@@ -1,0 +1,33 @@
+{
+  "mode": "server",
+  "private_key_file": "../keys/server/private.key",
+  "peer_public_keys": [
+    "REPLACE_WITH_CLIENT_PUBLIC_KEY_HEX"
+  ],
+  "server_dials": false,
+  "listeners": [
+    {
+      "addr": "0.0.0.0:443",
+      "transport": "xhttps",
+      "http_path": "/tunnel",
+      "xhttp": {
+        "mode": "packet-up",
+        "host": "tunnel.example.com"
+      },
+      "cert_file": "../keys/origin-tls/cert.pem",
+      "key_file": "../keys/origin-tls/key.pem",
+      "maps": [
+        {
+          "type": "tcp",
+          "bind": "127.0.0.1:18080",
+          "target": "127.0.0.1:8080"
+        },
+        {
+          "type": "udp",
+          "bind": "127.0.0.1:15353",
+          "target": "127.0.0.1:5353"
+        }
+      ]
+    }
+  ]
+}

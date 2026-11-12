@@ -1,0 +1,23 @@
+{
+  "mode": "server",
+  "private_key_file": "../keys/server/private.key",
+  "peer_public_keys": [
+    "REPLACE_WITH_CLIENT_PUBLIC_KEY_HEX"
+  ],
+  "listeners": [
+    {
+      "addr": "0.0.0.0:8443",
+      "transport": "wss",
+      "cert_file": "../keys/tls/cert.pem",
+      "key_file": "../keys/tls/key.pem",
+      "http_path": "/tunnel",
+      "maps": [
+        {
+          "type": "tcp",
+          "bind": "127.0.0.1:18080",
+          "target": "127.0.0.1:8080"
+        }
+      ]
+    }
+  ]
+}

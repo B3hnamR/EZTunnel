@@ -1,0 +1,24 @@
+{
+  "mode": "client",
+  "private_key_file": "../keys/client/private.key",
+  "server_dials": false,
+  "allowed_targets": [
+    "127.0.0.1:8080",
+    "127.0.0.1:5353"
+  ],
+  "paths": [
+    {
+      "addr": "192.0.2.2:443",
+      "transport": "xhttps",
+      "http_path": "/tunnel",
+      "xhttp": {
+        "mode": "auto",
+        "host": "tunnel.example.com"
+      },
+      "ca_file": "../keys/origin-tls/cert.pem",
+      "server_name": "tunnel.example.com",
+      "server_public_key": "REPLACE_WITH_SERVER_PUBLIC_KEY_HEX",
+      "connection_pool": 1
+    }
+  ]
+}

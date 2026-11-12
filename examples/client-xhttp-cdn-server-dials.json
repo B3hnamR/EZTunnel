@@ -1,0 +1,21 @@
+{
+  "mode": "client",
+  "server_dials": true,
+  "tunnel_key": "REPLACE-WITH-THE-TUNNEL-KEY",
+  "allowed_targets": [
+    "127.0.0.1:8080",
+    "127.0.0.1:5353"
+  ],
+  "paths": [
+    {
+      "addr": "0.0.0.0:443",
+      "transport": "xhttps",
+      "http_path": "/tunnel",
+      "xhttp": {
+        "mode": "packet-up",
+        "host": "tunnel.example.com"
+      },
+      "tls_auto": true
+    }
+  ]
+}

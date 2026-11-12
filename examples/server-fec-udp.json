@@ -1,0 +1,29 @@
+{
+  "mode": "server",
+  "private_key_file": "../keys/server/private.key",
+  "peer_public_keys": [
+    "REPLACE_WITH_CLIENT_PUBLIC_KEY_HEX"
+  ],
+  "listeners": [
+    {
+      "addr": "0.0.0.0:7000",
+      "transport": "fec-udp",
+      "fec": {
+        "mtu": 1350,
+        "knock": true
+      },
+      "maps": [
+        {
+          "type": "tcp",
+          "bind": "127.0.0.1:18080",
+          "target": "127.0.0.1:8080"
+        },
+        {
+          "type": "udp",
+          "bind": "127.0.0.1:15353",
+          "target": "127.0.0.1:5353"
+        }
+      ]
+    }
+  ]
+}

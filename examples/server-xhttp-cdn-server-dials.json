@@ -1,0 +1,29 @@
+{
+  "mode": "server",
+  "server_dials": true,
+  "tunnel_key": "REPLACE-WITH-THE-TUNNEL-KEY",
+  "listeners": [
+    {
+      "addr": "192.0.2.2:443",
+      "transport": "xhttps",
+      "http_path": "/tunnel",
+      "xhttp": {
+        "mode": "auto",
+        "host": "tunnel.example.com"
+      },
+      "server_name": "tunnel.example.com",
+      "maps": [
+        {
+          "type": "tcp",
+          "bind": "127.0.0.1:18080",
+          "target": "127.0.0.1:8080"
+        },
+        {
+          "type": "udp",
+          "bind": "127.0.0.1:15353",
+          "target": "127.0.0.1:5353"
+        }
+      ]
+    }
+  ]
+}

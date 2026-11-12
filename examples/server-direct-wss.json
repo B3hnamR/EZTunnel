@@ -1,0 +1,21 @@
+{
+  "mode": "server",
+  "server_dials": true,
+  "tunnel_key": "REPLACE-WITH-THE-TUNNEL-KEY",
+  "listeners": [
+    {
+      "addr": "198.51.100.20:8443",
+      "transport": "wss",
+      "tls_auto": true,
+      "server_name": "www.example.com",
+      "connection_pool": 4,
+      "maps": [
+        {
+          "type": "tcp",
+          "bind": "0.0.0.0:443",
+          "target": "127.0.0.1:443"
+        }
+      ]
+    }
+  ]
+}

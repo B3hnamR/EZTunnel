@@ -1,0 +1,39 @@
+{
+  "mode": "server",
+  "private_key_file": "../keys/server/private.key",
+  "peer_public_keys": [
+    "REPLACE_WITH_CLIENT_PUBLIC_KEY_HEX"
+  ],
+  "tun": {
+    "name": "ez0",
+    "address": "10.77.0.1",
+    "peer_address": "10.77.0.2",
+    "mtu": 1380,
+    "forwarding_port": 47475
+  },
+  "socks5": "127.0.0.1:1080",
+  "listeners": [
+    {
+      "addr": "192.0.2.1:443",
+      "transport": "tun",
+      "raw": {
+        "profile": "tcp",
+        "local_ip": "192.0.2.1",
+        "peer_ip": "192.0.2.2",
+        "l4_port": 443
+      },
+      "maps": [
+        {
+          "type": "tcp",
+          "bind": "127.0.0.1:18080",
+          "target": "127.0.0.1:8080"
+        },
+        {
+          "type": "udp",
+          "bind": "127.0.0.1:15353",
+          "target": "127.0.0.1:5353"
+        }
+      ]
+    }
+  ]
+}

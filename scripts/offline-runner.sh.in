@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Self-extracting local installer. The appended payload is checked offline.
+set -euo pipefail
+umask 077
+[[ $(uname -s) == Linux ]] || { echo 'This bundle supports Linux only.' >&2; exit 1; }
+prefix=''
+extract_dir=''
+open_menu=yes
+while (( $# )); do
+  case $1 in
+    --prefix) prefix=${2:?Missing --prefix value}; shift 2 ;;
+    --extract) extract_dir=${2:?Missing --extract directory}; shift 2 ;;
+    --no-menu|--no-setup) open_menu=no; shift ;;
+    -h|--help)
+      echo 'Usage: sudo bash eztunnel-linux-@ARCHITECTURE@.run [--prefix /usr/local] [--no-menu]'
+      echo '       bash eztunnel-linux-@ARCHITECTURE@.run --extract NEW_DIRECTORY'
+      echo 'Installs the embedded program and opens the tunnel manager. No downloads.'
+      exit 0 ;;
+    *) echo "Unknown option: $1" >&2; exit 2 ;;
+  esac
+done
+for required in tar sha256sum awk tail mktemp; do
+  command -v "$required" >/dev/null || { printf 'Required local command: %s\n' "$required" >&2; exit 1; }
+done
+[[ $(uname -m) == '@ARCHITECTURE@' ]] || { echo 'This bundle is for @ARCHITECTURE@ Linux.' >&2; exit 1; }
+stage=$(mktemp -d "${TMPDIR:-/tmp}/eztunnel-installer.XXXXXXXX")
+trap 'rm -rf -- "$stage"' EXIT
+payload_line=$(awk '/^__EZTUNNEL_PAYLOAD_BELOW__$/ { print NR+1; exit }' "$0")
+[[ $payload_line =~ ^[0-9]+$ ]] || { echo 'Embedded payload is missing.' >&2; exit 1; }
+tail -n "+$payload_line" -- "$0" > "$stage/payload.tar.gz"
+if ! (cd -- "$stage" && printf '%s  payload.tar.gz\n' '@PAYLOAD_SHA256@' | sha256sum --check --status); then
+  echo 'Embedded payload checksum failed.' >&2; exit 1
+fi
+if [[ -n $extract_dir ]]; then
+  [[ ! -e $extract_dir ]] || { echo 'Extraction directory must be new.' >&2; exit 2; }
+  mkdir -p -- "$extract_dir"
+  tar -xzf "$stage/payload.tar.gz" -C "$extract_dir" --no-same-owner
+  printf 'Extracted local bundle into: %s/eztunnel-linux\n' "$extract_dir"
+  exit 0
+fi
+tar -xzf "$stage/payload.tar.gz" -C "$stage" --no-same-owner
+bundle=$stage/eztunnel-linux
+[[ -x $bundle/bin/eztunnel && -f $bundle/scripts/install.sh ]] || { echo 'Embedded bundle is incomplete.' >&2; exit 1; }
+if (( EUID == 0 )); then [[ -n $prefix ]] || prefix=/usr/local
+else [[ -n $prefix ]] || prefix=${HOME:?}/.local; fi
+bash "$bundle/scripts/install.sh" --binary "$bundle/bin/eztunnel" --prefix "$prefix"
+# The program is installed; remove the unpacked copy now, because leaving the menu with
+# Ctrl-C can end this script before its exit trap runs.
+rm -rf -- "$stage"
+trap - EXIT
+if [[ $open_menu == yes && -t 0 && -t 2 ]]; then
+  if (( EUID == 0 )); then exec "$prefix/bin/eztunnel" menu
+  else echo 'Open the manager as root: sudo eztunnel'; fi
+fi
+exit 0
+
+__EZTUNNEL_PAYLOAD_BELOW__

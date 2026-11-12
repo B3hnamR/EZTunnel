@@ -1,0 +1,25 @@
+{
+  "mode": "client",
+  "private_key_file": "../keys/client/private.key",
+  "tun": {
+    "name": "ez0",
+    "address": "10.77.0.2",
+    "peer_address": "10.77.0.1",
+    "mtu": 1380
+  },
+  "paths": [
+    {
+      "addr": "192.0.2.1:443",
+      "transport": "fec-raw",
+      "raw": {
+        "profile": "tcp",
+        "local_ip": "192.0.2.2",
+        "peer_ip": "192.0.2.1",
+        "l4_port": 443,
+        "proto58_mode": false
+      },
+      "server_public_key": "REPLACE_WITH_SERVER_PUBLIC_KEY_HEX",
+      "connection_pool": 1
+    }
+  ]
+}

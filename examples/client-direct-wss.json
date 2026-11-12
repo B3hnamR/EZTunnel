@@ -1,0 +1,15 @@
+{
+  "mode": "client",
+  "server_dials": true,
+  "tunnel_key": "REPLACE-WITH-THE-TUNNEL-KEY",
+  "allowed_targets": [
+    "127.0.0.1:*"
+  ],
+  "paths": [
+    {
+      "addr": "0.0.0.0:8443",
+      "transport": "wss",
+      "tls_auto": true
+    }
+  ]
+}
