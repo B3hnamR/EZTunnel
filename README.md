@@ -15,6 +15,7 @@
   <a href="#transports"><b>Transports</b></a> ·
   <a href="#what-can-it-carry"><b>What it carries</b></a> ·
   <a href="#mirage"><b>Mirage</b></a> ·
+  <a href="#roadmap"><b>Roadmap</b></a> ·
   <a href="#documentation"><b>Docs</b></a>
 </p>
 
@@ -496,6 +497,18 @@ Don't turn them all on hoping for better gaming. Start with the defaults, measur
 and enable one only for a specific problem. See [transport extensions](docs/transport-upgrade.md).
 
 </details>
+
+## Roadmap
+
+Coming next to EZTunnel:
+
+| Feature | What it brings |
+|---|---|
+| **Telegram alerts** | A Telegram bot that tells you the moment a tunnel drops, reconnects, reaches its quota or a server restarts, so you know before your users do. |
+| **Web dashboard** | A full browser dashboard to watch every tunnel live (traffic, latency, sessions) and to start, stop and configure tunnels without opening a terminal. |
+| **Three new anti-censorship transports** | New carriers built to get through heavy filtering where today's transports are blocked or throttled. |
+
+Planned features may change before they ship. Follow the [releases](https://github.com/B3hnamR/EZTunnel/releases) to see them land.
 
 ## Using JSON instead of the menu
 
