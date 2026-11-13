@@ -12,6 +12,8 @@ pub mod spoof_fec;
 pub mod parallax_carrier;
 pub mod checker;
 pub mod config;
+#[cfg(feature = "dashboard")]
+pub mod dashboard;
 pub mod engine;
 pub mod farewell;
 pub mod fec_carrier;

@@ -6,6 +6,7 @@
 pub mod backup;
 pub mod bulk;
 pub mod checker;
+pub mod figures;
 pub mod iface;
 pub mod manage;
 mod mirage;

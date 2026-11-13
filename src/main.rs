@@ -103,6 +103,12 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    /// The web dashboard: set it up once, then serve it.
+    #[cfg(feature = "dashboard")]
+    Dashboard {
+        #[command(subcommand)]
+        action: DashboardCommand,
+    },
     /// Generate a local TLS certificate. Copy cert.pem to the client's ca_file.
     Certgen {
         #[arg(long)]
@@ -110,6 +116,40 @@ enum Command {
         /// Certificate DNS name or IP address; may be repeated.
         #[arg(long, default_value = "localhost")]
         name: Vec<String>,
+    },
+}
+
+#[cfg(feature = "dashboard")]
+#[derive(Subcommand)]
+enum DashboardCommand {
+    /// Create the settings: a random port, a random password shown once, a certificate.
+    Setup {
+        /// Use this port instead of a random one.
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long, default_value = eztunnel::dashboard::DEFAULT_STATE_DIR)]
+        state_dir: PathBuf,
+    },
+    /// Run the dashboard over HTTPS.
+    Serve {
+        #[arg(long, default_value = eztunnel::dashboard::DEFAULT_STATE_DIR)]
+        state_dir: PathBuf,
+        /// Listen only on this address (default: all addresses).
+        #[arg(long)]
+        listen: Option<IpAddr>,
+    },
+    /// Replace the password with a new random one, shown once.
+    ResetPassword {
+        #[arg(long, default_value = eztunnel::dashboard::DEFAULT_STATE_DIR)]
+        state_dir: PathBuf,
+    },
+    /// Serve the interface with sample data on 127.0.0.1 only, over plain HTTP.
+    Demo {
+        #[arg(long, default_value_t = 47832)]
+        port: u16,
+        /// Show a fresh install with no tunnels.
+        #[arg(long)]
+        empty: bool,
     },
 }
 
@@ -335,6 +375,13 @@ async fn run(cli: Cli) -> Result<()> {
         match command {
             Command::Menu => eztunnel::manager::run()?,
             Command::Key => println!("{}", eztunnel::tunnel_key::TunnelKey::generate()?.display()),
+            #[cfg(feature = "dashboard")]
+            Command::Dashboard { action } => match action {
+                DashboardCommand::Setup { port, state_dir } => eztunnel::dashboard::setup(&state_dir, port)?,
+                DashboardCommand::Serve { state_dir, listen } => eztunnel::dashboard::serve(&state_dir, listen).await?,
+                DashboardCommand::ResetPassword { state_dir } => eztunnel::dashboard::reset_password(&state_dir)?,
+                DashboardCommand::Demo { port, empty } => eztunnel::dashboard::demo(port, empty).await?,
+            },
             Command::Spooftest {action}=>{
                 match action {
                     SpoofTestCommand::Menu=>eztunnel::manager::mirage_tests()?,
