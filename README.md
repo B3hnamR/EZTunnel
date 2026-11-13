@@ -504,6 +504,7 @@ Coming next to EZTunnel:
 
 | Feature | What it brings |
 |---|---|
+| **Seamless failover** | Give a tunnel backup routes: another transport, or another foreign server. If the main route fails or slows down, traffic moves to a backup automatically and returns when the main route recovers. The user port never changes, open connections pause for a moment and continue instead of dropping, and game traffic keeps its session. |
 | **Telegram alerts** | A Telegram bot that tells you the moment a tunnel drops, reconnects, reaches its quota or a server restarts, so you know before your users do. |
 | **Web dashboard** | A full browser dashboard to watch every tunnel live (traffic, latency, sessions) and to start, stop and configure tunnels without opening a terminal. |
 | **Three new anti-censorship transports** | New carriers built to get through heavy filtering where today's transports are blocked or throttled. |
