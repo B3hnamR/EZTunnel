@@ -1,9 +1,17 @@
-//! The dashboard's certificate. Phase 1 uses a self-signed certificate kept in the state
-//! directory; its key fingerprint lets a join command pin it.
+//! The dashboard's certificate: a self-signed one kept in the state directory (its key
+//! fingerprint lets a join command pin it), replaced by a Let's Encrypt certificate when one is
+//! configured (see `acme`). The served certificate can be swapped while the server runs.
 use anyhow::{Context, Result};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::{
+    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+    server::{ClientHello, ResolvesServerCert},
+    sign::CertifiedKey,
+};
 use sha2::{Digest, Sha256};
-use std::{path::Path, sync::Arc};
+use std::{
+    path::Path,
+    sync::{Arc, RwLock},
+};
 
 const CERT_FILE: &str = "cert.der";
 const KEY_FILE: &str = "key.der";
@@ -11,6 +19,76 @@ const KEY_FILE: &str = "key.der";
 /// Loads the certificate, creating it on first use, and returns the TLS settings with the
 /// SHA-256 of the public key (base64), the value `curl --pinnedpubkey` expects.
 pub fn load_or_create(state_dir: &Path, address: &str) -> Result<(Arc<rustls::ServerConfig>, String)> {
+    let (cert, key) = self_signed_files(state_dir, address)?;
+    let pin = public_key_pin(&cert)?;
+    let swap = Arc::new(Swap::new(certified(vec![cert], key)?));
+    Ok((server_config(swap)?, pin))
+}
+
+/// A certificate with its signing key, ready to serve.
+pub fn certified(chain: Vec<CertificateDer<'static>>, key: PrivateKeyDer<'static>) -> Result<Arc<CertifiedKey>> {
+    let provider = rustls::crypto::ring::default_provider();
+    let signing = provider
+        .key_provider
+        .load_private_key(key)
+        .context("use the certificate key")?;
+    Ok(Arc::new(CertifiedKey::new(chain, signing)))
+}
+
+/// The certificate being served; `set` replaces it for every new connection.
+pub struct Swap(RwLock<Arc<CertifiedKey>>);
+
+impl std::fmt::Debug for Swap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Swap")
+    }
+}
+
+impl Swap {
+    pub fn new(first: Arc<CertifiedKey>) -> Self {
+        Self(RwLock::new(first))
+    }
+
+    /// When the certificate being served stops being valid (seconds since 1970).
+    pub fn not_after(&self) -> Option<u64> {
+        let current = self.0.read().unwrap().clone();
+        super::acme::validity_of(current.cert.first()?.as_ref()).map(|(_, end)| end)
+    }
+
+    /// Starts with the self-signed certificate of the state directory (created on first use).
+    pub fn self_signed(state_dir: &Path, address: &str) -> Result<Self> {
+        let (cert, key) = self_signed_files(state_dir, address)?;
+        Ok(Self::new(certified(vec![cert], key)?))
+    }
+
+    pub fn set(&self, next: Arc<CertifiedKey>) {
+        *self.0.write().unwrap_or_else(|p| p.into_inner()) = next;
+    }
+
+    pub fn current(&self) -> Arc<CertifiedKey> {
+        self.0.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+}
+
+impl ResolvesServerCert for Swap {
+    fn resolve(&self, _hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        Some(self.current())
+    }
+}
+
+/// TLS settings that serve whatever `swap` holds.
+pub fn server_config(swap: Arc<Swap>) -> Result<Arc<rustls::ServerConfig>> {
+    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()?
+    .with_no_client_auth()
+    .with_cert_resolver(swap);
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(Arc::new(config))
+}
+
+fn self_signed_files(state_dir: &Path, address: &str) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
     let cert_path = state_dir.join(CERT_FILE);
     let key_path = state_dir.join(KEY_FILE);
     if !cert_path.exists() || !key_path.exists() {
@@ -27,20 +105,11 @@ pub fn load_or_create(state_dir: &Path, address: &str) -> Result<(Arc<rustls::Se
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
         std::fs::read(&key_path).context("read the certificate key")?,
     ));
-    let pin = public_key_pin(&cert)?;
-    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()?
-    .with_no_client_auth()
-    .with_single_cert(vec![cert], key)
-    .context("use the certificate")?;
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Ok((Arc::new(config), pin))
+    Ok((cert, key))
 }
 
 /// SHA-256 of the certificate's SubjectPublicKeyInfo, base64.
-fn public_key_pin(cert: &CertificateDer) -> Result<String> {
+pub(super) fn public_key_pin(cert: &CertificateDer) -> Result<String> {
     use base64::Engine;
     let spki = spki_of(cert.as_ref()).context("read the certificate's public key")?;
     Ok(base64::engine::general_purpose::STANDARD.encode(Sha256::digest(spki)))
@@ -65,14 +134,14 @@ fn spki_of(der: &[u8]) -> Option<&[u8]> {
 }
 
 /// Returns (total length, whole element) of the first DER element in `bytes`.
-fn element(bytes: &[u8]) -> Option<(usize, &[u8])> {
+pub(super) fn element(bytes: &[u8]) -> Option<(usize, &[u8])> {
     let (header, length) = header(bytes)?;
     let total = header.checked_add(length)?;
     Some((total, bytes.get(..total)?))
 }
 
 /// The contents of the first DER element.
-fn inner(bytes: &[u8]) -> Option<&[u8]> {
+pub(super) fn inner(bytes: &[u8]) -> Option<&[u8]> {
     let (header, length) = header(bytes)?;
     bytes.get(header..header.checked_add(length)?)
 }

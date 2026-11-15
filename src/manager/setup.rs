@@ -26,6 +26,7 @@ pub(super) fn choose(store:&Store)->Result<Option<SaveAction>>{
     }
 }
 pub(super) fn save(store:&Store,name:&str,config:&serde_json::Value,action:SaveAction)->Result<()> {
+    let _lock=store.lock(name,false)?;
     super::plan::check(config)?;
     ensure!(!store.exists(name),"a tunnel with this name already exists");
     store.save(name,config)?;

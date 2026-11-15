@@ -438,7 +438,7 @@ impl Hub {
         let weak=Arc::downgrade(self);let peer=channel.peer;
         let task=tokio::spawn(async move {
             let result=async {
-                let address=timeout(Duration::from_secs(5),tokio::net::lookup_host(&target)).await??.next().context("gaming target address")?;
+                let address=crate::dial::udp_address(&target,Duration::from_secs(5)).await.context("gaming target address")?;
                 let socket=UdpSocket::bind(if address.is_ipv4(){"0.0.0.0:0"}else{"[::]:0"}).await?;socket.connect(address).await?;
                 let mut bytes=[0;65536];
                 loop {

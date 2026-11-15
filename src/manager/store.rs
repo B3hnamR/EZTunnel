@@ -12,6 +12,12 @@ use std::{
 /// System account the tunnel services run as.
 pub const SERVICE_USER: &str = "eztunnel";
 
+/// A tunnel's change lock, held until dropped: the terminal manager and the dashboard never
+/// change the same tunnel at the same time.
+pub struct ChangeLock {
+    _file: fs::File,
+}
+
 pub struct Store {
     root: PathBuf,
     /// Running as root with systemd: tunnels become system services. Otherwise (a test
@@ -59,7 +65,7 @@ impl Store {
         self.root == Path::new("/etc/eztunnel")
     }
 
-    fn dir(&self) -> PathBuf {
+    pub(crate) fn dir(&self) -> PathBuf {
         self.root.join("tunnels")
     }
 
@@ -136,6 +142,52 @@ impl Store {
         self.save(name, &value)
     }
 
+    /// The previous version as it is now, kept across a save that may have to be taken back.
+    pub fn previous_bytes(&self, name: &str) -> Option<Vec<u8>> {
+        fs::read(self.dir().join(format!("{name}.json.bak"))).ok()
+    }
+
+    /// Takes back a save that did not work: the previous version goes back in place and
+    /// `earlier` (the previous version from before that save, if there was one) is the previous
+    /// one again, so the settings that failed are not offered as the version to go back to.
+    pub fn take_back_save(&self, name: &str, earlier: Option<&[u8]>) -> Result<()> {
+        self.restore_previous(name)?;
+        let backup = self.dir().join(format!("{name}.json.bak"));
+        match earlier {
+            Some(bytes) => atomic_private(&backup, bytes).context("keep the earlier previous version"),
+            None => {
+                let _ = fs::remove_file(&backup);
+                Ok(())
+            }
+        }
+    }
+
+    /// Takes the change lock of a tunnel. `wait` blocks until it is free (the terminal manager);
+    /// otherwise a tunnel being changed elsewhere is an error (the dashboard answers at once).
+    pub fn lock(&self, name: &str, wait: bool) -> Result<ChangeLock> {
+        check_name(name)?;
+        create_private_dir(&self.dir())?;
+        let path = self.dir().join(format!(".{name}.lock"));
+        let mut options = fs::OpenOptions::new();
+        options.create(true).truncate(false).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let file = options.open(&path).with_context(|| format!("open {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let flags = libc::LOCK_EX | if wait { 0 } else { libc::LOCK_NB };
+            // SAFETY: flock on a descriptor this function owns; it is released when the file closes.
+            if unsafe { libc::flock(file.as_raw_fd(), flags) } != 0 {
+                bail!("{name} is being changed elsewhere (in the terminal manager or the dashboard); try again in a moment");
+            }
+        }
+        Ok(ChangeLock { _file: file })
+    }
+
     /// Writes a candidate next to the tunnel for editing by hand.
     pub fn draft(&self, name: &str) -> Result<PathBuf> {
         let draft = self.dir().join(format!(".{name}.json.edit"));
@@ -153,10 +205,18 @@ impl Store {
     }
 
     pub fn remove(&self, name: &str) -> Result<()> {
+        let _lock = self.lock(name, false)?;
+        self.remove_locked(name)
+    }
+
+    /// Removes a tunnel while the caller keeps its change lock through service cleanup.
+    pub fn remove_locked(&self, name: &str) -> Result<()> {
+        check_name(name)?;
         fs::remove_file(self.path(name)).with_context(|| format!("delete tunnel {name}"))?;
         let _ = fs::remove_file(self.dir().join(format!("{name}.json.bak")));
         // An edit that was never finished holds the whole configuration, tunnel key included.
         let _ = fs::remove_file(self.dir().join(format!(".{name}.json.edit")));
+        // Keep the lock inode: waiters may already hold an open descriptor to it.
         Ok(())
     }
 
@@ -315,6 +375,60 @@ mod tests {
         serde_json::json!({"mode":"client",
             "tunnel_key": crate::tunnel_key::TunnelKey::generate().unwrap().display(),
             "allowed_targets":["127.0.0.1:*"], "paths":[{"addr":"192.0.2.1:7000"}]})
+    }
+
+    #[test]
+    fn a_tunnel_being_changed_cannot_be_changed_elsewhere_at_once() {
+        let (_directory, store) = store();
+        let held = store.lock("t", false).unwrap();
+        assert!(store.lock("t", false).is_err());
+        // Another tunnel is not affected, and the lock is free again once dropped.
+        let other = store.lock("u", false).unwrap();
+        drop(held);
+        drop(other);
+        assert!(store.lock("t", false).is_ok());
+        assert!(store.lock("../x", false).is_err());
+        assert!(store.names().unwrap().is_empty(), "lock files are not tunnels");
+    }
+
+    #[test]
+    fn deleting_a_tunnel_keeps_its_change_lock_until_released() {
+        let (_directory, store) = store();
+        store.save("t", &sample()).unwrap();
+        let held = store.lock("t", false).unwrap();
+        store.remove_locked("t").unwrap();
+        assert!(store.lock("t", false).is_err(), "deletion must not create a second lock inode");
+        drop(held);
+        assert!(store.lock("t", false).is_ok());
+    }
+
+    #[test]
+    fn a_failed_save_taken_back_does_not_become_the_previous_version() {
+        let (_directory, store) = store();
+        let with = |port: u16| {
+            let mut config = sample();
+            config["paths"][0]["addr"] = serde_json::json!(format!("192.0.2.1:{port}"));
+            config
+        };
+        let port = |path: PathBuf| -> String {
+            let value: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            value["paths"][0]["addr"].as_str().unwrap().to_string()
+        };
+        // First save: no earlier version, so after taking back the failed one there is none.
+        store.save("t", &with(7000)).unwrap();
+        let earlier = store.previous_bytes("t");
+        store.save("t", &with(7001)).unwrap();
+        store.take_back_save("t", earlier.as_deref()).unwrap();
+        assert_eq!(port(store.path("t")), "192.0.2.1:7000");
+        assert!(!store.has_previous("t"));
+        // With an earlier version, that one stays the version to go back to.
+        store.save("t", &with(7002)).unwrap();
+        store.save("t", &with(7003)).unwrap();
+        let earlier = store.previous_bytes("t");
+        store.save("t", &with(7004)).unwrap();
+        store.take_back_save("t", earlier.as_deref()).unwrap();
+        assert_eq!(port(store.path("t")), "192.0.2.1:7003");
+        assert_eq!(port(store.dir().join("t.json.bak")), "192.0.2.1:7002");
     }
 
     #[test]

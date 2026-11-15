@@ -11,7 +11,9 @@ pub mod spoof_session;
 pub mod spoof_fec;
 pub mod parallax_carrier;
 pub mod checker;
+pub mod pathprobe;
 pub mod config;
+pub mod dial;
 #[cfg(feature = "dashboard")]
 pub mod dashboard;
 pub mod engine;

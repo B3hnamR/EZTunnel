@@ -243,6 +243,7 @@ fn status(stats: &Stats, server: bool) -> Value {
         "refused": stats.streams_refused.load(Relaxed),
         "rejected": stats.connections_rejected.load(Relaxed),
         "udp_dropped": stats.udp_dropped.load(Relaxed),
+        "udp_oversize": stats.udp_oversize.load(Relaxed),
         "bytes_to_peer": stats.bytes_to_peer.load(Relaxed),
         "bytes_from_peer": stats.bytes_from_peer.load(Relaxed),
         "pings": stats.pings.load(Relaxed),

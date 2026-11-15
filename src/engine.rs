@@ -35,6 +35,74 @@ const CREDITS: usize = 16;
 /// Largest window a receiver may open on one stream (frames). A protocol sanity bound; the
 /// window actually used is the receiver's `stream_window` setting.
 const MAX_WINDOW: usize = 4096;
+/// Window a receiver opens on a UDP conversation (frames). Every datagram takes one frame of
+/// credit whatever its size, so a conversation moves at most this many datagrams per round trip
+/// (about 11,000 per second at 90 ms). Memory stays bounded by the stream queue: a UDP receiver
+/// hands each datagram to its socket at once and drops (and counts) what does not fit.
+const UDP_WINDOW: usize = 1024;
+/// Datagrams a new UDP conversation may queue while it waits for its window. For its first round
+/// trip a conversation has only the initial `CREDITS`; the queue must carry the rest of that
+/// round trip (about 2,800 datagrams per second at 90 ms) or they were dropped. Each queued
+/// datagram is paid for from the memory budget, so the longer queue cannot outgrow it.
+const UDP_QUEUE: usize = 256;
+
+/// The queue of one UDP conversation waiting to go into the tunnel.
+fn udp_queue(tuning: &Tuning) -> usize {
+    tuning.stream_queue.max(UDP_QUEUE)
+}
+
+/// Credit a UDP receiver hands back at once (frames). Returning one frame of credit per datagram
+/// made every datagram cost a second tunnel message, and on the UDP carriers a second packet plus
+/// its acknowledgement: measured, about 5.8 UDP packets per echoed datagram.
+const CREDIT_BATCH: u32 = 8;
+/// Longest a UDP receiver keeps consumed credit before handing it back. The sender holds the rest
+/// of a window of `UDP_WINDOW` frames meanwhile, so the delay never stalls a conversation.
+const CREDIT_DELAY: Duration = Duration::from_millis(5);
+
+/// Credit for consumed UDP datagrams that has not been handed back yet.
+#[derive(Default)]
+struct CreditReturn {
+    pending: u32,
+    since: Option<Instant>,
+}
+
+impl CreditReturn {
+    async fn consumed(&mut self, session: &Session, id: u32) -> Result<()> {
+        self.pending += 1;
+        if self.pending >= CREDIT_BATCH {
+            return self.flush(session, id).await;
+        }
+        self.since.get_or_insert_with(Instant::now);
+        Ok(())
+    }
+
+    async fn flush(&mut self, session: &Session, id: u32) -> Result<()> {
+        if self.pending > 0 {
+            session.send(Frame::Credit { id, frames: self.pending }).await?;
+            self.pending = 0;
+        }
+        self.since = None;
+        Ok(())
+    }
+}
+
+/// The next frame of a UDP conversation, handing back held credit when it is due meanwhile.
+async fn next_udp_frame(
+    rx: &mut mpsc::Receiver<Frame>,
+    credit: &mut CreditReturn,
+    session: &Session,
+    id: u32,
+) -> Result<Option<Frame>> {
+    loop {
+        let due = credit.since.map(|since| since + CREDIT_DELAY);
+        tokio::select! {
+            frame = rx.recv() => return Ok(frame),
+            _ = async { match due { Some(at) => time::sleep_until(at).await, None => std::future::pending().await } } => {
+                credit.flush(session, id).await?;
+            }
+        }
+    }
+}
 
 /// Time limits taken from the configuration.
 #[derive(Clone, Copy)]
@@ -96,6 +164,8 @@ struct StreamEntry {
     /// The part of the memory budget this stream's wider window uses; given back when the entry
     /// is dropped, whether the stream ended or the whole session went away.
     reservation: Option<Reservation>,
+    /// A UDP conversation: a datagram that finds the queue full is dropped, not the stream.
+    datagram: bool,
 }
 
 /// Frames taken from `Stats::window_budget`, returned on drop.
@@ -204,6 +274,18 @@ impl std::error::Error for Unanswered {}
 
 impl Session {
     fn register(&self, requested: Option<u32>) -> Result<(u32, mpsc::Receiver<Frame>)> {
+        self.register_kind(requested, false)
+    }
+
+    /// `register` for a UDP conversation: its queue also holds `UDP_QUEUE` datagrams. With a
+    /// window of `UDP_WINDOW`, the UDP carriers hand over a burst at once when a lost packet is
+    /// recovered (everything that waited behind it); measured live, 0.4% of echoed datagrams
+    /// were dropped with the ordinary 68-frame queue.
+    fn register_datagram(&self, requested: Option<u32>) -> Result<(u32, mpsc::Receiver<Frame>)> {
+        self.register_kind(requested, true)
+    }
+
+    fn register_kind(&self, requested: Option<u32>, datagram: bool) -> Result<(u32, mpsc::Receiver<Frame>)> {
         let mut streams = self
             .streams
             .lock()
@@ -225,13 +307,15 @@ impl Session {
             },
         };
         // The queue must hold a full window plus the stream's control frames.
-        let (tx, rx) = mpsc::channel(self.stream_queue.max(self.window + 4));
+        let ordinary = self.stream_queue.max(self.window + 4);
+        let (tx, rx) = mpsc::channel(if datagram { ordinary.max(UDP_QUEUE) } else { ordinary });
         streams.insert(
             id,
             StreamEntry {
                 tx,
                 credits: Arc::new(Semaphore::new(CREDITS)),
                 reservation: None,
+                datagram: false,
             },
         );
         self.stats.streams.fetch_add(1, Ordering::Relaxed);
@@ -290,29 +374,50 @@ impl Session {
     /// `CREDITS`. Called once a stream is known at both ends. One stream's speed is at most
     /// window × 16 KiB per round trip, so a larger window is faster on long links.
     async fn open_window(&self, id: u32) -> Result<()> {
+        self.open_window_for(id, false).await
+    }
+
+    /// `open_window` for a UDP conversation. A datagram uses a whole frame of credit however
+    /// small it is, so a window sized for bytes (`stream_window`) would cap small datagrams at a
+    /// few hundred per second. The conversation gets `UDP_WINDOW` instead, at the memory cost of
+    /// an ordinary stream: its queue keeps the ordinary size and a datagram that does not fit is
+    /// dropped (see `deliver`), so the wider window never holds more memory.
+    async fn open_datagram_window(&self, id: u32) -> Result<()> {
+        self.open_window_for(id, true).await
+    }
+
+    async fn open_window_for(&self, id: u32, datagram: bool) -> Result<()> {
         // The wider window is what a slow user can leave queued in memory, so it is paid for
         // from the shared budget. When the budget is used up the stream keeps its initial window.
         let wanted = self.window.saturating_sub(CREDITS);
-        let mut extra = self.stats.window_budget.reserve(wanted);
-        if extra > 0 {
+        let reserved = self.stats.window_budget.reserve(wanted);
+        {
             let mut streams = self
                 .streams
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             match streams.get_mut(&id) {
                 Some(entry) => {
-                    entry.reservation = Some(Reservation {
-                        stats: self.stats.clone(),
-                        frames: extra,
-                    });
+                    entry.datagram = datagram;
+                    if reserved > 0 {
+                        entry.reservation = Some(Reservation {
+                            stats: self.stats.clone(),
+                            frames: reserved,
+                        });
+                    }
                 }
                 None => {
                     // The stream is already gone.
-                    self.stats.window_budget.release(extra);
+                    self.stats.window_budget.release(reserved);
                     return Ok(());
                 }
             }
         }
+        let mut extra = if datagram && reserved == wanted {
+            UDP_WINDOW.max(self.window) - CREDITS
+        } else {
+            reserved
+        };
         while extra > 0 {
             let frames = extra.min(16);
             self.send(Frame::Credit {
@@ -338,18 +443,28 @@ impl Session {
     }
 
     fn deliver(&self, id: u32, frame: Frame) {
-        let tx = self
+        let entry = self
             .streams
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&id)
-            .map(|entry| entry.tx.clone());
-        if let Some(tx) = tx
-            && tx.try_send(frame).is_err()
-        {
-            // A slow consumer must not block all other multiplexed streams.
-            self.remove(id);
-            let _ = self.tx.try_send(Frame::Close { id });
+            .map(|entry| (entry.tx.clone(), entry.datagram));
+        let Some((tx, datagram)) = entry else {
+            return;
+        };
+        match tx.try_send(frame) {
+            Ok(()) => {}
+            // UDP may lose a datagram; the conversation stays. The credit it used is handed
+            // back at once, as if it had been delivered, so the sender's window does not shrink.
+            Err(mpsc::error::TrySendError::Full(Frame::Data { .. })) if datagram => {
+                self.stats.udp_dropped.fetch_add(1, Ordering::Relaxed);
+                let _ = self.control.try_send(Frame::Credit { id, frames: 1 });
+            }
+            Err(_) => {
+                // A slow consumer must not block all other multiplexed streams.
+                self.remove(id);
+                let _ = self.tx.try_send(Frame::Close { id });
+            }
         }
     }
 }
@@ -405,6 +520,22 @@ fn queue_datagram(sender: &mpsc::Sender<QueuedDatagram>, data: &[u8], stats: &Ar
     };
     if sender.try_send(datagram).is_err() {
         stats.udp_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Counts a UDP datagram too large for one tunnel frame (16 KiB, fixed by the wire protocol).
+/// Such a datagram cannot cross the tunnel; the sender sees no error, so it is logged on the 1st,
+/// 2nd, 4th, 8th ... occurrence: visible, without flooding the log.
+fn oversize_datagram(stats: &Stats, size: usize) {
+    stats.udp_dropped.fetch_add(1, Ordering::Relaxed);
+    let count = stats.udp_oversize.fetch_add(1, Ordering::Relaxed) + 1;
+    if count.is_power_of_two() {
+        tracing::warn!(
+            size,
+            limit = DATA_SIZE,
+            dropped = count,
+            "a UDP datagram is larger than a tunnel frame and was dropped; lower the sender's datagram size"
+        );
     }
 }
 impl Drop for StreamGuard {
@@ -1416,7 +1547,7 @@ async fn session_body(
                             let _ = session.tx.try_send(Frame::Error { id, message: "target not allowed".into() });
                             continue;
                         }
-                        match session.register(Some(id)) {
+                        match session.register_kind(Some(id), kind == StreamKind::Udp) {
                             Ok((_, rx)) => {
                                 let session = session.clone();
                                 streams.spawn(async move {
@@ -1732,9 +1863,8 @@ async fn target_stream(
 ) -> Result<()> {
     match kind {
         StreamKind::Tcp => {
-            let mut socket = time::timeout(tuning.connect, TcpStream::connect(target))
-                .await
-                .context("target connect timeout")??;
+            // A name may have IPv6 addresses this server cannot reach; see `dial`.
+            let mut socket = crate::dial::tcp(target, tuning.connect).await?;
             socket.set_nodelay(true)?;
             // The destination learns the user's address before any user data.
             if let Some(info) = &proxy {
@@ -1748,11 +1878,7 @@ async fn target_stream(
             relay_tcp(socket, session, id, rx, tuning.tcp_idle, Opening::Open).await
         }
         StreamKind::Udp => {
-            let addr = time::timeout(tuning.connect, tokio::net::lookup_host(target))
-                .await
-                .context("UDP target lookup timeout")??
-                .next()
-                .context("UDP target has no address")?;
+            let addr = crate::dial::udp_address(target, tuning.connect).await?;
             let socket = UdpSocket::bind(if addr.is_ipv4() {
                 "0.0.0.0:0"
             } else {
@@ -1774,7 +1900,7 @@ async fn target_udp(
     idle: Duration,
     stats:&Stats,
 ) -> Result<()> {
-    session.open_window(id).await?;
+    session.open_datagram_window(id).await?;
     let activity = Mutex::new(Instant::now());
     let upload = async {
         let mut buffer = vec![0; 65536];
@@ -1786,21 +1912,24 @@ async fn target_udp(
             if count <= DATA_SIZE {
                 session.send_data(id, buffer[..count].to_vec()).await?;
                 stats.bytes_to_peer.fetch_add(count as u64,Ordering::Relaxed);
+            } else {
+                oversize_datagram(stats, count);
             }
         }
         #[allow(unreachable_code)]
         Ok::<(), anyhow::Error>(())
     };
     let download = async {
+        let mut credit = CreditReturn::default();
         loop {
-            match rx.recv().await {
+            match next_udp_frame(&mut rx, &mut credit, session, id).await? {
                 Some(Frame::Data { data, .. }) => {
                     socket.send(&data).await?;
                     stats.bytes_from_peer.fetch_add(data.len()as u64,Ordering::Relaxed);
                     *activity
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
-                    session.send(Frame::Credit { id, frames: 1 }).await?;
+                    credit.consumed(session, id).await?;
                 }
                 Some(Frame::Close { .. }) | Some(Frame::Eof { .. }) | None => {
                     return Ok::<(), anyhow::Error>(());
@@ -1937,7 +2066,7 @@ async fn udp_map(
                     Ok(received) => { backoff.succeeded(); received }
                     Err(error) => { backoff.failed("UDP receive", error).await?; continue; }
                 };
-                if count > DATA_SIZE { continue; }
+                if count > DATA_SIZE { oversize_datagram(&stats, count); continue; }
                 match peers.get(&peer) {
                     Some(sender) if !sender.is_closed() => {
                         queue_datagram(sender, &buffer[..count], &stats);
@@ -1991,9 +2120,9 @@ async fn udp_map(
                     }
                 }
                 let Some(session) = pool.pick() else { stats.refuse_stream(); continue; };
-                let Ok((id, mut rx)) = session.register(None) else { stats.refuse_stream(); continue; };
+                let Ok((id, mut rx)) = session.register_datagram(None) else { stats.refuse_stream(); continue; };
                 let guard = StreamGuard { session: session.clone(), id };
-                let (tx, mut packets) = mpsc::channel(tuning.stream_queue);
+                let (tx, mut packets) = mpsc::channel(udp_queue(&tuning));
                 queue_datagram(&tx, &buffer[..count], &stats);
                 peers.insert(peer, tx);
                 let (socket, target) = (socket.clone(), target.clone());
@@ -2011,7 +2140,7 @@ async fn udp_map(
                         };
                         let opened = AtomicBool::new(matches!(opening, Opening::Open));
                         if opened.load(Ordering::Acquire) {
-                            session.open_window(id).await?;
+                            session.open_datagram_window(id).await?;
                         }
                         let activity = Mutex::new(Instant::now());
                         let upload = async {
@@ -2024,11 +2153,12 @@ async fn udp_map(
                             Ok::<(), anyhow::Error>(())
                         };
                         let download = async {
+                            let mut credit = CreditReturn::default();
                             loop {
-                                match rx.recv().await {
+                                match next_udp_frame(&mut rx, &mut credit, &session, id).await? {
                                     Some(Frame::Opened { .. }) if !opened.load(Ordering::Acquire) => {
                                         opened.store(true, Ordering::Release);
-                                        session.open_window(id).await?;
+                                        session.open_datagram_window(id).await?;
                                     }
                                     Some(Frame::Error { message, .. }) if !opened.load(Ordering::Acquire) => {
                                         bail!("UDP target rejected: {message}")
@@ -2037,7 +2167,7 @@ async fn udp_map(
                                         socket.send_to(&data, peer).await?;
                                         session.stats.bytes_from_peer.fetch_add(data.len()as u64,Ordering::Relaxed);
                                         *activity.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
-                                        session.send(Frame::Credit { id, frames: 1 }).await?;
+                                        credit.consumed(&session, id).await?;
                                     }
                                     Some(Frame::Close { .. }) | Some(Frame::Eof { .. }) | None => return Ok::<(), anyhow::Error>(()),
                                     Some(Frame::Error { message, .. }) => bail!("remote UDP error: {message}"),
@@ -2720,6 +2850,181 @@ mod tests {
             session.open_window(id).await.unwrap();
             assert_eq!(credited(&mut credits), 240);
         }
+    }
+
+    /// Live test, 90 ms link: every datagram took a whole frame of credit, so a UDP conversation
+    /// stopped at 64 datagrams per round trip (about 714/s) even for 100-byte datagrams.
+    #[tokio::test]
+    async fn a_udp_conversation_gets_the_datagram_window_for_the_price_of_a_stream() {
+        let stats = Arc::new(Stats::default());
+        stats.window_budget.set_limit(1000);
+        let (session, mut credits) = lone_session(64, stats.clone());
+        let (udp, _keep_udp) = session.register(None).unwrap();
+        session.open_datagram_window(udp).await.unwrap();
+        assert_eq!(credited(&mut credits), UDP_WINDOW - CREDITS);
+        assert_eq!(stats.window_budget.used(), 64 - CREDITS, "costs what a stream costs");
+        let (tcp, _keep_tcp) = session.register(None).unwrap();
+        session.open_window(tcp).await.unwrap();
+        assert_eq!(credited(&mut credits), 64 - CREDITS, "ordinary streams are unchanged");
+        // A larger stream_window is never narrowed.
+        let (wide, mut credits_wide) = lone_session(2048, Arc::new(Stats::default()));
+        let (id, _keep) = wide.register(None).unwrap();
+        wide.open_datagram_window(id).await.unwrap();
+        assert_eq!(credited(&mut credits_wide), 2048 - CREDITS);
+    }
+
+    #[tokio::test]
+    async fn a_udp_conversation_without_budget_keeps_the_small_window() {
+        let stats = Arc::new(Stats::default());
+        stats.window_budget.set_limit(10);
+        let (session, mut credits) = lone_session(64, stats.clone());
+        let (id, _keep) = session.register(None).unwrap();
+        session.open_datagram_window(id).await.unwrap();
+        assert_eq!(credited(&mut credits), 10, "only what the budget has left");
+    }
+
+    #[tokio::test]
+    async fn a_full_udp_queue_drops_the_datagram_not_the_conversation() {
+        let stats = Arc::new(Stats::default());
+        let (session, mut credits) = lone_session(64, stats.clone());
+        let (udp, _rx_udp) = session.register(None).unwrap();
+        session.open_datagram_window(udp).await.unwrap();
+        let (tcp, _rx_tcp) = session.register(None).unwrap();
+        credited(&mut credits);
+        // The queue holds max(stream_queue 32, window 64 + 4) = 68 frames.
+        for _ in 0..70 {
+            session.deliver(udp, Frame::Data { id: udp, data: vec![1; 100] });
+        }
+        assert!(session.streams.lock().unwrap().contains_key(&udp), "conversation stays");
+        assert_eq!(stats.udp_dropped.load(Ordering::Relaxed), 2);
+        assert_eq!(credited(&mut credits), 2, "the dropped datagrams' credit comes back");
+        // An ordinary stream with a full queue is still closed, as before.
+        for _ in 0..70 {
+            session.deliver(tcp, Frame::Data { id: tcp, data: vec![1; 100] });
+        }
+        assert!(!session.streams.lock().unwrap().contains_key(&tcp));
+        assert_eq!(stats.udp_dropped.load(Ordering::Relaxed), 2);
+    }
+
+    /// Live test, 90 ms link, 2000 datagrams per second: about 6% of a new conversation's first
+    /// second was lost while it waited one round trip for its window with a 32-datagram queue.
+    #[test]
+    fn a_new_udp_conversation_queues_its_first_round_trip() {
+        let tuning = |stream_queue| Tuning {
+            connect: Duration::from_secs(1),
+            open: Duration::from_secs(1),
+            udp_idle: Duration::from_secs(1),
+            tcp_idle: None,
+            stream_queue,
+            early_data: true,
+        };
+        assert_eq!(udp_queue(&tuning(32)), UDP_QUEUE);
+        assert_eq!(udp_queue(&tuning(1000)), 1000, "a larger setting is kept");
+        let stats = Arc::new(Stats::default());
+        let (tx, _rx) = mpsc::channel(udp_queue(&tuning(32)));
+        // 2000/s for 90 ms is 180 datagrams, minus the 16 the initial credits let through.
+        for _ in 0..180 {
+            queue_datagram(&tx, &[0; 1200], &stats);
+        }
+        assert_eq!(stats.udp_dropped.load(Ordering::Relaxed), 0);
+        for _ in 0..UDP_QUEUE {
+            queue_datagram(&tx, &[0; 1200], &stats);
+        }
+        assert_eq!(stats.udp_dropped.load(Ordering::Relaxed), 180, "still bounded");
+    }
+
+    /// Live test: one credit frame per datagram made each datagram cost a second tunnel message,
+    /// and on FEC-UDP about 5.8 UDP packets per echoed datagram.
+    #[tokio::test(start_paused = true)]
+    async fn a_udp_receiver_hands_credit_back_in_batches_and_never_keeps_it() {
+        let stats = Arc::new(Stats::default());
+        let (session, mut credits) = lone_session(64, stats);
+        let (id, mut rx) = session.register(None).unwrap();
+        let mut credit = CreditReturn::default();
+        for _ in 0..CREDIT_BATCH {
+            credit.consumed(&session, id).await.unwrap();
+        }
+        let mut frames = Vec::new();
+        while let Ok(frame) = credits.try_recv() {
+            frames.push(frame);
+        }
+        assert!(
+            matches!(frames.as_slice(), [Frame::Credit { frames, .. }] if *frames == CREDIT_BATCH),
+            "one frame for a full batch"
+        );
+        // A remainder is handed back once it has waited CREDIT_DELAY, even with no more data.
+        for _ in 0..3 {
+            credit.consumed(&session, id).await.unwrap();
+        }
+        assert_eq!(credited(&mut credits), 0, "held for a moment");
+        let waited = time::timeout(CREDIT_DELAY * 4, next_udp_frame(&mut rx, &mut credit, &session, id)).await;
+        assert!(waited.is_err(), "no frame arrived");
+        assert_eq!(credited(&mut credits), 3, "nothing is kept");
+        // A frame that arrives is returned at once; its credit follows within the delay.
+        session.deliver(id, Frame::Data { id, data: vec![7] });
+        let frame = next_udp_frame(&mut rx, &mut credit, &session, id).await.unwrap();
+        assert!(matches!(frame, Some(Frame::Data { .. })));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn batched_udp_credit_adds_up_to_every_datagram_consumed() {
+        let stats = Arc::new(Stats::default());
+        let (session, mut credits) = lone_session(64, stats);
+        let (id, mut rx) = session.register(None).unwrap();
+        let mut credit = CreditReturn::default();
+        let mut total = 0;
+        for burst in [1usize, 5, 8, 13, 2, 30, 7] {
+            for _ in 0..burst {
+                session.deliver(id, Frame::Data { id, data: vec![1] });
+            }
+            for _ in 0..burst {
+                let frame = next_udp_frame(&mut rx, &mut credit, &session, id).await.unwrap();
+                assert!(matches!(frame, Some(Frame::Data { .. })));
+                credit.consumed(&session, id).await.unwrap();
+            }
+            total += burst;
+            time::sleep(CREDIT_DELAY / 2).await;
+        }
+        let _ = time::timeout(CREDIT_DELAY * 2, next_udp_frame(&mut rx, &mut credit, &session, id)).await;
+        assert_eq!(credited(&mut credits), total);
+    }
+
+    /// Live: a recovered loss on the UDP carrier releases everything that waited behind it at
+    /// once, and the ordinary 68-frame queue dropped part of that burst.
+    #[tokio::test]
+    async fn a_udp_conversation_takes_a_recovered_burst_without_dropping() {
+        let stats = Arc::new(Stats::default());
+        let (session, _credits) = lone_session(64, stats.clone());
+        let (udp, _rx_udp) = session.register_datagram(None).unwrap();
+        session.open_datagram_window(udp).await.unwrap();
+        for _ in 0..UDP_QUEUE {
+            session.deliver(udp, Frame::Data { id: udp, data: vec![1; 1200] });
+        }
+        assert_eq!(stats.udp_dropped.load(Ordering::Relaxed), 0);
+        session.deliver(udp, Frame::Data { id: udp, data: vec![1; 1200] });
+        assert_eq!(stats.udp_dropped.load(Ordering::Relaxed), 1, "still bounded");
+        // Ordinary streams keep their queue.
+        let (tcp, mut rx_tcp) = session.register(None).unwrap();
+        let mut held = 0;
+        while session.streams.lock().unwrap().contains_key(&tcp) {
+            session.deliver(tcp, Frame::Data { id: tcp, data: vec![1] });
+            held += 1;
+            assert!(held <= 100);
+        }
+        let mut queued = 0;
+        while rx_tcp.try_recv().is_ok() {
+            queued += 1;
+        }
+        assert_eq!(queued, 68);
+    }
+
+    #[test]
+    fn an_oversize_datagram_is_counted() {
+        let stats = Stats::default();
+        oversize_datagram(&stats, DATA_SIZE + 1);
+        oversize_datagram(&stats, 32_704);
+        assert_eq!(stats.udp_dropped.load(Ordering::Relaxed), 2);
+        assert_eq!(stats.udp_oversize.load(Ordering::Relaxed), 2);
     }
 
     #[test]

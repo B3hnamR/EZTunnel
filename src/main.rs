@@ -109,6 +109,12 @@ enum Command {
         #[command(subcommand)]
         action: DashboardCommand,
     },
+    /// Let a dashboard on another server manage this server's tunnels.
+    #[cfg(feature = "dashboard")]
+    Agent {
+        #[command(subcommand)]
+        action: AgentCommand,
+    },
     /// Generate a local TLS certificate. Copy cert.pem to the client's ca_file.
     Certgen {
         #[arg(long)]
@@ -121,12 +127,51 @@ enum Command {
 
 #[cfg(feature = "dashboard")]
 #[derive(Subcommand)]
+enum AgentCommand {
+    /// Join this server to a dashboard with the one-time code it shows, and start the agent.
+    Join { code: String },
+    /// Run the agent (the eztunnel-agent service does this).
+    Run {
+        #[arg(long, default_value = "/etc/eztunnel-agent")]
+        config_dir: PathBuf,
+    },
+    /// Stop the agent and forget the dashboard. Tunnels on this server keep running.
+    Leave,
+}
+
+#[cfg(feature = "dashboard")]
+#[derive(Subcommand)]
 enum DashboardCommand {
-    /// Create the settings: a random port, a random password shown once, a certificate.
+    /// Create the settings (a random port, a random password shown once, a certificate) and
+    /// start the dashboard's service, which also starts with the server.
     Setup {
         /// Use this port instead of a random one.
         #[arg(long)]
         port: Option<u16>,
+        /// Only create the settings; run the dashboard yourself with `eztunnel dashboard serve`.
+        #[arg(long)]
+        no_service: bool,
+        #[arg(long, default_value = eztunnel::dashboard::DEFAULT_STATE_DIR)]
+        state_dir: PathBuf,
+    },
+    /// Show whether the dashboard runs, its address and certificate, and whether this server is
+    /// joined to a dashboard.
+    Status {
+        #[arg(long, default_value = eztunnel::dashboard::DEFAULT_STATE_DIR)]
+        state_dir: PathBuf,
+    },
+    /// Move the dashboard to another port.
+    Port {
+        port: u16,
+        #[arg(long, default_value = eztunnel::dashboard::DEFAULT_STATE_DIR)]
+        state_dir: PathBuf,
+    },
+    /// Stop the dashboard and remove its service. Settings, history and backups stay unless
+    /// --delete-data is given. Tunnels keep running.
+    Remove {
+        /// Also delete the settings, history and backups.
+        #[arg(long)]
+        delete_data: bool,
         #[arg(long, default_value = eztunnel::dashboard::DEFAULT_STATE_DIR)]
         state_dir: PathBuf,
     },
@@ -137,6 +182,24 @@ enum DashboardCommand {
         /// Listen only on this address (default: all addresses).
         #[arg(long)]
         listen: Option<IpAddr>,
+    },
+    /// Use a Let's Encrypt certificate for this server's address (an IP address works), renewed
+    /// automatically; or go back to the self-signed one with --self-signed.
+    Certificate {
+        /// Order a Let's Encrypt certificate now and keep renewing it.
+        #[arg(long, conflicts_with = "self_signed", required_unless_present = "self_signed")]
+        lets_encrypt: bool,
+        /// Go back to the self-signed certificate.
+        #[arg(long)]
+        self_signed: bool,
+        /// The address the certificate names (default: this server's address).
+        #[arg(long)]
+        address: Option<String>,
+        /// Use Let's Encrypt's staging service (for testing; browsers do not trust it).
+        #[arg(long)]
+        staging: bool,
+        #[arg(long, default_value = eztunnel::dashboard::DEFAULT_STATE_DIR)]
+        state_dir: PathBuf,
     },
     /// Replace the password with a new random one, shown once.
     ResetPassword {
@@ -227,6 +290,10 @@ enum CheckCommand {
         /// Also save the report as JSON here.
         #[arg(long)]
         json: Option<PathBuf>,
+        /// Reach the other server's control port at this address instead (the local end of a
+        /// forward through a machine both servers can reach, such as an SSH port forward).
+        #[arg(long)]
+        control_via: Option<SocketAddr>,
     },
     /// Join a check started on the other server.
     Join {
@@ -234,6 +301,10 @@ enum CheckCommand {
         /// Also save the report as JSON here.
         #[arg(long)]
         json: Option<PathBuf>,
+        /// Reach the other server's control port at this address instead (the local end of a
+        /// forward through a machine both servers can reach, such as an SSH port forward).
+        #[arg(long)]
+        control_via: Option<SocketAddr>,
     },
 }
 
@@ -376,9 +447,21 @@ async fn run(cli: Cli) -> Result<()> {
             Command::Menu => eztunnel::manager::run()?,
             Command::Key => println!("{}", eztunnel::tunnel_key::TunnelKey::generate()?.display()),
             #[cfg(feature = "dashboard")]
+            Command::Agent { action } => match action {
+                AgentCommand::Join { code } => eztunnel::dashboard::agent_join(&code).await?,
+                AgentCommand::Run { config_dir } => eztunnel::dashboard::agent_run(&config_dir).await?,
+                AgentCommand::Leave => eztunnel::dashboard::agent_leave()?,
+            },
+            #[cfg(feature = "dashboard")]
             Command::Dashboard { action } => match action {
-                DashboardCommand::Setup { port, state_dir } => eztunnel::dashboard::setup(&state_dir, port)?,
+                DashboardCommand::Setup { port, no_service, state_dir } => eztunnel::dashboard::setup(&state_dir, port, !no_service)?,
+                DashboardCommand::Status { state_dir } => eztunnel::dashboard::status(&state_dir)?,
+                DashboardCommand::Port { port, state_dir } => eztunnel::dashboard::set_port(&state_dir, port)?,
+                DashboardCommand::Remove { delete_data, state_dir } => eztunnel::dashboard::remove(&state_dir, delete_data)?,
                 DashboardCommand::Serve { state_dir, listen } => eztunnel::dashboard::serve(&state_dir, listen).await?,
+                DashboardCommand::Certificate { lets_encrypt, self_signed: _, address, staging, state_dir } => {
+                    eztunnel::dashboard::certificate(&state_dir, lets_encrypt, staging, address).await?
+                }
                 DashboardCommand::ResetPassword { state_dir } => eztunnel::dashboard::reset_password(&state_dir)?,
                 DashboardCommand::Demo { port, empty } => eztunnel::dashboard::demo(port, empty).await?,
             },
@@ -447,7 +530,11 @@ async fn run(cli: Cli) -> Result<()> {
                         also_pacer,
                         also_fragment,
                         json,
+                        control_via,
                     } => {
+                        if let Some(via) = control_via {
+                            eztunnel::checker::control::set_control_via(Some(via));
+                        }
                         let mut options = Options::preset(match preset {
                             PresetArg::Quick => Preset::Quick,
                             PresetArg::Standard => Preset::Standard,
@@ -494,7 +581,10 @@ async fn run(cli: Cli) -> Result<()> {
                         println!("eztunnel check join {}", code::encode(&check)?);
                         eztunnel::checker::cli::run(check, me, json.as_deref()).await?;
                     }
-                    CheckCommand::Join { code: text, json } => {
+                    CheckCommand::Join { code: text, json, control_via } => {
+                        if let Some(via) = control_via {
+                            eztunnel::checker::control::set_control_via(Some(via));
+                        }
                         let check = code::decode(&text)?;
                         let me = check.starter.other();
                         eztunnel::checker::cli::run(check, me, json.as_deref()).await?;

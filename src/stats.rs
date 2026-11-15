@@ -203,9 +203,11 @@ pub struct Stats {
     pub pings_lost: AtomicU64,
     /// Memory the flow-control windows of all user connections may use (see `WindowBudget`).
     pub window_budget: WindowBudget,
-    /// UDP datagrams dropped before entering the tunnel because the memory budget was used up or
-    /// the conversation's queue was full.
+    /// UDP datagrams dropped: the memory budget was used up, a conversation's queue was full, or
+    /// the datagram was larger than one tunnel frame.
     pub udp_dropped: AtomicU64,
+    /// The part of `udp_dropped` that was larger than one tunnel frame (16 KiB).
+    pub udp_oversize: AtomicU64,
     /// The live sessions, to tell the other server before this one stops.
     pub farewell: crate::farewell::Farewell,
     /// Heartbeat round trips in microseconds.

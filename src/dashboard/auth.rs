@@ -9,6 +9,7 @@ use std::{
     collections::{HashMap, VecDeque},
     net::IpAddr,
     sync::Mutex,
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 use tokio::sync::Semaphore;
@@ -31,6 +32,7 @@ const GLOBAL_FAILURES: usize = 30;
 const GLOBAL_PAUSE: Duration = Duration::from_secs(60);
 /// Addresses remembered by the limiter before old entries are dropped.
 const MAX_TRACKED: usize = 10_000;
+pub const MAX_PASSWORD_BYTES: usize = 256;
 
 pub fn hash_password(password: &str) -> Result<String> {
     let mut salt = [0u8; 16];
@@ -54,6 +56,8 @@ fn token_key(token: &str) -> [u8; 32] {
 struct Session {
     created: Instant,
     last_seen: Instant,
+    /// Where it signed in from.
+    ip: Option<IpAddr>,
 }
 
 #[derive(Default)]
@@ -124,9 +128,12 @@ pub enum Login {
 }
 
 pub struct Auth {
-    hash: String,
+    hash: Mutex<String>,
     sessions: Mutex<HashMap<[u8; 32], Session>>,
     limiter: Mutex<Limiter>,
+    /// Serializes password transitions with session creation.
+    transition: tokio::sync::Mutex<()>,
+    generation: AtomicU64,
     /// Password checks are slow on purpose; only a few run at once.
     checks: Semaphore,
 }
@@ -134,9 +141,11 @@ pub struct Auth {
 impl Auth {
     pub fn new(hash: String) -> Self {
         Self {
-            hash,
+            hash: Mutex::new(hash),
             sessions: Mutex::new(HashMap::new()),
             limiter: Mutex::new(Limiter::default()),
+            transition: tokio::sync::Mutex::new(()),
+            generation: AtomicU64::new(0),
             checks: Semaphore::new(2),
         }
     }
@@ -145,11 +154,20 @@ impl Auth {
         if let Some(seconds) = self.limiter.lock().unwrap().wait(ip, Instant::now()) {
             return Ok(Login::Wait(seconds));
         }
+        let generation = self.generation.load(Ordering::Acquire);
         let matches = {
             let _permit = self.checks.acquire().await?;
-            let hash = self.hash.clone();
+            let hash = self.hash.lock().unwrap().clone();
             tokio::task::spawn_blocking(move || password_matches(&hash, &password)).await?
         };
+        self.finish_login(ip, matches, generation).await
+    }
+
+    async fn finish_login(&self, ip: IpAddr, matches: bool, generation: u64) -> Result<Login> {
+        let _transition = self.transition.lock().await;
+        if generation != self.generation.load(Ordering::Acquire) {
+            return Ok(Login::Wrong);
+        }
         let mut limiter = self.limiter.lock().unwrap();
         if !matches {
             limiter.failed(ip, Instant::now());
@@ -174,6 +192,7 @@ impl Auth {
             Session {
                 created: now,
                 last_seen: now,
+                ip: Some(ip),
             },
         );
         Ok(Login::Ok(token))
@@ -200,6 +219,64 @@ impl Auth {
     pub fn logout(&self, token: &str) {
         self.sessions.lock().unwrap().remove(&token_key(token));
     }
+
+    /// The signed-in sessions: a short id, where from, age and idle time; `current` marks the
+    /// one asking.
+    pub fn sessions(&self, current: &str) -> Vec<serde_json::Value> {
+        let now = Instant::now();
+        let mine = token_key(current);
+        let mut sessions = self.sessions.lock().unwrap();
+        sessions.retain(|_, s| alive(s, now));
+        let mut list: Vec<(Instant, serde_json::Value)> = sessions
+            .iter()
+            .map(|(key, s)| {
+                (s.created, serde_json::json!({
+                    "id": session_id(key),
+                    "ip": s.ip.map(|ip| ip.to_string()),
+                    "age_sec": (now - s.created).as_secs(),
+                    "idle_sec": (now - s.last_seen).as_secs(),
+                    "current": *key == mine,
+                }))
+            })
+            .collect();
+        list.sort_by_key(|(created, _)| std::cmp::Reverse(*created));
+        list.into_iter().map(|(_, v)| v).collect()
+    }
+
+    /// Ends one session by its id, or every session but `current` with `"others"`. Returns how
+    /// many ended.
+    pub fn revoke(&self, id: &str, current: &str) -> usize {
+        let mine = token_key(current);
+        let mut sessions = self.sessions.lock().unwrap();
+        let before = sessions.len();
+        sessions.retain(|key, _| if id == "others" { *key == mine } else { session_id(key) != id || *key == mine });
+        before - sessions.len()
+    }
+
+    /// Changes the password after checking the current one, ends every other session, and
+    /// returns the new hash for saving.
+    pub async fn change_password(&self, current_token: &str, current: String, new: String) -> Result<String> {
+        anyhow::ensure!(new.chars().count() >= 12, "the new password needs at least 12 characters");
+        anyhow::ensure!(new.len() <= MAX_PASSWORD_BYTES, "the new password is too long");
+        let _transition = self.transition.lock().await;
+        anyhow::ensure!(self.check(current_token), "the session ended; sign in again");
+        let matches = {
+            let _permit = self.checks.acquire().await?;
+            let hash = self.hash.lock().unwrap().clone();
+            tokio::task::spawn_blocking(move || password_matches(&hash, &current)).await?
+        };
+        anyhow::ensure!(matches, "the current password is wrong");
+        let hash = tokio::task::spawn_blocking(move || hash_password(&new)).await??;
+        *self.hash.lock().unwrap() = hash.clone();
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.revoke("others", current_token);
+        Ok(hash)
+    }
+}
+
+/// A session's short public id: never enough to sign in with.
+fn session_id(key: &[u8; 32]) -> String {
+    key[..6].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn alive(session: &Session, now: Instant) -> bool {
@@ -212,6 +289,25 @@ mod tests {
 
     fn ip(last: u8) -> IpAddr {
         IpAddr::from([198, 51, 100, last])
+    }
+
+    #[tokio::test]
+    async fn a_login_checked_before_a_password_change_cannot_create_a_session() {
+        let auth = Auth::new(hash_password("old password").unwrap());
+        let generation = auth.generation.load(Ordering::Acquire);
+        auth.generation.fetch_add(1, Ordering::AcqRel);
+        assert!(matches!(auth.finish_login(ip(1), true, generation).await.unwrap(), Login::Wrong));
+        assert!(auth.sessions.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn password_changes_use_the_login_byte_limit() {
+        let auth = Auth::new(hash_password("old password").unwrap());
+        let Login::Ok(token) = auth.login(ip(1), "old password".into()).await.unwrap() else { panic!() };
+        assert!(auth.change_password(&token, "old password".into(), "\u{e9}".repeat(129)).await.is_err());
+        let accepted = "\u{e9}".repeat(128);
+        auth.change_password(&token, "old password".into(), accepted.clone()).await.unwrap();
+        assert!(matches!(auth.login(ip(1), accepted).await.unwrap(), Login::Ok(_)));
     }
 
     #[test]
@@ -292,13 +388,37 @@ mod tests {
         assert!(!auth.check(&token));
     }
 
+    #[tokio::test]
+    async fn sessions_are_listed_revoked_and_ended_by_a_new_password() {
+        let auth = Auth::new(hash_password("correct horse battery").unwrap());
+        let Login::Ok(mine) = auth.login(ip(1), "correct horse battery".into()).await.unwrap() else { panic!() };
+        let Login::Ok(other) = auth.login(ip(2), "correct horse battery".into()).await.unwrap() else { panic!() };
+        let list = auth.sessions(&mine);
+        assert_eq!(list.len(), 2);
+        assert_eq!(list.iter().filter(|s| s["current"] == true).count(), 1);
+        assert!(!list.iter().any(|s| s["id"].as_str().unwrap().len() > 12), "ids are short");
+        let other_id = list.iter().find(|s| s["current"] == false).unwrap()["id"].as_str().unwrap().to_string();
+        assert_eq!(auth.revoke(&other_id, &mine), 1);
+        assert!(!auth.check(&other) && auth.check(&mine));
+        // The current session cannot be revoked by id.
+        let mine_id = auth.sessions(&mine)[0]["id"].as_str().unwrap().to_string();
+        assert_eq!(auth.revoke(&mine_id, &mine), 0);
+        let Login::Ok(third) = auth.login(ip(3), "correct horse battery".into()).await.unwrap() else { panic!() };
+        assert!(auth.change_password(&mine, "wrong".into(), "a brand new password".into()).await.is_err());
+        assert!(auth.change_password(&mine, "correct horse battery".into(), "short".into()).await.is_err());
+        auth.change_password(&mine, "correct horse battery".into(), "a brand new password".into()).await.unwrap();
+        assert!(auth.check(&mine) && !auth.check(&third), "other sessions end");
+        assert!(matches!(auth.login(ip(4), "correct horse battery".into()).await.unwrap(), Login::Wrong));
+        assert!(matches!(auth.login(ip(4), "a brand new password".into()).await.unwrap(), Login::Ok(_)));
+    }
+
     #[test]
     fn idle_and_old_sessions_are_not_alive() {
         let now = Instant::now();
-        let fresh = Session { created: now, last_seen: now };
+        let fresh = Session { created: now, last_seen: now, ip: None };
         assert!(alive(&fresh, now));
         assert!(!alive(&fresh, now + IDLE));
-        let old = Session { created: now, last_seen: now + LIFETIME };
+        let old = Session { created: now, last_seen: now + LIFETIME, ip: None };
         assert!(!alive(&old, now + LIFETIME));
     }
 }

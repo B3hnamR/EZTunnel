@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.10.0 (2026-11-15)
+
+- Web dashboard (optional): an HTTPS dashboard in English and Persian, set up from **Tools → Web
+  dashboard** or `eztunnel dashboard setup`, running as the `eztunnel-dashboard` service. It shows
+  every tunnel live with up to 30 days of history, as cards or as a compact list; creates tunnels
+  on any two servers, edits, starts, stops and deletes them (on both ends of a pair at once when
+  asked), and follows their logs; runs the transport checker (a preset, or every transport and
+  measurement chosen by hand), a path finder and the Mirage source test between two servers, and
+  creates a tunnel from the best result; checks the health of every server and fixes what it can;
+  updates any server to the newest official release, picking the file for its CPU, or all of them
+  in turn, and keeps and restores backups (also from a file); and sends alerts, also to Telegram,
+  where a test message can be sent before the settings are saved. Settings cover the password and
+  sessions, a proxy and a token-protected `/metrics` endpoint; Maintenance has automatic backups.
+  Its address can get a Let's Encrypt certificate (an IP address works). See [docs/dashboard.md](docs/dashboard.md).
+- Agents: other servers join a dashboard with a one-time join command or over SSH and run the
+  `eztunnel-agent` service, which connects out to the dashboard over an encrypted link; nothing has
+  to be opened on them. `eztunnel agent join`, `eztunnel agent leave`, and the same steps in
+  **Tools → Web dashboard**.
+- New `eztunnel dashboard` commands: `status`, `port`, `remove` (with `--delete-data`),
+  `reset-password`, `certificate` and `demo`.
+- The terminal manager and the dashboard never change the same tunnel at the same time: each
+  tunnel has a change lock, and a change made elsewhere is refused or waits instead of being lost.
+- Transport checker: while one server waits for the other, it looks at the path every 45 s and says
+  why the other has not joined. When the servers cannot reach each other's control port, **Through
+  my computer over SSH** (`--control-via`) carries only the control messages through an SSH forward
+  from your computer; every test tunnel still connects the servers directly.
+- SOCKS5 and port maps to a host name: the far end tries the name's addresses IPv4 first,
+  alternating with IPv6, and starts the next one after 250 ms instead of spending the whole connect
+  timeout on the first. A server whose IPv6 address does not actually work (an address on a
+  VPN interface, for example) no longer fails names that also have an IPv4 address. UDP to a
+  name uses its IPv4 address when it has one.
+- UDP: a UDP conversation's window counts datagrams (at least 1024) instead of 16 KiB frames, so
+  small datagrams are no longer held to a few hundred per second. A datagram larger than 16 KiB is
+  dropped and counted in `udp_dropped`, and separately in `udp_oversize`.
+
 ## 0.9.14 (2026-11-11)
 
 - KCP/FEC: `flush` hands data to KCP and returns again; only shutdown waits for the queued

@@ -173,6 +173,9 @@ fn start(store: &Store) -> Result<()> {
         Ok((me, iran_ip, foreign_ip, options))
     })?;
     let code = CheckCode::new(me, iran_ip, foreign_ip, options)?;
+    if !bridge(code.ip(me), code.ip(me.other()), code.options.control_port)? {
+        return Ok(());
+    }
     let text = code::encode(&code)?;
     ui::boxed(
         "On the other server",
@@ -212,7 +215,47 @@ fn join(store: &Store) -> Result<()> {
         }
         Ok((code, me))
     })?;
+    if !bridge(code.ip(me), code.ip(me.other()), code.options.control_port)? {
+        return Ok(());
+    }
     watch(store, code, me)
+}
+
+/// How the two servers coordinate the check. Normally directly; when they cannot reach each
+/// other, through the operator's computer: an SSH reverse forward makes a local port on this
+/// server lead to the other server's control port. Only the check's control messages take that
+/// way; every test tunnel still connects directly, so each transport still gets a real verdict.
+/// Returns false when the operator went back.
+fn bridge(own: IpAddr, other: IpAddr, control: u16) -> Result<bool> {
+    let ways = vec![
+        format!("{}  {}", ui::bold("Directly"), ui::dim("the two servers can reach each other (normal)")),
+        format!("{}  {}", ui::bold("Through my computer over SSH"), ui::dim("the servers cannot reach each other, but my computer reaches both")),
+    ];
+    let Some(way) = choose_or_back("How do the two servers coordinate the check?", &ways, 0)? else {
+        return Ok(false);
+    };
+    if way == 0 {
+        crate::checker::control::set_control_via(None);
+        return Ok(true);
+    }
+    const LOCAL: u16 = 47101;
+    let host = |ip: IpAddr| if ip.is_ipv6() { format!("[{ip}]") } else { ip.to_string() };
+    ui::boxed(
+        "On your computer (keep it open while the check runs)",
+        &[
+            format!("ssh -N -R {LOCAL}:{}:{control} root@{}", host(other), host(own)),
+            String::new(),
+            "Use your SSH user instead of root if it differs; add -p PORT when SSH is not on port 22.".into(),
+            "Only this server uses it: on the other server choose Directly.".into(),
+            "If the other server can still reach this one directly, the check starts without it.".into(),
+            format!("If your computer cannot reach {}:{control} directly, use two windows instead:", host(other)),
+            format!("  ssh -N -L 47102:127.0.0.1:{control} root@{}", host(other)),
+            format!("  ssh -N -R {LOCAL}:127.0.0.1:47102 root@{}", host(own)),
+        ],
+    );
+    ui::note("Only the check's control messages go through your computer; every test tunnel still connects the servers directly, so each transport gets its real result.");
+    crate::checker::control::set_control_via(Some(std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, LOCAL))));
+    Ok(true)
 }
 
 /// Preset, priority and (for Custom) every option; then a summary to confirm.
@@ -868,6 +911,9 @@ impl Screen {
             _ => view.step.clone(),
         };
         lines.push(format!("  {} {step}", style("▸").cyan()));
+        if let Some(hint) = view.path_hint.as_ref().filter(|_| !view.connected) {
+            lines.push(format!("  {}", style(hint).yellow()));
+        }
         let keys = if view.finished {
             "press any key for the results".to_string()
         } else if self.confirm_stop.is_some() {

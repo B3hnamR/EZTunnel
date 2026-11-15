@@ -80,10 +80,12 @@ pub fn set_everywhere(
     tunnels
         .iter()
         .map(|name| {
-            let result = store.read(name).and_then(|mut config| {
+            let result = (|| {
+                let _lock = store.lock(name, false)?;
+                let mut config = store.read(name)?;
                 apply_setting(&mut config, setting, value)?;
                 store.save(name, &config)
-            });
+            })();
             (name.clone(), result)
         })
         .collect()
@@ -131,10 +133,11 @@ fn delete_all(store: &Store) -> Result<()> {
     }
     for name in &names {
         let result = (|| {
+            let _lock = store.lock(name, false)?;
             if store.system {
                 service::remove(name)?;
             }
-            store.remove(name)
+            store.remove_locked(name)
         })();
         match result {
             Ok(()) => ui::ok(&format!("Deleted {name}")),
@@ -359,5 +362,16 @@ mod tests {
         for name in &names {
             assert!(store.read(name).unwrap().get("heartbeat_sec").is_none());
         }
+    }
+
+    #[test]
+    fn bulk_settings_refuse_a_tunnel_being_changed_elsewhere() {
+        let (_directory, store) = store();
+        let original = client(7000);
+        store.save("client", &original).unwrap();
+        let _held = store.lock("client", false).unwrap();
+        let results = set_everywhere(&store, &setting("heartbeat_sec"), Some(20), &["client".into()]);
+        assert!(results[0].1.is_err());
+        assert_eq!(store.read("client").unwrap(), original);
     }
 }

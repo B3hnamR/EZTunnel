@@ -257,6 +257,21 @@ async fn hello(
 /// Where the control listener binds: every address of this machine (a server behind NAT does not
 /// have its public address locally), except for a loopback address, which tests use to run both
 /// sides on one machine.
+/// Where this server dials the other one's control port instead of its address: the local end
+/// of a forward through a machine both can reach (an SSH port forward from an operator's PC),
+/// for two servers that cannot reach each other. The handshake still proves the other server;
+/// only the control messages take that way, the test tunnels still go directly.
+static CONTROL_VIA: std::sync::Mutex<Option<SocketAddr>> = std::sync::Mutex::new(None);
+
+/// `None` goes back to dialing the other server directly.
+pub fn set_control_via(address: Option<SocketAddr>) {
+    *CONTROL_VIA.lock().unwrap() = address;
+}
+
+fn control_via() -> Option<SocketAddr> {
+    *CONTROL_VIA.lock().unwrap()
+}
+
 fn bind_address(own: IpAddr, other: IpAddr, port: u16) -> SocketAddr {
     if own.is_loopback() {
         return SocketAddr::new(own, port);
@@ -346,10 +361,17 @@ async fn pair_as(
             }
         });
     }
-    {
+    // Dial the other server directly and, when a forward is given, through it too: whichever
+    // connects first wins, so the forward never makes a reachable pair slower.
+    let mut targets = vec![SocketAddr::new(other_ip, port).to_string()];
+    if let Some(via) = control_via() {
+        targets.push(via.to_string());
+    }
+    for target in targets {
         let found = found.clone();
-        let target = SocketAddr::new(other_ip, port).to_string();
         let mine = mine.clone();
+        let client_private = client_private.clone();
+        let server_public = server_public.clone();
         tasks.spawn(async move {
             // The foreign server dials first; the Iran server joins in when that does not work.
             if me == Side::Iran {
@@ -369,7 +391,11 @@ async fn pair_as(
     }
     drop(found);
     status(&format!(
-        "waiting for the other server ({other_ip}, control port {port})"
+        "waiting for the other server ({}, control port {port})",
+        match control_via() {
+            Some(via) => format!("{other_ip} through {via}"),
+            None => other_ip.to_string(),
+        }
     ));
     loop {
         let first = time::timeout_at(deadline, links.recv())

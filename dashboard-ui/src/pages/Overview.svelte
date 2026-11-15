@@ -10,7 +10,9 @@
   import State from "./State.svelte";
   import { live } from "../lib/live.svelte.js";
   import { t, ui, num, pct, rate, amount, dateText } from "../lib/i18n.svelte.js";
-  import { tunnelState, transportLabel, isUp } from "../lib/view.js";
+  import { tunnelState, transportLabel, isUp, linkState } from "../lib/view.js";
+  import LinkLine from "../lib/LinkLine.svelte";
+  import { fleet } from "../lib/servers.svelte.js";
 
   const reduced = typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
   // Under reduced motion the chart starts still; Resume makes it follow the data.
@@ -19,10 +21,26 @@
 
   const snap = $derived(live.snapshot);
   const tunnels = $derived(snap?.tunnels ?? []);
-  const issues = $derived(snap?.issues ?? []);
+  // Trouble on every server: this one's, each joined server's, and joined servers that went quiet.
+  const issues = $derived([
+    ...(snap?.issues ?? []),
+    ...fleet.list.flatMap((s) =>
+      s.online
+        ? (s.snapshot?.issues ?? []).map((i) => ({ ...i, server: s.name, serverId: s.id }))
+        : [{ level: "bad", kind: "server_offline", server: s.name, serverId: s.id }],
+    ),
+    // Drift: a joined server running another program version than this one.
+    ...fleet.list
+      .filter((s) => s.online && s.snapshot?.version && snap?.version && s.snapshot.version !== snap.version)
+      .map((s) => ({ level: "warn", kind: "server_version", server: s.name, serverId: s.id, value: s.snapshot.version })),
+  ]);
   const level = $derived(issues.some((i) => i.level === "bad") ? "bad" : issues.length ? "warn" : "ok");
+  const remoteTunnels = $derived(fleet.list.flatMap((s) => (s.online ? s.snapshot?.tunnels ?? [] : [])));
+  const allTunnels = $derived([...tunnels, ...remoteTunnels]);
   const running = $derived(tunnels.filter((x) => x.state === "running"));
-  const pings = $derived(running.map((x) => x.rtt_ms).filter((v) => v != null));
+  const runningAll = $derived(allTunnels.filter((x) => x.state === "running"));
+  const pings = $derived(runningAll.map((x) => x.rtt_ms).filter((v) => v != null));
+  const serversOnline = $derived(fleet.list.filter((s) => s.online).length);
   const shown = $derived(paused ? frozen : live.history);
 
   // Ranges other than Live come from the stored history (all tunnels summed).
@@ -65,7 +83,8 @@
 
   function issueText(issue) {
     const text = t("issue")[issue.kind];
-    return typeof text === "function" ? text(pct(issue.value ?? 0)) : text;
+    if (typeof text !== "function") return text;
+    return text(issue.kind === "udp_drops" ? num(issue.value ?? 0) : pct(issue.value ?? 0));
   }
 
   function total(x) {
@@ -77,38 +96,11 @@
 
 {#if snap}
   <Strip host={snap.host} />
-  {#if tunnels.length === 0}
+  {#if allTunnels.length === 0 && fleet.list.length === 0}
     <Empty />
   {:else}
-    <section class="panel hero {level}" aria-labelledby="hero-h">
-      <div>
-        <h2 id="hero-h"><span class="mark {level}"></span>{issues.length ? t("attn", issues.length) : t("healthy")}</h2>
-        {#if issues.length}
-          <ul class="issues">
-            {#each issues as issue}
-              <li>
-                <span class="mark {issue.level}"></span>
-                <span>{ui.lang === "fa" ? "تونل " : ""}<b class="ltr">{issue.tunnel}</b> {issueText(issue)}</span>
-              </li>
-            {/each}
-          </ul>
-        {/if}
-      </div>
-      <a class="btn" href="#/tunnels">{t("openTunnels")}</a>
-      <div class="stats">
-        <div><div class="label">{t("kTunnels")}</div><div class="num">{num(running.length)}<small>{t("of")} {num(tunnels.length)}</small></div></div>
-        <div>
-          <div class="label">{t("kToday")}</div>
-          {#if todayBytes == null}<div class="num">-</div>{:else}{@const [v, u] = size(todayBytes)}<div class="num">{v}<small>{u}</small></div>{/if}
-        </div>
-        <div>
-          <div class="label">{t("kPing")}</div>
-          <div class="num">{pings.length ? num(pings.reduce((a, b) => a + b, 0) / pings.length) : "-"}<small>ms</small></div>
-        </div>
-      </div>
-    </section>
-
-    <section class="panel mt16" aria-labelledby="tr-h">
+    <div class="ov-grid">
+    <section class="panel" aria-labelledby="tr-h">
       <div class="row-flex">
         <div class="grow"><h2 id="tr-h">{t("traffic")}</h2><div class="muted small">{t("trafficSub")}</div></div>
         <div class="legend"><span><i class="sw-recv"></i>{t("recv")}</span><span><i class="sw-sent"></i>{t("sent")}</span></div>
@@ -163,6 +155,47 @@
       {/if}
     </section>
 
+    <section class="panel" aria-labelledby="hero-h">
+      <div class="ov-status"><span class="mark {level}"></span><h2 id="hero-h">{issues.length ? t("attn", issues.length) : t("healthy")}</h2></div>
+      {#if issues.length}
+        <ul class="issues">
+          {#each issues as issue}
+            <li>
+              <span class="mark {issue.level}"></span>
+              {#if issue.kind === "server_offline"}
+                <span>{ui.lang === "fa" ? "سرور " : ""}<b class="ltr">{issue.server}</b> {t("issue").server_offline}</span>
+              {:else if issue.kind === "server_version"}
+                <span>{ui.lang === "fa" ? "سرور " : ""}<b class="ltr">{issue.server}</b> {t("versionDrift", issue.value, snap.version)}</span>
+              {:else}
+                <span>{ui.lang === "fa" ? "تونل " : ""}<b class="ltr">{issue.tunnel}</b>{#if issue.server}<span class="issue-on">{t("issueOn")} <b class="ltr">{issue.server}</b></span>{/if} {issueText(issue)}</span>
+              {/if}
+            </li>
+          {/each}
+        </ul>
+      {/if}
+      <div class="figures">
+        <div><span class="label">{fleet.list.length ? t("kTunnelsAll") : t("kTunnels")}</span><span class="num">{num(runningAll.length)}<small>{t("of")} {num(allTunnels.length)}</small></span></div>
+        {#if fleet.list.length}
+          <div><span class="label">{t("kServers")}</span><span class="num">{num(serversOnline + 1)}<small>{t("of")} {num(fleet.list.length + 1)}</small></span></div>
+        {/if}
+        <div>
+          <span class="label">{t("kToday")}</span>
+          {#if todayBytes == null}<span class="num">-</span>{:else}{@const [v, u] = size(todayBytes)}<span class="num">{v}<small>{u}</small></span>{/if}
+        </div>
+        <div>
+          <span class="label">{t("kPing")}</span>
+          <span class="num">{pings.length ? num(pings.reduce((a, b) => a + b, 0) / pings.length) : "-"}<small>ms</small></span>
+        </div>
+      </div>
+      <div class="row-flex ov-quick mt16">
+        <a class="btn" href={fleet.list.length ? "#/servers" : "#/tunnels"}>{fleet.list.length ? t("openServers") : t("openTunnels")}</a>
+        <a class="btn ghost" href="#/health"><Icon name="health" />{t("health")}</a>
+        <a class="btn ghost" href="#/alerts"><Icon name="alerts" />{t("alerts")}</a>
+      </div>
+    </section>
+    </div>
+
+    {#if tunnels.length}
     <div class="sec-head"><h2>{t("tunnelsList")}</h2><div class="grow"></div><a class="btn" href="#/tunnels">{t("viewAll")}</a></div>
     <div class="panel tablewrap">
       <table class="table">
@@ -170,7 +203,6 @@
           <tr>
             <th scope="col">{t("name")}</th>
             <th scope="col">{t("route")}</th>
-            <th scope="col" class="hide-m">{t("ping")}</th>
             <th scope="col" class="hide-m">{t("loss")}</th>
             <th scope="col" class="hide-m">{t("total")}</th>
             <th scope="col">{t("state")}</th>
@@ -181,8 +213,7 @@
             {@const [mark, label] = tunnelState(x)}
             <tr>
               <td class="tname"><span class="ltr">{x.name}</span><small><span class="ltr">{transportLabel(x.transport)}</span> · {t(x.direction || "reverse")}</small></td>
-              <td><span class="route">{t(x.side || "iran")}<span class="ltr mono">{x.link}</span></span></td>
-              <td class="num hide-m">{isUp(x) && x.rtt_ms != null ? `${num(x.rtt_ms)} ms` : "-"}</td>
+              <td><LinkLine from={t(x.side || "iran")} to={x.link} state={linkState(x)} label={isUp(x) && x.rtt_ms != null ? `${num(x.rtt_ms)} ms` : ""} /></td>
               <td class="num hide-m">{isUp(x) && x.loss_pct != null ? pct(x.loss_pct) : "-"}</td>
               <td class="num hide-m">{total(x)}</td>
               <td><State {mark} {label} /></td>
@@ -191,5 +222,6 @@
         </tbody>
       </table>
     </div>
+    {/if}
   {/if}
 {/if}

@@ -790,7 +790,7 @@ fn describe(config: &Value) -> Result<(Mode, bool, Transport)> {
 }
 
 /// The numeric settings offered for a saved tunnel.
-pub(super) fn settings_of(config: &Value) -> Result<Vec<Setting>> {
+pub(crate) fn settings_of(config: &Value) -> Result<Vec<Setting>> {
     let (mode, server_dials, transport) = describe(config)?;
     Ok(relevant_settings(mode, transport, server_dials))
 }

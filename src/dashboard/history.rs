@@ -16,6 +16,8 @@ use std::{
 /// Days of history kept.
 pub const RETENTION_DAYS: u64 = 30;
 const MINUTES_PER_DAY: u64 = 1440;
+/// The longest gap between two samples that is still counted as it is (five intervals).
+const MAX_GAP_MS: u64 = 10_000;
 const MAGIC: &[u8; 8] = b"EZHIST01";
 const ROW: usize = 56;
 
@@ -291,8 +293,7 @@ impl Sum {
         }
     }
 
-    fn traffic(&mut self, down_bps: Option<f64>, up_bps: Option<f64>) {
-        let seconds = INTERVAL.as_secs_f64();
+    fn traffic(&mut self, seconds: f64, down_bps: Option<f64>, up_bps: Option<f64>) {
         let (down, up) = (down_bps.unwrap_or(0.0).max(0.0), up_bps.unwrap_or(0.0).max(0.0));
         self.down += down * seconds;
         self.up += up * seconds;
@@ -301,10 +302,29 @@ impl Sum {
     }
 }
 
+/// What one snapshot adds to the history, from this server or another one.
+struct Sample {
+    at: u64,
+    /// rx, tx (bytes per second), cpu, memory, disk (percent).
+    host: [Option<f64>; 5],
+    tunnels: Vec<TunnelSample>,
+}
+
+struct TunnelSample {
+    name: String,
+    running: bool,
+    down: Option<f64>,
+    up: Option<f64>,
+    rtt: Option<f64>,
+    loss: Option<f64>,
+    sessions: Option<f64>,
+}
+
 pub struct History {
     store: Box<dyn Store>,
     current: Mutex<(u64, BTreeMap<String, Sum>)>,
     pruned_day: Mutex<u64>,
+    last_at: Mutex<Option<u64>>,
 }
 
 impl History {
@@ -313,11 +333,72 @@ impl History {
             store,
             current: Mutex::new((0, BTreeMap::new())),
             pruned_day: Mutex::new(0),
+            last_at: Mutex::new(None),
         }
     }
 
     /// Adds one snapshot; writes the previous minute's rows when the minute changed.
     pub fn record(&self, snapshot: &Snapshot) {
+        let host = &snapshot.host;
+        self.record_sample(Sample {
+            at: snapshot.at,
+            host: [host.rx_bps, host.tx_bps, host.cpu_pct, host.mem_pct, host.disk_pct],
+            tunnels: snapshot
+                .tunnels
+                .iter()
+                .map(|t| TunnelSample {
+                    name: t.name.clone(),
+                    running: t.state == "running",
+                    down: t.down_bps,
+                    up: t.up_bps,
+                    rtt: t.rtt_ms,
+                    loss: t.loss_pct,
+                    sessions: t.sessions.map(|s| s as f64),
+                })
+                .collect(),
+        });
+    }
+
+    /// `record` for a snapshot another server sent (JSON of the same shape), counted at `at_ms`
+    /// on this server's clock. Fields that are missing count as not known.
+    pub fn record_value(&self, snapshot: &serde_json::Value, at_ms: u64) {
+        let f = |v: &serde_json::Value| v.as_f64();
+        let host = &snapshot["host"];
+        self.record_sample(Sample {
+            at: at_ms,
+            host: [f(&host["rx_bps"]), f(&host["tx_bps"]), f(&host["cpu_pct"]), f(&host["mem_pct"]), f(&host["disk_pct"])],
+            tunnels: snapshot["tunnels"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|t| {
+                    Some(TunnelSample {
+                        name: t["name"].as_str()?.to_string(),
+                        running: t["state"] == "running",
+                        down: f(&t["down_bps"]),
+                        up: f(&t["up_bps"]),
+                        rtt: f(&t["rtt_ms"]),
+                        loss: f(&t["loss_pct"]),
+                        sessions: f(&t["sessions"]),
+                    })
+                })
+                .collect(),
+        });
+    }
+
+    fn record_sample(&self, snapshot: Sample) {
+        let seconds = {
+            let mut last = self.last_at.lock().unwrap();
+            // A longer gap (an agent that reconnected, a host that slept) says nothing about
+            // the traffic in between, so it counts as one ordinary interval.
+            let seconds = (*last)
+                .and_then(|at| snapshot.at.checked_sub(at))
+                .filter(|ms| *ms <= MAX_GAP_MS)
+                .map(|ms| ms as f64 / 1000.0)
+                .unwrap_or(INTERVAL.as_secs_f64());
+            *last = Some(snapshot.at);
+            seconds
+        };
         let minute = snapshot.at / 60_000;
         let finished = {
             let mut current = self.current.lock().unwrap();
@@ -328,23 +409,24 @@ impl History {
             let host = sums.entry("host".into()).or_default();
             host.samples = host.samples.saturating_add(1);
             host.running = host.running.saturating_add(1);
-            host.traffic(snapshot.host.rx_bps, snapshot.host.tx_bps);
-            add(&mut host.cpu, snapshot.host.cpu_pct);
-            add(&mut host.mem, snapshot.host.mem_pct);
-            add(&mut host.disk, snapshot.host.disk_pct);
+            let [rx, tx, cpu, mem, disk] = snapshot.host;
+            host.traffic(seconds, rx, tx);
+            add(&mut host.cpu, cpu);
+            add(&mut host.mem, mem);
+            add(&mut host.disk, disk);
             for tunnel in &snapshot.tunnels {
                 let sum = sums.entry(format!("t:{}", tunnel.name)).or_default();
                 sum.samples = sum.samples.saturating_add(1);
-                if tunnel.state == "running" {
+                if tunnel.running {
                     sum.running = sum.running.saturating_add(1);
                 }
-                sum.traffic(tunnel.down_bps, tunnel.up_bps);
-                add(&mut sum.rtt, tunnel.rtt_ms);
-                if let Some(rtt) = tunnel.rtt_ms {
+                sum.traffic(seconds, tunnel.down, tunnel.up);
+                add(&mut sum.rtt, tunnel.rtt);
+                if let Some(rtt) = tunnel.rtt {
                     sum.rtt_max = sum.rtt_max.max(rtt);
                 }
-                add(&mut sum.loss, tunnel.loss_pct);
-                add(&mut sum.sessions, tunnel.sessions.map(|s| s as f64));
+                add(&mut sum.loss, tunnel.loss);
+                add(&mut sum.sessions, tunnel.sessions);
             }
             finished
         };
@@ -531,6 +613,36 @@ mod tests {
     use super::*;
     use crate::dashboard::{data::Tunnel, host::Host};
 
+    #[test]
+    fn traffic_integrates_actual_slow_and_fast_sample_intervals() {
+        let mut sum = Sum::default();
+        sum.traffic(4.0, Some(1000.0), Some(100.0));
+        sum.traffic(0.5, Some(1000.0), Some(100.0));
+        assert_eq!((sum.row().down, sum.row().up), (4500, 450));
+        let dir = tempfile::tempdir().unwrap();
+        let history = History::new(Box::new(FileStore::open(dir.path()).unwrap()));
+        let at = 30_000_000 * 60_000;
+        history.record(&snapshot(at, 0.0, "running"));
+        history.record(&snapshot(at + 4000, 1000.0, "running"));
+        history.record(&snapshot(at + 4500, 1000.0, "running"));
+        history.record(&snapshot(at + 60_000, 0.0, "running"));
+        assert_eq!(history.store.rows("t:game", at / 60_000, at / 60_000 + 1)[0].1.down, 4500);
+    }
+
+    #[test]
+    fn a_long_gap_between_samples_counts_as_one_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let history = History::new(Box::new(FileStore::open(dir.path()).unwrap()));
+        let at = 30_000_000 * 60_000;
+        history.record(&snapshot(at, 1000.0, "running"));
+        // An hour offline, then back at 1000 B/s: one interval of traffic, not an hour of it.
+        let back = at + 3_600_000;
+        history.record(&snapshot(back, 1000.0, "running"));
+        history.record(&snapshot(back + 60_000, 0.0, "running"));
+        let interval = INTERVAL.as_secs();
+        assert_eq!(history.store.rows("t:game", back / 60_000, back / 60_000 + 1)[0].1.down, 1000 * interval);
+    }
+
     fn row(down: u64) -> Row {
         Row { down, up: down / 10, samples: 30, running: 30, rtt: 80.0, ..Row::default() }
     }
@@ -579,6 +691,27 @@ mod tests {
         assert_eq!(again.rows("t:game", 0, u64::MAX / 2).len(), 3);
         assert_eq!(again.first_minute(), Some(day * MINUTES_PER_DAY + 5));
         assert_eq!(again.series(), ["t:game"]);
+    }
+
+    #[test]
+    fn a_snapshot_from_another_server_is_counted_like_a_local_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let history = History::new(Box::new(FileStore::open(dir.path()).unwrap()));
+        let minute = 29_000_000u64;
+        let snapshot = serde_json::json!({
+            "host": {"rx_bps": 1000.0, "tx_bps": 500.0, "cpu_pct": 20.0, "mem_pct": 40.0, "disk_pct": 60.0},
+            "tunnels": [{"name": "far", "state": "running", "down_bps": 2000.0, "up_bps": 100.0, "rtt_ms": 90.0, "sessions": 2},
+                        {"state": "running"}]
+        });
+        history.record_value(&snapshot, minute * 60_000);
+        history.record_value(&snapshot, minute * 60_000 + 2_000);
+        // The next minute writes the finished one.
+        history.record_value(&serde_json::json!({}), (minute + 1) * 60_000);
+        let far = history.store.rows("t:far", minute, minute + 1);
+        assert_eq!(far.len(), 1);
+        assert_eq!((far[0].1.samples, far[0].1.running), (2, 2));
+        assert_eq!(history.store.rows("host", minute, minute + 1)[0].1.samples, 2);
+        assert_eq!(history.store.series().len(), 2, "a tunnel without a name is skipped");
     }
 
     #[test]

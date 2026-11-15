@@ -20,5 +20,6 @@ export default defineConfig({
       },
     },
   },
-  server: { proxy: { "/api": "http://127.0.0.1:47832" } },
+  // Same Host as the page, so the dashboard's same-origin check passes through the proxy.
+  server: { proxy: { "/api": { target: process.env.EZ_DEMO ?? "http://127.0.0.1:47832", changeOrigin: false } } },
 });

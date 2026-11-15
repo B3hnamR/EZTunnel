@@ -109,12 +109,17 @@ pub struct Report {
 pub fn import(store: &Store, tunnels: &[(String, Value)], replace: bool) -> Report {
     let mut report = Report::default();
     for (name, config) in tunnels {
-        if store.exists(name) && !replace {
-            report.skipped.push(name.clone());
-            continue;
-        }
-        match store.save(name, config) {
-            Ok(()) => report.imported.push(name.clone()),
+        let result = (|| -> Result<bool> {
+            let _lock = store.lock(name, false)?;
+            if store.exists(name) && !replace {
+                return Ok(false);
+            }
+            store.save(name, config)?;
+            Ok(true)
+        })();
+        match result {
+            Ok(true) => report.imported.push(name.clone()),
+            Ok(false) => report.skipped.push(name.clone()),
             Err(error) => report.failed.push((name.clone(), format!("{error:#}"))),
         }
     }
@@ -232,6 +237,19 @@ mod tests {
         let report = import(&target, &tunnels, true);
         assert_eq!(report.imported, ["alpha"]);
         assert_eq!(target.read("alpha").unwrap(), tunnels[0].1);
+    }
+
+    #[test]
+    fn import_refuses_a_tunnel_being_changed_elsewhere() {
+        let (_directory, target) = store();
+        let original = sample(7000);
+        target.save("alpha", &original).unwrap();
+        let held = target.lock("alpha", false).unwrap();
+        let report = import(&target, &[("alpha".into(), sample(7777))], true);
+        assert!(report.imported.is_empty());
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(target.read("alpha").unwrap(), original);
+        drop(held);
     }
 
     #[test]

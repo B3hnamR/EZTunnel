@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/B3hnamR/EZTunnel/releases/latest"><img src="https://img.shields.io/badge/release-v0.9.14-00afff?style=for-the-badge" alt="Release v0.9.14"></a>
+  <a href="https://github.com/B3hnamR/EZTunnel/releases/latest"><img src="https://img.shields.io/badge/release-v0.10.0-00afff?style=for-the-badge" alt="Release v0.10.0"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-875fff?style=for-the-badge" alt="License: AGPL-3.0"></a>
   <img src="https://img.shields.io/badge/built_with-Rust-dea584?style=for-the-badge&logo=rust&logoColor=white" alt="Built with Rust">
   <img src="https://img.shields.io/badge/Linux-x86__64%20%7C%20ARM64-0087ff?style=for-the-badge&logo=linux&logoColor=white" alt="Linux x86_64 and ARM64">
@@ -15,6 +15,7 @@
   <a href="#transports"><b>Transports</b></a> ·
   <a href="#what-can-it-carry"><b>What it carries</b></a> ·
   <a href="#mirage"><b>Mirage</b></a> ·
+  <a href="#web-dashboard"><b>Web dashboard</b></a> ·
   <a href="#roadmap"><b>Roadmap</b></a> ·
   <a href="#documentation"><b>Docs</b></a>
 </p>
@@ -23,7 +24,8 @@
 
 **EZTunnel** connects two Linux servers with an encrypted tunnel. Forward TCP and
 UDP ports, offer a SOCKS5 proxy, or carry whole IP networks through a TUN
-interface, all from a guided terminal manager, with no config files to write.
+interface, all from a guided terminal manager or an optional web dashboard, with no
+config files to write.
 
 - **Simple:** answer a few questions on one server, paste one code on the other. Done.
 - **Secure:** every tunnel uses Noise IK authentication, encryption with separate keys
@@ -71,7 +73,7 @@ never starts, stops or changes existing tunnels.
 curl -fsSLo install-eztunnel.sh https://raw.githubusercontent.com/B3hnamR/EZTunnel/main/scripts/install-latest.sh
 less install-eztunnel.sh
 sudo bash install-eztunnel.sh                      # latest release
-sudo bash install-eztunnel.sh --version v0.9.14    # a specific release
+sudo bash install-eztunnel.sh --version v0.10.0    # a specific release
 ```
 
 **Requirements:** Linux, Bash, `curl`, `tar`, coreutils and `flock` (from
@@ -450,12 +452,30 @@ not real TLS.
 
 </details>
 
+## Web dashboard
+
+An optional dashboard in the browser, in English and Persian. Set it up on one server (usually the
+Iran server) with **Tools → Web dashboard**, then join your other servers to it with one command or
+over SSH. From there you can:
+
+- watch every tunnel on every server live, with 24 hours to 30 days of history;
+- create a tunnel on any two servers, edit, start, stop and delete tunnels, and read their logs;
+- run the transport checker (a preset or your own choices), the path finder and the Mirage source
+  test between two servers, and create a tunnel from the best result;
+- check each server's health and fix what it finds, update EZTunnel on one server or all of them
+  in turn, and keep and restore backups;
+- get alerts in the dashboard and on Telegram.
+
+It runs as its own service over HTTPS with a random port and password, and tunnels never depend on
+it. See [the dashboard guide](docs/dashboard.md).
+
 ## Managing tunnels
 
 | In the manager | What you can do |
 |---|---|
 | **Manage tunnels** | Live status, traffic, latency, reconnects, logs, start/stop/restart, ports, settings, speed tests, delete |
 | **All tunnels** | Start, stop or change settings on many tunnels at once |
+| **Tools → Web dashboard** | Set up, run and manage the optional browser dashboard, or join this server to one |
 | **Tools → Transport checker** | Test which transports work between your servers, then create a tunnel |
 | **Tools → Mirage source tests** | Find working spoof sources and profiles per direction |
 | **Tools → Link test** | Check TCP, UDP, reachability and MTU between two servers |
@@ -468,8 +488,9 @@ service named `eztunnel-NAME.service`. Keep configs, backups and codes private.
 <details>
 <summary><b>Updating to a new version</b></summary>
 
-Run the installer again on each server. It replaces the program file but **does not
-restart** running tunnels, so they keep the old version until you restart them:
+Run the installer again on each server, or use **Tools → Update** or the dashboard's
+**Maintenance** page. The installer replaces the program file but **does not restart** running
+tunnels, so they keep the old version until you restart them:
 
 ```bash
 sudo systemctl restart eztunnel-NAME.service
@@ -505,8 +526,6 @@ Coming next to EZTunnel:
 | Feature | What it brings |
 |---|---|
 | **Seamless failover** | Give a tunnel backup routes: another transport, or another foreign server. If the main route fails or slows down, traffic moves to a backup automatically and returns when the main route recovers. The user port never changes, open connections pause for a moment and continue instead of dropping, and game traffic keeps its session. |
-| **Telegram alerts** | A Telegram bot that tells you the moment a tunnel drops, reconnects, reaches its quota or a server restarts, so you know before your users do. |
-| **Web dashboard** | A full web dashboard, installed on any server (usually the Iran server), to watch every tunnel live and to create, edit, start and stop tunnels on all your servers from the browser, without a terminal. It shows the tunnels already on its server, connects your other servers with one join command, and comes in English and Persian. |
 | **Three new anti-censorship transports** | New carriers built to get through heavy filtering where today's transports are blocked or throttled. |
 
 Planned features may change before they ship. Follow the [releases](https://github.com/B3hnamR/EZTunnel/releases) to see them land.
@@ -577,15 +596,18 @@ namespaces or VMs. Full details: [build from source](docs/build-from-source.md) 
 | [FEC tuning](docs/fec-tuning.md) | [Raw TUN](docs/raw-tun.md) |
 | [Two-server validation](docs/two-server-test.md) | [Architecture](docs/architecture.md) |
 | [Transport extensions](docs/transport-upgrade.md) | [Build from source](docs/build-from-source.md) |
+| [Web dashboard](docs/dashboard.md) | |
 
 ## Release quality
 
-**v0.9.14** is a full dual-CPU release: 563/563 tests pass on x86_64 and natively on
-ARM64, plus the kernel runtime matrix (24/24 on each CPU) and the Mirage runtime
-matrix. Both binaries are static musl builds from the same source.
+**v0.10.0** is a full dual-CPU release: the full test suite passes on x86_64 and natively on
+ARM64, plus the kernel runtime matrix and the Mirage runtime matrix on each CPU. Both binaries are
+static musl builds from the same source.
 
-Releases are not signed with the official update key unless stated, so the built-in
-`update` command does not install them; use the installer or replace the binary.
+From v0.10.0 the release programs are signed with the official update key, so **Tools → Update**,
+`eztunnel update` and the dashboard's **Install** accept them. The updater replaces only a program
+that is itself a signed release, so servers on v0.9.14 or older move to v0.10.0 once with the
+installer; after that, updates install from inside EZTunnel.
 
 ## License
 

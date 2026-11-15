@@ -1,6 +1,6 @@
 [package]
 name = "eztunnel"
-version = "0.9.14"
+version = "0.10.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Independent encrypted reverse tunnel with locally pinned peer keys"
@@ -11,8 +11,9 @@ default = ["browser-tls", "dashboard"]
 # A TLS client that looks like Chrome (`tls_profile: "chrome"`), built on BoringSSL. Building it needs
 # cmake and a C++ compiler; `cargo build --no-default-features` leaves it out.
 browser-tls = ["dep:boring", "dep:tokio-boring", "dep:p256", "dep:brotli-decompressor"]
-# The web dashboard (`eztunnel dashboard`): HTTPS server, sign-in and the built-in UI files.
-dashboard = ["dep:axum", "dep:hyper", "dep:hyper-util", "dep:tower-service", "dep:argon2"]
+# The web dashboard (`eztunnel dashboard`): HTTPS server, sign-in, the built-in UI files and a
+# Let's Encrypt certificate for its address.
+dashboard = ["dep:axum", "dep:hyper", "dep:hyper-util", "dep:tower-service", "dep:argon2", "dep:instant-acme", "dep:bytes", "dep:http", "dep:http-body-util"]
 
 [dependencies]
 anyhow = "1"
@@ -46,10 +47,16 @@ snow = { version = "0.10", default-features = false, features = ["use-chacha20po
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 axum = { version = "0.8", optional = true, default-features = false, features = ["tokio", "http1", "json", "query"] }
-hyper = { version = "1", optional = true, features = ["server", "http1"] }
+hyper = { version = "1", optional = true, features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1", optional = true, features = ["tokio"] }
 tower-service = { version = "0.3", optional = true }
 argon2 = { version = "0.5", optional = true, default-features = false, features = ["alloc", "password-hash"] }
+# ACME client for the dashboard certificate. Its HTTP client is ours (hyper + tokio-rustls with
+# the bundled roots), so only the signing backend is enabled.
+instant-acme = { version = "0.8.5", optional = true, default-features = false, features = ["ring"] }
+bytes = { version = "1", optional = true }
+http = { version = "1", optional = true }
+http-body-util = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

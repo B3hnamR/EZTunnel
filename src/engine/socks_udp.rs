@@ -149,7 +149,7 @@ pub(super) async fn associate(
                 }
                 let datagram = match parse_datagram(&buffer[..count]) {
                     Ok(datagram) if datagram.data.len() <= DATA_SIZE => datagram,
-                    Ok(_) => continue,
+                    Ok(datagram) => { super::oversize_datagram(&stats, datagram.data.len()); continue; }
                     Err(error) => { tracing::debug!(%error, "SOCKS5 UDP datagram dropped"); continue; }
                 };
                 if let Some(sender) = flows.get(&datagram.target) {
@@ -200,9 +200,9 @@ pub(super) async fn associate(
                     }
                 }
                 let Some(session) = pool.pick() else { stats.refuse_stream(); continue; };
-                let Ok((id, mut rx)) = session.register(None) else { stats.refuse_stream(); continue; };
+                let Ok((id, mut rx)) = session.register_datagram(None) else { stats.refuse_stream(); continue; };
                 let guard = StreamGuard { session: session.clone(), id };
-                let (tx, mut packets) = mpsc::channel(tuning.stream_queue);
+                let (tx, mut packets) = mpsc::channel(super::udp_queue(&tuning));
                 super::queue_datagram(&tx, datagram.data, &stats);
                 let (target, header) = (datagram.target.clone(), datagram.header.to_vec());
                 flows.insert(datagram.target.clone(), tx);
@@ -212,7 +212,7 @@ pub(super) async fn associate(
                     session_scope(&session, close_stream(&session, id, async {
                         session.send(Frame::Open { id, kind: StreamKind::Udp, target, proxy: None }).await?;
                         await_open(&mut rx, tuning.open).await?;
-                        session.open_window(id).await?;
+                        session.open_datagram_window(id).await?;
                         let activity = Mutex::new(Instant::now());
                         let upload = async {
                             while let Some(super::QueuedDatagram { data, _held }) = packets.recv().await {
@@ -224,8 +224,9 @@ pub(super) async fn associate(
                             Ok::<(), anyhow::Error>(())
                         };
                         let download = async {
+                            let mut credit = super::CreditReturn::default();
                             loop {
-                                match rx.recv().await {
+                                match super::next_udp_frame(&mut rx, &mut credit, &session, id).await? {
                                     Some(Frame::Data { data, .. }) => {
                                         // The answer carries the header the client used for this
                                         // destination, so it knows where it came from.
@@ -234,7 +235,7 @@ pub(super) async fn associate(
                                         relay.send_to(&reply, from).await?;
                                         session.stats.bytes_from_peer.fetch_add(data.len()as u64,std::sync::atomic::Ordering::Relaxed);
                                         *activity.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
-                                        session.send(Frame::Credit { id, frames: 1 }).await?;
+                                        credit.consumed(&session, id).await?;
                                     }
                                     Some(Frame::Close { .. }) | Some(Frame::Eof { .. }) | None => return Ok::<(), anyhow::Error>(()),
                                     Some(Frame::Error { message, .. }) => bail!("remote UDP error: {message}"),

@@ -69,6 +69,29 @@ the options as they were.
 The raw transports (fec-raw, fec-raw-gaming and raw TUN) are part of every preset when the check runs
 as root and both addresses are IPv4; otherwise they are listed as not available, with the reason.
 
+## When the servers cannot reach each other
+
+The two servers coordinate a check over a control connection (TCP port 47100 by default) before
+any test tunnel starts. While one waits for the other, it looks at the path every 45 seconds (ping
+and TCP on 22, 80, 443, 8443 and the control port) and says why the other server has not joined:
+no path at all, a control port that gets no answer, or simply that the other side has not joined yet.
+
+When the servers cannot reach each other on the control port but your computer reaches both, choose
+**Through my computer over SSH** when the checker asks how the two servers coordinate. It shows one
+command to keep running on your computer:
+
+```sh
+ssh -N -R 47101:<other server's IP>:47100 root@<this server>
+```
+
+This server's local port 47101 then leads, through your computer, to the other server's control
+port. Do it for one of the two servers only. If your computer cannot reach the other server's port
+47100 directly, use two windows instead: `ssh -N -L 47102:127.0.0.1:47100 root@<other server>` and
+`ssh -N -R 47101:127.0.0.1:47102 root@<this server>`.
+
+Only the control messages take this way. Every test tunnel still connects the two servers directly,
+so each transport gets its real result; when nothing gets through between them, every row says so.
+
 ## The live view
 
 ```
@@ -152,7 +175,9 @@ sudo eztunnel check start --role iran --this-ip 203.0.113.10 --peer-ip 198.51.10
 Options: `--no-udp`, `--preset quick|standard|thorough`, `--transports` (comma separated), `--directions
 both|iran|foreign`, `--tls-port`, `--port`, `--control-port`, `--priority
 stability|speed|hiding|lossy`, `--also-congestion`, `--also-pacer`, `--also-fragment` (0.8.13, the
-three re-checks described above), `--json FILE`. Progress goes to standard error one line per step, the
+three re-checks described above), `--json FILE`, `--control-via ADDRESS:PORT` (reach the other server's
+control port through a forward, as described in "When the servers cannot reach each other"; also on
+`check join`). Progress goes to standard error one line per step, the
 report to standard output. Ctrl+C stops the check and removes the test tunnels.
 
 ## Safety

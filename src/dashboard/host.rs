@@ -97,7 +97,7 @@ impl HostSampler {
     }
 }
 
-fn hostname() -> String {
+pub(super) fn hostname() -> String {
     read("/proc/sys/kernel/hostname")
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())

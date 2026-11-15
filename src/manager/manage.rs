@@ -627,7 +627,7 @@ fn reset_quota(name: &str) -> Result<()> {
 
 /// C21: the running tracker would write its in-memory count back, so the tunnel stops
 /// before the count is removed and starts afterwards; a failed removal still restarts it.
-fn reset_quota_with(
+pub(crate) fn reset_quota_with(
     stop: impl FnOnce() -> Result<()>,
     remove: impl FnOnce() -> std::io::Result<()>,
     mut start: impl FnMut() -> Result<()>,
@@ -737,6 +737,8 @@ fn toggle_raw_firewall(store: &Store, name: &str) -> Result<()> {
 /// can still fail to start (a port another program holds), so the tunnel is watched for a few
 /// seconds afterwards; if it does not stay up, the previous settings can be put back.
 fn save_and_restart(store: &Store, name: &str, config: &Value) -> Result<()> {
+    let _lock = store.lock(name, true)?;
+    let earlier = store.previous_bytes(name);
     store.save(name, config)?;
     ui::ok("Saved");
     let mut outcome = None;
@@ -746,7 +748,7 @@ fn save_and_restart(store: &Store, name: &str, config: &Value) -> Result<()> {
             || started_well(store, name),
             store.has_previous(name),
             |question| ui::confirm(question, true),
-            || store.restore_previous(name),
+            || store.take_back_save(name, earlier.as_deref()),
         )?;
         report_recovery(&result);
         outcome = Some(result);
@@ -832,7 +834,7 @@ fn has_tcp_maps(config: &Value) -> bool {
 }
 
 /// The PROXY protocol version the TCP maps use (the first one that sets it), if any.
-fn current_proxy(config: &Value) -> Option<u8> {
+pub(crate) fn current_proxy(config: &Value) -> Option<u8> {
     config["listeners"][0]["maps"]
         .as_array()?
         .iter()
@@ -899,7 +901,7 @@ fn change_proxy_protocol(store: &Store, name: &str, config: &Value) -> Result<()
 /// bind address: this screen can only show and write back one, so a config with more than one
 /// (only reachable by hand-editing - the wizard itself never writes more than one) would
 /// otherwise be silently collapsed onto whichever map happened to be read last.
-fn current_ports(config: &Value) -> (Vec<PortRule>, Protocol, String, bool) {
+pub(crate) fn current_ports(config: &Value) -> (Vec<PortRule>, Protocol, String, bool) {
     let mut rules: Vec<PortRule> = Vec::new();
     let (mut tcp, mut udp) = (false, false);
     let mut public_ip = "0.0.0.0".to_string();
@@ -962,13 +964,23 @@ fn change_ports(store: &Store, name: &str, config: &Value) -> Result<()> {
     let protocol = protocols[ui::choose_required("Protocol", &labels, current)?];
     let(original_rules,original_protocol,_,_)=current_ports(config);
     if rules==original_rules&&protocol==original_protocol{return Ok(());}
+    let _ = (public_ip, proxy);
+    save_and_restart(store, name, &with_ports(config, &rules, protocol))
+}
+
+/// The configuration with these forwarded ports: maps for unchanged ports are kept as they were
+/// (mixed protocols, per-map PROXY protocol), new ones are written for the tunnel's one address.
+/// The terminal manager and the web dashboard both edit ports through this.
+pub(crate) fn with_ports(config: &Value, rules: &[PortRule], protocol: Protocol) -> Value {
+    let (original_rules, original_protocol, public_ip, _) = current_ports(config);
+    let proxy = current_proxy(config);
     let host = if public_ip.contains(':') {
         format!("[{public_ip}]")
     } else {
         public_ip
     };
     let mut maps = Vec::new();
-    for rule in &rules {
+    for rule in rules {
         let bind = format!("{host}:{}", rule.listen);
         if protocol != Protocol::Udp {
             maps.push(json!({"type":"tcp","bind":bind,"target":rule.target}));
@@ -979,8 +991,8 @@ fn change_ports(store: &Store, name: &str, config: &Value) -> Result<()> {
     }
     let mut edited = config.clone();
     for map in &mut maps{if map["type"]!="udp"&&let Some(proxy)=proxy{map["proxy_protocol"]=proxy.into();}}
-    edited["listeners"][0]["maps"] = Value::Array(preserve_unedited_maps(config,&original_rules,&rules,protocol==original_protocol,maps));
-    save_and_restart(store, name, &edited)
+    edited["listeners"][0]["maps"] = Value::Array(preserve_unedited_maps(config,&original_rules,rules,protocol==original_protocol,maps));
+    edited
 }
 
 fn preserve_unedited_maps(config:&Value,old:&[PortRule],new:&[PortRule],same_protocol:bool,generated:Vec<Value>)->Vec<Value>{
@@ -995,6 +1007,7 @@ fn preserve_unedited_maps(config:&Value,old:&[PortRule],new:&[PortRule],same_pro
 }
 
 fn edit_file(store: &Store, name: &str) -> Result<()> {
+    let _lock = store.lock(name, true)?;
     let draft = store.draft(name)?;
     let editor = std::env::var("EDITOR")
         .ok()
@@ -1085,10 +1098,11 @@ fn delete(store: &Store, name: &str) -> Result<bool> {
     )? {
         return Ok(false);
     }
+    let _lock = store.lock(name, true)?;
     if store.system {
         service::remove(name)?;
     }
-    store.remove(name)?;
+    store.remove_locked(name)?;
     ui::ok(&format!("Deleted {name}"));
     std::thread::sleep(std::time::Duration::from_millis(800));
     Ok(true)

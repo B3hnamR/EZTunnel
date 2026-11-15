@@ -8,6 +8,7 @@ pub async fn run(code: CheckCode, me: Side, json: Option<&Path>) -> Result<Repor
     super::logbuf::capture();
     let mut handle = run::spawn(code, me);
     let mut last_step = String::new();
+    let mut last_hint: Option<String> = None;
     let mut reported = HashSet::new();
     let mut stopping = false;
     let report = loop {
@@ -20,6 +21,10 @@ pub async fn run(code: CheckCode, me: Side, json: Option<&Path>) -> Result<Repor
                 if view.step != last_step {
                     eprintln!("· {}", view.step);
                     last_step = view.step.clone();
+                }
+                if let Some(hint) = view.path_hint.as_ref().filter(|h| !view.connected && last_hint.as_ref() != Some(*h)) {
+                    eprintln!("! {hint}");
+                    last_hint = Some(hint.clone());
                 }
                 for row in &view.rows {
                     if let Some(verdict) = row.verdict

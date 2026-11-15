@@ -15,7 +15,7 @@ use std::{
     sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant},
 };
-use tokio::sync::broadcast;
+use tokio::sync::{Notify, broadcast};
 
 /// How often a snapshot is taken.
 pub const INTERVAL: Duration = Duration::from_secs(2);
@@ -29,6 +29,11 @@ const HEALTH_EVERY: Duration = Duration::from_secs(30);
 const START_GRACE_SEC: u64 = 30;
 /// Loss from this percentage on is reported.
 const LOSS_WARNING: f64 = 1.0;
+/// Heartbeats lost while a link comes up still count in the loss figure for about a minute.
+const LOSS_GRACE_SEC: u64 = 90;
+/// UDP datagrams dropped in the last minute from which it is reported. A new conversation can
+/// lose a few in its first round trip; a steady count means datagrams are really being lost.
+const UDP_DROP_WARNING: u64 = 20;
 
 #[derive(Serialize, Clone, Debug)]
 pub struct Snapshot {
@@ -87,15 +92,21 @@ pub struct Tunnel {
     pub up_total: Option<u64>,
     pub quota: Option<Quota>,
     pub last_drop: Option<String>,
+    /// UDP datagrams the tunnel dropped since it started, and in the last minute.
+    pub udp_dropped: Option<u64>,
+    pub udp_dropped_recent: Option<u64>,
     /// The configuration could not be read.
     pub error: Option<String>,
+    /// The same for both ends of one tunnel (from their shared key, which it does not reveal),
+    /// so the other end can be found on another managed server.
+    pub pair: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct Issue {
     /// "bad" or "warn".
     pub level: &'static str,
-    /// failed, not_connected, silent, no_traffic, quota or loss.
+    /// failed, not_connected, silent, no_traffic, quota, loss or udp_drops.
     pub kind: &'static str,
     pub tunnel: Option<String>,
     pub value: Option<f64>,
@@ -153,9 +164,15 @@ pub fn issues(tunnels: &[Tunnel]) -> Vec<Issue> {
             _ => {}
         }
         if tunnel.state == "running"
+            && tunnel.uptime_sec.is_none_or(|up| up >= LOSS_GRACE_SEC)
             && let Some(loss) = tunnel.loss_pct.filter(|l| *l >= LOSS_WARNING)
         {
             add("warn", "loss", tunnel, Some((loss * 10.0).round() / 10.0));
+        }
+        if tunnel.state == "running"
+            && let Some(dropped) = tunnel.udp_dropped_recent.filter(|d| *d >= UDP_DROP_WARNING)
+        {
+            add("warn", "udp_drops", tunnel, Some(dropped as f64));
         }
     }
     list.sort_by_key(|issue| issue.level != "bad");
@@ -171,6 +188,8 @@ pub struct Live {
     latest: RwLock<Option<Arc<Snapshot>>>,
     history: Mutex<VecDeque<Point>>,
     updates: broadcast::Sender<Arc<Snapshot>>,
+    /// Takes the next snapshot now instead of at the next tick (after an action).
+    nudge: Notify,
 }
 
 impl Live {
@@ -181,6 +200,7 @@ impl Live {
             latest: RwLock::new(None),
             history: Mutex::new(VecDeque::with_capacity(HISTORY)),
             updates,
+            nudge: Notify::new(),
         });
         let source = Arc::new(Mutex::new(source));
         let task_live = live.clone();
@@ -188,7 +208,10 @@ impl Live {
             let mut ticks = tokio::time::interval(INTERVAL);
             ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                ticks.tick().await;
+                tokio::select! {
+                    _ = ticks.tick() => {}
+                    _ = task_live.nudge.notified() => ticks.reset(),
+                }
                 let source = source.clone();
                 let history = history.clone();
                 let Ok(snapshot) = tokio::task::spawn_blocking(move || {
@@ -232,6 +255,11 @@ impl Live {
     pub fn subscribe(&self) -> broadcast::Receiver<Arc<Snapshot>> {
         self.updates.subscribe()
     }
+
+    /// Asks for a fresh snapshot now, so a change made by an action shows at once.
+    pub fn refresh(&self) {
+        self.nudge.notify_one();
+    }
 }
 
 fn millis_now() -> u64 {
@@ -245,6 +273,7 @@ fn millis_now() -> u64 {
 struct Memory {
     counters: Option<(u64, u64, Instant)>,
     heartbeats: VecDeque<(Instant, u64, u64)>,
+    udp_drops: VecDeque<(Instant, u64)>,
     health: Option<(Health, Instant)>,
 }
 
@@ -337,7 +366,7 @@ fn state_word(state: State) -> &'static str {
     }
 }
 
-fn link_word(health: &Health, status: Option<&Value>) -> &'static str {
+pub(super) fn link_word(health: &Health, status: Option<&Value>) -> &'static str {
     if health.quota_exhausted {
         return "quota";
     }
@@ -367,6 +396,15 @@ fn describe(view: &mut Tunnel, config: &Value) {
         view.link = summary.link;
     }
     view.carry = carry(config);
+    view.pair = pair_of(config);
+}
+
+/// A short fingerprint of the tunnel key, equal on both ends of a tunnel.
+pub fn pair_of(config: &Value) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let key = config["tunnel_key"].as_str().filter(|k| !k.is_empty())?;
+    let digest = Sha256::new().chain_update(b"eztunnel dashboard pair\0").chain_update(key.as_bytes()).finalize();
+    Some(digest[..8].iter().map(|b| format!("{b:02x}")).collect())
 }
 
 fn carry(config: &Value) -> Carry {
@@ -455,6 +493,22 @@ fn read_status(view: &mut Tunnel, status: &Value, server: bool, memory: &mut Mem
     if let Some((_, pongs0, lost0)) = memory.heartbeats.front() {
         view.loss_pct = loss_percent(lost - lost0, pongs - pongs0);
     }
+    if let Some(dropped) = counter("udp_dropped") {
+        view.udp_dropped = Some(dropped);
+        // A restart starts the count again.
+        if memory.udp_drops.back().is_some_and(|(_, d)| dropped < *d) {
+            memory.udp_drops.clear();
+        }
+        memory.udp_drops.push_back((now, dropped));
+        while memory
+            .udp_drops
+            .get(1)
+            .is_some_and(|(at, _)| now.duration_since(*at) >= LOSS_WINDOW)
+        {
+            memory.udp_drops.pop_front();
+        }
+        view.udp_dropped_recent = memory.udp_drops.front().map(|(_, first)| dropped - first);
+    }
 }
 
 fn quota(name: &str, config: &Value) -> Option<Quota> {
@@ -479,6 +533,8 @@ pub struct DemoSource {
     started: Instant,
     seed: u64,
     totals: [(f64, f64); 4],
+    /// Start/stop/restart done in the demo.
+    ops: Option<super::ops::DemoOps>,
 }
 
 impl DemoSource {
@@ -497,7 +553,13 @@ impl DemoSource {
                 (9.8e9, 1.1e9),
                 (0.0, 0.0),
             ],
+            ops: None,
         }
+    }
+
+    /// Sample data whose tunnels follow the demo's actions.
+    pub fn with_ops(tunnels: bool, ops: super::ops::DemoOps) -> Self {
+        Self { ops: Some(ops), ..Self::with_tunnels(tunnels) }
     }
 
     fn noise(&mut self) -> f64 {
@@ -524,14 +586,18 @@ impl Source for DemoSource {
             ("game-fec", "fec-udp", "reverse", "listen :7000", &["9392"], 3.2e6, 82.0, true),
             ("web-wss", "wss", "reverse", "listen :443", &["443", "8443"], 11.0e6, 89.0, true),
             ("cdn-xhttps", "xhttps", "direct", "→ 198.51.100.20:2083", &["2083"], 0.9e6, 131.0, true),
-            ("backup-tcp", "tcp", "reverse", "listen :7100", &["8080"], 0.0, 0.0, false),
+            ("backup-tcp", "tcp", "reverse", "listen :7100", &["8080"], 1.5e6, 76.0, false),
         ];
         let mut tunnels = Vec::new();
         let empty = self.empty;
-        for (index, (name, transport, direction, link, ports, rate, rtt, running)) in
-            specs.into_iter().enumerate().filter(|_| !empty)
+        let ops = self.ops.clone();
+        for (index, (name, transport, direction, link, ports, rate, rtt, running)) in specs
+            .into_iter()
+            .enumerate()
+            .filter(|(_, spec)| !empty && !ops.as_ref().is_some_and(|ops| ops.deleted(spec.0)))
         {
             let unstable = name == "cdn-xhttps";
+            let running = self.ops.as_ref().map_or(running, |ops| ops.running(name, running));
             let mut tunnel = Tunnel {
                 name: name.into(),
                 side: "iran",
@@ -580,7 +646,23 @@ impl Source for DemoSource {
             if name == "cdn-xhttps" {
                 tunnel.quota = Some(Quota { used: 44_000_000_000, limit: 100_000_000_000 });
                 tunnel.last_drop = Some("no heartbeat answer".into());
+                tunnel.udp_dropped = Some(1840 + (elapsed as u64) / 2);
+                tunnel.udp_dropped_recent = Some(30);
             }
+            tunnels.push(tunnel);
+        }
+        // Tunnels created in the demo run quietly with small sample figures.
+        for (name, config) in ops.as_ref().map(|ops| ops.created()).unwrap_or_default() {
+            let mut tunnel = Tunnel { name, state: "running", link_state: "working", ..Tunnel::default() };
+            describe(&mut tunnel, &config);
+            tunnel.down_bps = Some(40_000.0 * self.noise());
+            tunnel.up_bps = Some(8_000.0 * self.noise());
+            tunnel.down_total = Some(0);
+            tunnel.up_total = Some(0);
+            tunnel.rtt_ms = Some(80.0 + 4.0 * self.noise());
+            tunnel.loss_pct = Some(0.0);
+            tunnel.sessions = Some(4);
+            tunnel.uptime_sec = Some(elapsed as u64 % 600);
             tunnels.push(tunnel);
         }
         Snapshot {
@@ -613,6 +695,20 @@ impl Source for DemoSource {
 mod tests {
     use super::*;
 
+    #[test]
+    fn both_ends_of_a_tunnel_share_a_pair_that_does_not_show_the_key() {
+        let key = crate::tunnel_key::TunnelKey::generate().unwrap().display();
+        let iran = json!({"mode": "server", "tunnel_key": key});
+        let foreign = json!({"mode": "client", "tunnel_key": key});
+        let pair = pair_of(&iran).unwrap();
+        assert_eq!(pair.len(), 16);
+        assert_eq!(Some(pair.clone()), pair_of(&foreign));
+        assert!(!key.contains(&pair));
+        let other = json!({"tunnel_key": crate::tunnel_key::TunnelKey::generate().unwrap().display()});
+        assert_ne!(pair_of(&other), Some(pair));
+        assert_eq!(pair_of(&json!({"mode": "server"})), None);
+    }
+
     fn tunnel(state: &'static str, link: &'static str) -> Tunnel {
         Tunnel {
             name: "t".into(),
@@ -636,6 +732,48 @@ mod tests {
         assert_eq!(list.len(), 2);
         assert_eq!((list[0].level, list[0].kind), ("bad", "failed"));
         assert_eq!((list[1].kind, list[1].value), ("loss", Some(2.4)));
+    }
+
+    #[test]
+    fn loss_while_a_link_comes_up_is_not_a_problem_yet() {
+        let mut fresh = tunnel("running", "working");
+        fresh.loss_pct = Some(4.0);
+        fresh.uptime_sec = Some(51);
+        assert!(issues(&[fresh.clone()]).is_empty());
+        fresh.uptime_sec = Some(LOSS_GRACE_SEC);
+        assert_eq!(issues(&[fresh])[0].kind, "loss");
+    }
+
+    #[test]
+    fn steady_udp_drops_are_reported_and_a_few_are_not() {
+        let mut busy = tunnel("running", "working");
+        busy.udp_dropped = Some(877);
+        busy.udp_dropped_recent = Some(255);
+        let mut quiet = tunnel("running", "working");
+        quiet.udp_dropped = Some(12);
+        quiet.udp_dropped_recent = Some(3);
+        let list = issues(&[busy, quiet]);
+        assert_eq!(list.len(), 1);
+        assert_eq!((list[0].kind, list[0].value), ("udp_drops", Some(255.0)));
+    }
+
+    #[test]
+    fn udp_drops_of_the_last_minute_come_from_the_counter() {
+        let mut memory = Memory::default();
+        let start = Instant::now();
+        let mut view = Tunnel::default();
+        let status = |dropped: u64| json!({"bytes_from_peer": 0, "bytes_to_peer": 0, "udp_dropped": dropped});
+        read_status(&mut view, &status(266), true, &mut memory, start);
+        assert_eq!((view.udp_dropped, view.udp_dropped_recent), (Some(266), Some(0)));
+        read_status(&mut view, &status(622), true, &mut memory, start + Duration::from_secs(30));
+        assert_eq!(view.udp_dropped_recent, Some(356));
+        read_status(&mut view, &status(877), true, &mut memory, start + Duration::from_secs(70));
+        assert_eq!(view.udp_dropped_recent, Some(611), "from the newest sample at least a minute old");
+        read_status(&mut view, &status(900), true, &mut memory, start + Duration::from_secs(95));
+        assert_eq!(view.udp_dropped_recent, Some(278), "the oldest sample left the window");
+        // A restart: the counter starts again and so does the window.
+        read_status(&mut view, &status(4), true, &mut memory, start + Duration::from_secs(72));
+        assert_eq!((view.udp_dropped, view.udp_dropped_recent), (Some(4), Some(0)));
     }
 
     #[test]

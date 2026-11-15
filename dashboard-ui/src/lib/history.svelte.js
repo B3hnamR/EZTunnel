@@ -5,29 +5,36 @@ const FRESH_MS = 60_000;
 export const history = $state({});
 const inflight = {};
 
-export function key(range, series) {
-  return `${range}:${series}`;
+export function key(range, series, server = "local") {
+  return `${server}:${range}:${series}`;
 }
 
 /** Loads (or refreshes) one history; the result appears in `history[key]`. */
-export async function load(range, series, force = false) {
-  const k = key(range, series);
+export async function load(range, series, force = false, server = "local") {
+  const k = key(range, series, server);
   const have = history[k];
   if (!force && have?.data && Date.now() - have.loadedAt < FRESH_MS) return;
   if (inflight[k]) return;
-  inflight[k] = true;
+  const request = new AbortController();
+  inflight[k] = request;
   history[k] = { ...(have ?? {}), loading: true, error: false };
   try {
-    const { status, data } = await getHistory(range, series);
+    const { status, data } = await getHistory(range, series, server, request.signal);
+    if (request.signal.aborted || inflight[k] !== request) return;
     history[k] = status === 200 ? { data, loadedAt: Date.now(), loading: false, error: false } : { ...(have ?? {}), loading: false, error: true };
   } catch {
+    if (request.signal.aborted || inflight[k] !== request) return;
     history[k] = { ...(have ?? {}), loading: false, error: true };
   } finally {
-    inflight[k] = false;
+    if (inflight[k] === request) delete inflight[k];
   }
 }
 
 export function clear() {
+  for (const k of Object.keys(inflight)) {
+    inflight[k].abort();
+    delete inflight[k];
+  }
   for (const k of Object.keys(history)) delete history[k];
 }
 

@@ -984,6 +984,37 @@ pub fn update_screen() -> Result<()> {
     Ok(())
 }
 
+/// The dashboard's update: the same checks and staging as Tools → Update, without questions.
+/// Only an officially signed program file is run. Returns what the new program printed.
+pub(crate) fn install_signed(bytes: &[u8], allow_downgrade: bool) -> Result<String> {
+    ensure!(super::store::is_root(), "updating changes system files: run it as root");
+    ensure!(bytes.len() as u64 <= MAX_PROGRAM_BYTES, "the file is too large to be an EZTunnel program");
+    ensure_signed_bytes(bytes)?;
+    #[cfg(target_os = "linux")]
+    validate_installation_target(Path::new("/usr/local/bin/eztunnel.incoming"))?;
+    let staged = Staged::write(bytes, Path::new("/usr/local/bin/eztunnel.incoming"))?;
+    let mut command = Command::new(staged.path());
+    command.arg("update");
+    if allow_downgrade {
+        command.arg("--allow-downgrade");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: `signal` is async-signal-safe and touches no memory of this process.
+        unsafe {
+            command.pre_exec(|| {
+                libc::signal(libc::SIGHUP, libc::SIG_IGN);
+                Ok(())
+            });
+        }
+    }
+    let output = command.stdin(std::process::Stdio::null()).output().context("run the new program")?;
+    let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    ensure!(output.status.success(), "the update did not finish: {}", text.trim());
+    Ok(text)
+}
+
 /// Tools → Roll back.
 pub fn rollback_screen() -> Result<()> {
     ui::banner("Roll back EZTunnel");

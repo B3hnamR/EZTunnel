@@ -28,10 +28,15 @@ const FILES: &[File] = &[
     ui!("app.js", "text/javascript; charset=utf-8"),
     ui!("app.css", "text/css; charset=utf-8"),
     ui!("favicon.svg", "image/svg+xml"),
+    ui!("manifest.webmanifest", "application/manifest+json"),
+    ui!("icon-192.png", "image/png"),
+    ui!("icon-512.png", "image/png"),
+    ui!("fonts/IBMPlexSans-400.woff2", "font/woff2"),
+    ui!("fonts/IBMPlexSans-500.woff2", "font/woff2"),
+    ui!("fonts/IBMPlexMono-400.woff2", "font/woff2"),
+    ui!("fonts/IBMPlexMono-500.woff2", "font/woff2"),
     ui!("fonts/Vazirmatn-Regular.woff2", "font/woff2"),
     ui!("fonts/Vazirmatn-Medium.woff2", "font/woff2"),
-    ui!("fonts/Vazirmatn-SemiBold.woff2", "font/woff2"),
-    ui!("fonts/Vazirmatn-Bold.woff2", "font/woff2"),
 ];
 
 /// Short content hashes, computed once, so browsers can ask "has it changed?".

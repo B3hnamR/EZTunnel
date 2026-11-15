@@ -48,6 +48,9 @@ pub struct View {
     pub remaining_sec: u64,
     pub baseline: Option<Baseline>,
     pub finished: bool,
+    /// Why the other server has not joined, from a quick look at the path to it.
+    #[serde(default)]
+    pub path_hint: Option<String>,
 }
 
 /// A check running in the background.
@@ -74,6 +77,28 @@ pub fn spawn(code: CheckCode, me: Side) -> Handle {
         ..View::default()
     });
     let (commands, commands_rx) = mpsc::unbounded_channel();
+    // While the other server has not joined, look at the path to it and say what is wrong,
+    // instead of waiting in silence until the time limit.
+    let hint_view = view_tx.clone();
+    let (peer, control) = (code.ip(me.other()), code.options.control_port);
+    tokio::spawn(async move {
+        time::sleep(Duration::from_secs(15)).await;
+        while !hint_view.is_closed() {
+            let waiting = { let v = hint_view.borrow(); !v.connected && !v.finished };
+            if !waiting {
+                break;
+            }
+            let path = crate::pathprobe::probe(peer, &[control], Duration::from_secs(5)).await;
+            let hint = path.hint(control);
+            hint_view.send_modify(|v| {
+                if !v.connected {
+                    v.path_hint = Some(hint);
+                }
+            });
+            time::sleep(Duration::from_secs(45)).await;
+        }
+        hint_view.send_modify(|v| v.path_hint = None);
+    });
     let task = tokio::spawn(async move {
         match me {
             Side::Iran => coordinate(code, view_tx, commands_rx).await,

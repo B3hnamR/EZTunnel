@@ -16,6 +16,7 @@ export const live = $state({
 
 let source = null;
 let onSignedOut = () => {};
+let connectionGeneration = 0;
 
 function take(snapshot) {
   live.snapshot = snapshot;
@@ -37,9 +38,19 @@ function take(snapshot) {
 export async function connect(signedOut) {
   onSignedOut = signedOut;
   disconnect();
+  const generation = ++connectionGeneration;
   live.link = "loading";
-  const { status, data } = await getSnapshot();
+  let snapshot = { status: 0, data: null };
+  try {
+    snapshot = await getSnapshot();
+  } catch {
+    if (generation === connectionGeneration) live.link = "lost";
+    // The event stream can recover even when the initial HTTP request failed.
+  }
+  if (generation !== connectionGeneration) return;
+  const { status, data } = snapshot;
   if (status === 401) return onSignedOut();
+  if (status !== 200) live.link = "lost";
   if (status === 200 && data) {
     live.history = data.history ?? [];
     if (data.snapshot) {
@@ -48,8 +59,10 @@ export async function connect(signedOut) {
       live.link = "up";
     }
   }
-  source = new EventSource("/api/events");
-  source.addEventListener("snapshot", (event) => {
+  const stream = new EventSource("/api/events");
+  source = stream;
+  stream.addEventListener("snapshot", (event) => {
+    if (generation !== connectionGeneration || source !== stream) return;
     try {
       take(JSON.parse(event.data));
       live.link = "up";
@@ -57,11 +70,13 @@ export async function connect(signedOut) {
       // a broken event is skipped; the next one replaces it
     }
   });
-  source.addEventListener("error", async () => {
-    if (live.snapshot) live.link = "lost";
+  stream.addEventListener("error", async () => {
+    if (generation !== connectionGeneration || source !== stream) return;
+    live.link = "lost";
     // EventSource retries by itself, but not after the session ended.
     try {
       const { data } = await getSession();
+      if (generation !== connectionGeneration || source !== stream) return;
       if (data && !data.signed_in) {
         disconnect();
         onSignedOut();
@@ -73,6 +88,7 @@ export async function connect(signedOut) {
 }
 
 export function disconnect() {
+  connectionGeneration++;
   if (source) source.close();
   source = null;
 }

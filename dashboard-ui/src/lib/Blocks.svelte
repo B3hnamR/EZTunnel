@@ -1,9 +1,9 @@
 <script>
-  // The identity motif: a 10-segment block meter.
+  // A thin meter. The fill is an SVG attribute, since the page allows no inline styles.
   let { value = 0, cls = "" } = $props();
-  const on = $derived(Math.max(0, Math.min(10, Math.round((value ?? 0) / 10))));
+  const w = $derived(Math.max(0, Math.min(100, value ?? 0)));
 </script>
 
 <div class="blocks {cls}" aria-hidden="true">
-  {#each Array(10) as _, i}<i class:on={i < on}></i>{/each}
+  <svg viewBox="0 0 100 1" preserveAspectRatio="none"><rect class="bar" width={w} height="1" /></svg>
 </div>

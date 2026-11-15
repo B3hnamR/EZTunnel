@@ -6,6 +6,7 @@
 pub mod backup;
 pub mod bulk;
 pub mod checker;
+mod dashboard_screen;
 pub mod figures;
 pub mod iface;
 pub mod manage;
@@ -100,7 +101,7 @@ pub fn run() -> Result<()> {
             format!(
                 "{}  {}",
                 ui::bold("Tools          "),
-                ui::dim("transport checker, tunnel key, link test")
+                ui::dim("web dashboard, transport checker, tunnel key, link test")
             ),
             format!(
                 "{}  {}",
@@ -195,11 +196,12 @@ fn optimize_screen() -> Result<()> {
 }
 
 #[derive(Debug,Clone,Copy,PartialEq,Eq)]
-enum ToolAction{Checker,Optimize,Undo,Key,CheckConfigs,Export,Import,Update,Rollback,LinkTest,Mirage}
-const TOOLS:[ToolAction;11]=[ToolAction::Checker,ToolAction::Optimize,ToolAction::Undo,ToolAction::Key,ToolAction::CheckConfigs,ToolAction::Export,ToolAction::Import,ToolAction::Update,ToolAction::Rollback,ToolAction::LinkTest,ToolAction::Mirage];
+enum ToolAction{Dashboard,Checker,Optimize,Undo,Key,CheckConfigs,Export,Import,Update,Rollback,LinkTest,Mirage}
+const TOOLS:[ToolAction;12]=[ToolAction::Dashboard,ToolAction::Checker,ToolAction::Optimize,ToolAction::Undo,ToolAction::Key,ToolAction::CheckConfigs,ToolAction::Export,ToolAction::Import,ToolAction::Update,ToolAction::Rollback,ToolAction::LinkTest,ToolAction::Mirage];
 fn tool_label(action:ToolAction)->String{
     use console::style;
     let(category,title,description,color)=match action{
+        ToolAction::Dashboard=>("WEB","Web dashboard","set up, run and manage the browser dashboard",14),
         ToolAction::Checker=>("TEST","Transport checker","compare transports between servers",6),
         ToolAction::Mirage=>("TEST","Mirage source tests","find working spoof IPs and create a tunnel",6),
         ToolAction::LinkTest=>("TEST","Link test","listen or probe TCP, UDP and MTU",6),
@@ -225,6 +227,7 @@ fn tools(store: &Store) -> Result<()> {
         let Some(action)=ui::choose("Tool",&items,0)?.and_then(|index|TOOLS.get(index).copied())else{return Ok(());};
         let result = (|| -> Result<()> {
             match action {
+                ToolAction::Dashboard => dashboard_screen::screen()?,
                 ToolAction::Checker => checker::menu(store)?,
                 ToolAction::Optimize => optimize_screen()?,
                 ToolAction::Undo => {
@@ -517,7 +520,7 @@ fn uninstall(store: &Store) -> Result<()> {
     ui::banner("Uninstall");
     let names = store.names()?;
     ui::warn(&format!(
-        "This stops and removes {} tunnel service(s) and the eztunnel program.",
+        "This stops and removes {} tunnel service(s), the web dashboard or agent if there is one, and the eztunnel program.",
         names.len()
     ));
     if !ui::confirm("Uninstall EZTunnel from this server?", false)? {
@@ -569,6 +572,10 @@ fn uninstall(store: &Store) -> Result<()> {
             }
         }
     }
+    if store.system {
+        // Their services would keep restarting a program that is gone.
+        dashboard_screen::on_uninstall()?;
+    }
     if !keep {
         if !every_service_removed {
             ui::warn(&format!(
@@ -617,7 +624,7 @@ mod tests {
         let mut seen=std::collections::HashSet::new();
         for action in TOOLS{assert!(seen.insert(format!("{action:?}")));let label=tool_label(action);assert!(!console::strip_ansi_codes(&label).is_empty());}
         assert_eq!(TOOLS.iter().filter(|action|**action==ToolAction::LinkTest).count(),1);
-        assert_eq!(TOOLS.len(),11);
+        assert_eq!(TOOLS.len(),12);
     }
 
     #[test]
