@@ -454,6 +454,10 @@ not real TLS.
 
 ## Web dashboard
 
+<p align="center">
+  <img src="docs/assets/dashboard.svg" alt="The EZTunnel web dashboard: live traffic, tunnels on every server, health, updates and alerts in the browser" width="100%">
+</p>
+
 An optional dashboard in the browser, in English and Persian. Set it up on one server (usually the
 Iran server) with **Tools → Web dashboard**, then join your other servers to it with one command or
 over SSH. From there you can:
@@ -605,9 +609,9 @@ ARM64, plus the kernel runtime matrix and the Mirage runtime matrix on each CPU.
 static musl builds from the same source.
 
 From v0.10.0 the release programs are signed with the official update key, so **Tools → Update**,
-`eztunnel update` and the dashboard's **Install** accept them. The updater replaces only a program
-that is itself a signed release, so servers on v0.9.14 or older move to v0.10.0 once with the
-installer; after that, updates install from inside EZTunnel.
+`eztunnel update` and the dashboard's **Update** and **Install** accept them. The updater replaces
+only a program that is itself a signed release, so servers on v0.9.14 or older move to v0.10.0 once
+with the installer; after that, updates install from inside EZTunnel.
 
 ## License
 
