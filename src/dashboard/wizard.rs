@@ -1,7 +1,8 @@
 //! A new tunnel from the dashboard: both ends are built here from one form, with one fresh key, the
-//! same way the terminal manager builds a tunnel and its pairing code. Raw-socket, TUN, Parallax and
-//! Mirage tunnels and CDN setups need measurements or choices on the machine, so they stay in the
-//! terminal manager.
+//! same way the terminal manager builds a tunnel and its pairing code, with the same per-carrier
+//! options (TLS look and fragmentation, TCP congestion control, FEC pacer, speed mode, Parallax
+//! mode, parallel connections). Raw-socket, TUN and Mirage tunnels and CDN setups need
+//! measurements or choices on the machine, so they stay in the terminal manager.
 use crate::{
     config::Transport,
     manager::plan::{self, Carry, Direction, Plan, Protocol, Side, check_name, parse_ports},
@@ -11,7 +12,24 @@ use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 
 /// The carriers the dashboard can set up, in the order it offers them.
-pub const TRANSPORTS: [&str; 10] = ["tcp", "wss", "xhttps", "https", "fec-udp", "kcp", "xhttp", "ws", "http", "tcp6"];
+pub const TRANSPORTS: [&str; 10] =
+    ["tcp", "wss", "xhttps", "https", "parallax", "fec-udp", "kcp", "xhttp", "ws", "http"];
+
+/// Which of the optional choices a carrier has, for the form (`GET /api/new-tunnel`).
+pub fn options_of(transport: Transport) -> Value {
+    json!({
+        "tls": transport.uses_tls(),
+        "congestion": !plan::uses_udp(transport) && !plan::is_raw(transport),
+        "pacer": matches!(transport, Transport::FecUdp),
+        "speed": crate::manager::speed::applies(transport, false),
+        "parallax": transport == Transport::Parallax,
+        "game": !plan::is_raw(transport),
+    })
+}
+
+fn speed_of(word: &str) -> Result<crate::manager::speed::SpeedMode> {
+    crate::manager::speed::SpeedMode::from_label(word).with_context(|| format!("unknown speed mode {word}"))
+}
 
 /// Both ends of a new tunnel.
 #[derive(Debug, Clone, PartialEq)]
@@ -29,12 +47,23 @@ fn transport_of(word: &str) -> Result<Transport> {
 
 /// The form: `name`, `transport`, `direction` ("reverse" or "direct"), `tunnel_port`, `address`
 /// (where the dialing end connects), `carry` ("ports" or "socks"), `ports`, `protocol`
-/// ("tcp", "udp" or "both"), `socks_bind`, `reach` ("local" or "any").
+/// ("tcp", "udp" or "both"), `socks_bind`, `reach` ("local" or "any"); optional, each only where
+/// the carrier has it: `parallax_mode` ("stream" or "packet"), `tls_profile` ("classic" or
+/// "chrome"), `tls_fragment`, `tcp_congestion` (an algorithm name or "system"), `fec_pacer`,
+/// `speed` ("default", "normal", "fast", "fast2", "fast3"), `pool` (1 to 16), `game` (Game mode:
+/// game UDP on the direct datagram path in copies) with `game_port`, `game_copies` and, for a
+/// direct tunnel, `iran_address` (how the foreign server reaches the Iran server).
 pub fn build(form: &Value) -> Result<Built> {
     let text = |key: &str| form[key].as_str().unwrap_or("").trim().to_string();
     let name = text("name");
     check_name(&name)?;
-    let transport = transport_of(&text("transport"))?;
+    // IPv6 is the list's entry for routes that block IPv4: `ipv6_transport` runs between the
+    // servers' IPv6 addresses. GAME is the entry for games: FEC-UDP with Game mode on.
+    let ipv6_entry = text("transport") == "ipv6";
+    let chosen = if ipv6_entry { text("ipv6_transport") } else { text("transport") };
+    ensure!(!(ipv6_entry && chosen.is_empty()), "choose the transport to run over IPv6");
+    let game_entry = chosen == "game";
+    let transport = if game_entry { Transport::FecUdp } else { transport_of(&chosen)? };
     let direction = match text("direction").as_str() {
         "" | "reverse" => Direction::Reverse,
         "direct" => Direction::Direct,
@@ -50,6 +79,11 @@ pub fn build(form: &Value) -> Result<Built> {
     };
     let address = text("address");
     ensure!(!address.is_empty(), "the address of the server the other end connects to is missing");
+    let ipv6 = ipv6_entry || address.trim_matches(['[', ']']).parse::<std::net::Ipv6Addr>().is_ok();
+    ensure!(
+        !ipv6_entry || address.trim_matches(['[', ']']).parse::<std::net::Ipv6Addr>().is_ok(),
+        "an IPv6 tunnel needs the IPv6 address of the server the other end connects to"
+    );
     ensure!(
         !address.contains(['/', ' ', '@']) && address.len() <= 253,
         "the address must be an IP address or a host name"
@@ -65,15 +99,122 @@ pub fn build(form: &Value) -> Result<Built> {
         "both" => Protocol::Both,
         other => bail!("unknown protocol {other}"),
     };
+    let options = options_of(transport);
+    let flag = |key: &str| form[key].as_bool().unwrap_or(false);
+    let offered = |key: &str, what: &str| -> Result<()> {
+        ensure!(options[what] == true, "{key} does not apply to {}", text("transport"));
+        Ok(())
+    };
+    let parallax_mode = match text("parallax_mode").as_str() {
+        "" | "stream" => crate::parallax_carrier::Mode::Stream,
+        "packet" => {
+            offered("parallax_mode", "parallax")?;
+            crate::parallax_carrier::Mode::Packet
+        }
+        other => bail!("unknown Parallax mode {other}"),
+    };
+    let tls_profile = match text("tls_profile").as_str() {
+        "" | "classic" => crate::config::TlsProfile::Classic,
+        "chrome" => {
+            offered("tls_profile", "tls")?;
+            crate::config::TlsProfile::Chrome
+        }
+        other => bail!("unknown TLS look {other}"),
+    };
+    if flag("tls_fragment") {
+        offered("tls_fragment", "tls")?;
+    }
+    let congestion = match text("tcp_congestion").as_str() {
+        "" => None,
+        word => {
+            offered("tcp_congestion", "congestion")?;
+            ensure!(
+                word.len() <= 16 && word.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+                "tcp_congestion must be an algorithm name such as bbr or cubic, or system"
+            );
+            Some(word.to_string())
+        }
+    };
+    if flag("fec_pacer") {
+        offered("fec_pacer", "pacer")?;
+    }
+    let speed = match text("speed").as_str() {
+        "" => crate::manager::speed::SpeedMode::Default,
+        word => {
+            ensure!(
+                crate::manager::speed::applies(transport, parallax_mode == crate::parallax_carrier::Mode::Packet),
+                "a speed mode does not apply to {}",
+                text("transport")
+            );
+            speed_of(word)?
+        }
+    };
+    let pool = match &form["pool"] {
+        Value::Null => None,
+        value => Some(
+            value
+                .as_u64()
+                .filter(|p| (1..=16).contains(p))
+                .context("parallel connections must be 1 to 16")? as usize,
+        ),
+    };
+    let game = if game_entry || flag("game") {
+        offered("game", "game")?;
+        ensure!(
+            carry == Carry::Socks || protocol != Protocol::Tcp,
+            "Game mode needs UDP: forward UDP (or TCP and UDP) or use SOCKS5"
+        );
+        let port = match &form["game_port"] {
+            Value::Null => plan::game_port(tunnel_port),
+            value => value.as_u64().and_then(|p| u16::try_from(p).ok()).filter(|p| *p > 0)
+                .context("the Game mode port must be 1 to 65535")?,
+        };
+        let copies = match &form["game_copies"] {
+            Value::Null => plan::GAME_COPIES,
+            value => value.as_u64().filter(|c| (1..=4).contains(c)).context("Game mode copies must be 1 to 4")? as u8,
+        };
+        let iran_host = match text("iran_address").as_str() {
+            "" => None,
+            host => {
+                let host = host.trim_matches(['[', ']']);
+                ensure!(host.parse::<std::net::IpAddr>().is_ok(), "the Iran address for Game mode must be an IP address");
+                Some(host.to_string())
+            }
+        };
+        ensure!(
+            direction == Direction::Reverse || iran_host.is_some(),
+            "Game mode in a direct tunnel needs the Iran server's address"
+        );
+        Some(plan::GamePlan { port, copies, iran_host })
+    } else {
+        None
+    };
     let key = TunnelKey::generate()?.display();
     let plan_for = |side: Side| -> Result<Plan> {
         let mut plan = Plan::new(key.clone(), side, direction, transport);
         plan.tunnel_port = tunnel_port;
         plan.carry = carry;
         plan.protocol = protocol;
+        plan.parallax_mode = parallax_mode;
+        plan.tls_profile = tls_profile;
+        plan.tls_fragment = flag("tls_fragment");
+        plan.tcp_congestion = congestion.clone();
+        plan.fec_pacer = flag("fec_pacer");
+        plan.speed = speed;
+        if game.is_some() {
+            plan.set_game(true);
+            plan.game = game.clone();
+        }
+        if let Some(pool) = pool {
+            plan.pool = pool;
+        }
         if plan.dials() {
             plan.peer_host = Some(address.clone());
+        } else if ipv6 {
+            // An IPv6 tunnel: the other end comes to this server's IPv6 address.
+            plan.listen_on_both_families();
         }
+        plan.ipv6 = ipv6;
         match carry {
             Carry::Ports => {
                 plan.ports = parse_ports(&text("ports"))?;
@@ -130,13 +271,27 @@ mod tests {
     fn both_ends_share_one_key_and_the_right_end_dials() {
         for transport in TRANSPORTS {
             for direction in ["reverse", "direct"] {
-                let mut f = form(transport, direction);
-                let peer = if transport == "tcp6" { "[2001:db8::7]:" } else { "203.0.113.7:" };
-                if transport == "tcp6" {
-                    f["address"] = json!("2001:db8::7");
-                }
+                let f = form(transport, direction);
+                let peer = "203.0.113.7:";
                 let built = build(&f).unwrap_or_else(|e| panic!("{transport} {direction}: {e:#}"));
                 assert_eq!(built.iran["tunnel_key"], built.foreign["tunnel_key"]);
+                // The IPv6 entry with this transport: the dialing end goes to the IPv6 address,
+                // the listening end listens on IPv6.
+                {
+                    let mut v6 = f.clone();
+                    v6["transport"] = json!("ipv6");
+                    v6["ipv6_transport"] = json!(transport);
+                    v6["address"] = json!("2001:db8::7");
+                    let built6 = build(&v6).unwrap_or_else(|e| panic!("{transport} {direction} over IPv6: {e:#}"));
+                    let (listening, dialing) = if direction == "reverse" { (&built6.iran["listeners"][0], &built6.foreign["paths"][0]) } else { (&built6.foreign["paths"][0], &built6.iran["listeners"][0]) };
+                    assert!(dialing["addr"].as_str().unwrap().starts_with("[2001:db8::7]:"), "{transport} {direction}: {dialing}");
+                    assert!(listening["addr"].as_str().unwrap().starts_with("[::]:"), "{transport} {direction}: {listening}");
+                    let mut v4_address = v6.clone();
+                    v4_address["address"] = json!("203.0.113.7");
+                    assert!(build(&v4_address).is_err(), "the IPv6 entry needs an IPv6 address");
+                    crate::manager::plan::check(&built6.iran).unwrap();
+                    crate::manager::plan::check(&built6.foreign).unwrap();
+                }
                 assert_eq!(built.iran["mode"], "server");
                 assert_eq!(built.foreign["mode"], "client");
                 let iran_addr = built.iran["listeners"][0]["addr"].as_str().unwrap();
@@ -175,6 +330,101 @@ mod tests {
     }
 
     #[test]
+    fn carrier_options_reach_the_right_end() {
+        // Parallax packet mode: both ends, since the mode must match.
+        let mut parallax = form("parallax", "reverse");
+        parallax["parallax_mode"] = json!("packet");
+        parallax["speed"] = json!("fast2");
+        parallax["pool"] = json!(3);
+        let built = build(&parallax).unwrap();
+        for end in [&built.iran, &built.foreign] {
+            let entry = end.get("listeners").or(end.get("paths")).unwrap();
+            assert_eq!(entry[0]["parallax"]["mode"], "packet");
+            assert_eq!(entry[0]["fec"]["interval_ms"], 20, "speed mode on the packet session");
+            creatable(end).unwrap();
+        }
+        assert_eq!(built.foreign["paths"][0]["connection_pool"], 3, "the dialing end keeps the pool");
+        // TLS look and fragmentation: only the dialing end (the foreign one in a reverse tunnel).
+        let mut wss = form("wss", "reverse");
+        // The browser-like look exists only in builds with that feature; others refuse it.
+        if cfg!(feature = "browser-tls") {
+            wss["tls_profile"] = json!("chrome");
+        }
+        wss["tls_fragment"] = json!(true);
+        wss["tcp_congestion"] = json!("cubic");
+        let built = build(&wss).unwrap();
+        let path = &built.foreign["paths"][0];
+        if cfg!(feature = "browser-tls") {
+            assert_eq!(path["tls_profile"], "chrome");
+        }
+        assert_eq!(path["tls_fragment"]["enabled"], true);
+        assert_eq!(path["tcp_congestion"], "cubic");
+        let listener = &built.iran["listeners"][0];
+        assert!(listener.get("tls_fragment").is_none() && listener.get("tcp_congestion").is_none());
+        // FEC pacer on fec-udp.
+        let mut fec = form("fec-udp", "direct");
+        fec["fec_pacer"] = json!(true);
+        let built = build(&fec).unwrap();
+        assert_eq!(built.iran["paths"].get(0).or(built.iran["listeners"].get(0)).unwrap()["fec"]["pacer"], true);
+        // An option the carrier does not have is refused, not silently dropped.
+        for (transport, key, value) in [("tcp", "tls_fragment", json!(true)), ("tcp", "parallax_mode", json!("packet")),
+            ("wss", "fec_pacer", json!(true)), ("kcp", "tcp_congestion", json!("cubic")), ("tcp", "speed", json!("fast")),
+            ("parallax", "speed", json!("fast")), ("tcp", "pool", json!(17))] {
+            let mut bad = form(transport, "reverse");
+            bad[key] = value;
+            assert!(build(&bad).is_err(), "{transport} {key}");
+        }
+    }
+
+    #[test]
+    fn game_mode_is_written_on_both_ends() {
+        let mut game = form("fec-udp", "reverse");
+        game["game"] = json!(true);
+        let built = build(&game).unwrap();
+        let port = plan::default_tunnel_port(Transport::FecUdp) + 1;
+        assert_eq!(built.iran["gaming"]["control_address"], format!("0.0.0.0:{port}"));
+        assert_eq!(built.foreign["gaming"]["control_address"], format!("203.0.113.7:{port}"));
+        assert_eq!(built.foreign["gaming"]["copies"], 3);
+        assert_eq!(built.foreign["paths"][0]["fec"]["interval_ms"], 10, "fast3 for the carrier");
+        creatable(&built.iran).unwrap();
+        creatable(&built.foreign).unwrap();
+        // Direct: the foreign end needs the Iran address; TCP-only forwarding has no game UDP.
+        let mut direct = form("tcp", "direct");
+        direct["game"] = json!(true);
+        assert!(build(&direct).is_err());
+        direct["iran_address"] = json!("198.51.100.30");
+        direct["game_port"] = json!(45001);
+        direct["game_copies"] = json!(2);
+        let built = build(&direct).unwrap();
+        assert_eq!(built.foreign["gaming"]["control_address"], "198.51.100.30:45001");
+        assert_eq!(built.foreign["gaming"]["copies"], 2);
+        let mut tcp_only = form("tcp", "reverse");
+        tcp_only["game"] = json!(true);
+        tcp_only["protocol"] = json!("tcp");
+        assert!(build(&tcp_only).is_err());
+        for (key, value) in [("game_copies", json!(5)), ("game_port", json!(0))] {
+            let mut bad = form("tcp", "reverse");
+            bad["game"] = json!(true);
+            bad[key] = value;
+            assert!(build(&bad).is_err(), "{key}");
+        }
+    }
+
+    #[test]
+    fn the_game_entry_builds_fec_udp_with_game_mode() {
+        let built = build(&form("game", "reverse")).unwrap();
+        for end in [&built.iran, &built.foreign] {
+            let entry = end.get("listeners").or(end.get("paths")).unwrap();
+            assert_eq!(entry[0]["transport"], "fec-udp");
+            assert_eq!(end["gaming"]["copies"], 3);
+        }
+        // With TCP-only forwarding there is no game UDP: refused, not silently without Game mode.
+        let mut tcp = form("game", "reverse");
+        tcp["protocol"] = json!("tcp");
+        assert!(build(&tcp).is_err());
+    }
+
+    #[test]
     fn bad_forms_and_machine_specific_tunnels_are_refused() {
         let with = |key: &str, value: Value| {
             let mut f = form("tcp", "reverse");
@@ -185,7 +435,6 @@ mod tests {
             with("name", json!("../x")),
             with("transport", json!("fec-raw")),
             with("transport", json!("mirage")),
-            with("transport", json!("parallax")),
             with("carry", json!("tun")),
             with("ports", json!("")),
             with("tunnel_port", json!(0)),

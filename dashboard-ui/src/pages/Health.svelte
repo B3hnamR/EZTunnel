@@ -65,7 +65,7 @@
   const system = $derived((checks ?? []).filter((c) => !c.subject).sort((a, b) => order[a.level] - order[b.level]));
   const tunnels = $derived.by(() => {
     const groups = {};
-    for (const c of checks ?? []) if (c.subject) (groups[c.subject] ??= []).push(c);
+    for (const c of checks ?? []) if (c.subject) (Object.hasOwn(groups, c.subject) ? groups[c.subject] : (groups[c.subject] = [])).push(c);
     return Object.entries(groups).sort(([, a], [, b]) => Math.min(...a.map((c) => order[c.level])) - Math.min(...b.map((c) => order[c.level])));
   });
   // Everything that is not fine, worst first, across the server and its tunnels.
@@ -93,7 +93,7 @@
       case "link": return `${t("note")[v.state] ?? t("hcLinkOk")}${v.last_drop ? ` ${t("lastDrop")} ${v.last_drop}` : ""}`;
       case "program": return t("hcProgram", v);
       case "debug_logging": return t("hcDebug");
-      case "firewall": return t(c.level === "ok" ? "hcFwOpen" : "hcFwClosed", v);
+      case "firewall": return t(c.level === "ok" ? "hcFwOpen" : c.level === "warn" ? "hcFwScoped" : "hcFwClosed", v);
       default: return String(v ?? "");
     }
   }

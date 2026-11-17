@@ -38,6 +38,10 @@ pub struct Row {
     pub sessions: f32,
     /// Host only: average CPU, memory and disk use in percent (NaN otherwise).
     pub cpu: f32,
+    /// Tunnels and the all-tunnels series: the highest combined rate (download + upload of the
+    /// same moment), bytes per second. Kept where the host keeps its CPU (unused for tunnels);
+    /// NaN in rows written before it existed.
+    pub peak_both: f32,
     pub mem: f32,
     pub disk: f32,
     /// Snapshots that went into the row, and how many of them found the tunnel running.
@@ -51,7 +55,7 @@ impl Row {
         out[8..16].copy_from_slice(&self.up.to_le_bytes());
         let floats = [
             self.peak_down, self.peak_up, self.rtt, self.rtt_max, self.loss, self.sessions,
-            self.cpu, self.mem, self.disk,
+            if self.cpu.is_nan() { self.peak_both } else { self.cpu }, self.mem, self.disk,
         ];
         for (i, value) in floats.iter().enumerate() {
             out[16 + i * 4..20 + i * 4].copy_from_slice(&value.to_le_bytes());
@@ -74,6 +78,7 @@ impl Row {
             loss: f32_at(32),
             sessions: f32_at(36),
             cpu: f32_at(40),
+            peak_both: f32_at(40),
             mem: f32_at(44),
             disk: f32_at(48),
             samples: u16_at(52),
@@ -99,13 +104,21 @@ pub struct FileStore {
     dir: PathBuf,
     /// The day being written for each series, kept in memory so a minute costs one write.
     open: Mutex<HashMap<String, (u64, Vec<u8>)>>,
+    /// The series this store has (loaded on first write), to cap how many there can be.
+    known: Mutex<Option<std::collections::HashSet<String>>>,
 }
+
+/// Tunnels one snapshot may add to the history: a server has a handful; a snapshot from a broken
+/// or hostile agent with thousands of names must not make the hub keep a day buffer for each.
+const MAX_SNAPSHOT_TUNNELS: usize = 256;
+/// Series one history may have at all (the host and its tunnels, past ones included).
+const MAX_SERIES: usize = 1024;
 
 /// Series names become directory names: `host`, or `t-` and a tunnel name (tunnel names are
 /// already limited to letters, digits and hyphens).
 fn directory_of(series: &str) -> Option<String> {
-    if series == "host" {
-        return Some("host".into());
+    if series == "host" || series == "all" {
+        return Some(series.into());
     }
     let name = series.strip_prefix("t:")?;
     (!name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
@@ -113,8 +126,8 @@ fn directory_of(series: &str) -> Option<String> {
 }
 
 fn series_of(directory: &str) -> Option<String> {
-    if directory == "host" {
-        return Some("host".into());
+    if directory == "host" || directory == "all" {
+        return Some(directory.into());
     }
     directory.strip_prefix("t-").map(|name| format!("t:{name}"))
 }
@@ -136,6 +149,7 @@ impl FileStore {
         Ok(Self {
             dir: dir.to_path_buf(),
             open: Mutex::new(HashMap::new()),
+            known: Mutex::new(None),
         })
     }
 
@@ -165,7 +179,19 @@ impl Store for FileStore {
     fn put(&self, series: &str, minute: u64, row: &Row) -> Result<()> {
         let directory = directory_of(series).context("bad series name")?;
         let (day, minute_of_day) = (minute / MINUTES_PER_DAY, minute % MINUTES_PER_DAY);
+        {
+            let mut known = self.known.lock().unwrap();
+            let known = known.get_or_insert_with(|| self.series().into_iter().collect());
+            if !known.contains(series) {
+                anyhow::ensure!(known.len() < MAX_SERIES, "the history has {MAX_SERIES} series already");
+                known.insert(series.to_string());
+            }
+        }
         let mut open = self.open.lock().unwrap();
+        // Only the days being written stay in memory; older ones are on disk.
+        if !open.contains_key(series) && open.len() >= MAX_SERIES {
+            open.retain(|_, (open_day, _)| *open_day == day);
+        }
         let entry = open.entry(series.to_string()).or_insert_with(|| (u64::MAX, Vec::new()));
         if entry.0 != day {
             *entry = (day, self.read_day(&directory, day).unwrap_or_else(empty_day));
@@ -242,6 +268,8 @@ impl Store for FileStore {
             // A tunnel deleted long ago leaves an empty directory behind.
             let _ = std::fs::remove_dir(self.dir.join(&directory));
         }
+        // Series whose days all ended no longer count against the cap.
+        *self.known.lock().unwrap() = None;
     }
 }
 
@@ -252,6 +280,7 @@ struct Sum {
     up: f64,
     peak_down: f64,
     peak_up: f64,
+    peak_both: f64,
     rtt: (f64, u32),
     rtt_max: f64,
     loss: (f64, u32),
@@ -286,6 +315,7 @@ impl Sum {
             loss: mean(self.loss),
             sessions: mean(self.sessions),
             cpu: mean(self.cpu),
+            peak_both: self.peak_both as f32,
             mem: mean(self.mem),
             disk: mean(self.disk),
             samples: self.samples,
@@ -299,6 +329,7 @@ impl Sum {
         self.up += up * seconds;
         self.peak_down = self.peak_down.max(down);
         self.peak_up = self.peak_up.max(up);
+        self.peak_both = self.peak_both.max(down + up);
     }
 }
 
@@ -371,6 +402,8 @@ impl History {
                 .as_array()
                 .into_iter()
                 .flatten()
+                .filter(|t| t["name"].as_str().is_some_and(|name| crate::manager::plan::check_name(name).is_ok()))
+                .take(MAX_SNAPSHOT_TUNNELS)
                 .filter_map(|t| {
                     Some(TunnelSample {
                         name: t["name"].as_str()?.to_string(),
@@ -414,8 +447,21 @@ impl History {
             add(&mut host.cpu, cpu);
             add(&mut host.mem, mem);
             add(&mut host.disk, disk);
+            // Every tunnel together at the same moment: the only way to know the combined peak.
+            if !snapshot.tunnels.is_empty() {
+                let all = sums.entry("all".into()).or_default();
+                all.samples = all.samples.saturating_add(1);
+                all.running = all.running.saturating_add(1);
+                let total = |f: fn(&TunnelSample) -> Option<f64>| Some(snapshot.tunnels.iter().filter_map(f).filter(|v| v.is_finite()).sum::<f64>());
+                all.traffic(seconds, total(|t| t.down), total(|t| t.up));
+            }
             for tunnel in &snapshot.tunnels {
-                let sum = sums.entry(format!("t:{}", tunnel.name)).or_default();
+                let series = format!("t:{}", tunnel.name);
+                // Names that change from snapshot to snapshot cannot grow the minute without end.
+                if !sums.contains_key(&series) && sums.len() >= MAX_SERIES {
+                    continue;
+                }
+                let sum = sums.entry(series).or_default();
                 sum.samples = sum.samples.saturating_add(1);
                 if tunnel.running {
                     sum.running = sum.running.saturating_add(1);
@@ -462,17 +508,21 @@ impl History {
         };
         let to = start_of(now_ms / 60_000) + bucket;
         let from = to.saturating_sub(span / bucket * bucket);
-        let points = |rows: &[(u64, Row)]| -> Vec<Value> {
+        // `combined`: the rows know their combined peak (tunnels, all); the host's do not.
+        let points = |rows: &[(u64, Row)], combined: bool| -> Vec<Value> {
             let count = ((to - from) / bucket) as usize;
             let mut buckets: Vec<Option<Row>> = vec![None; count];
             for (minute, row) in rows {
                 let index = ((minute - from) / bucket) as usize;
                 if index < count {
-                    let b = buckets[index].get_or_insert_with(Row::default);
+                    let b = buckets[index].get_or_insert_with(|| Row { peak_both: f32::NAN, ..Row::default() });
                     b.down += row.down;
                     b.up += row.up;
                     b.peak_down = b.peak_down.max(row.peak_down);
                     b.peak_up = b.peak_up.max(row.peak_up);
+                    if combined && row.peak_both.is_finite() {
+                        b.peak_both = if b.peak_both.is_finite() { b.peak_both.max(row.peak_both) } else { row.peak_both };
+                    }
                     b.samples = b.samples.saturating_add(row.samples);
                     b.running = b.running.saturating_add(row.running);
                 }
@@ -483,7 +533,12 @@ impl History {
                 .map(|(i, b)| {
                     let at = (from + i as u64 * bucket) * 60_000;
                     match b {
-                        Some(b) => json!({"at": at, "down": b.down, "up": b.up, "peak": b.peak_down.max(b.peak_up)}),
+                        // The page compares it with download + upload per second, so it is the
+                        // combined peak; rows from before it was kept give the higher direction.
+                        // A direction's peak is never above the combined one at that moment, so
+                        // it is a floor; rows from before the combined peak give only that.
+                        Some(b) => json!({"at": at, "down": b.down, "up": b.up,
+                            "peak": if b.peak_both.is_finite() { b.peak_both.max(b.peak_down).max(b.peak_up) } else { b.peak_down.max(b.peak_up) }}),
                         None => json!({"at": at, "down": null, "up": null}),
                     }
                 })
@@ -508,21 +563,28 @@ impl History {
             "first_at": self.store.first_minute().map(|m| m * 60_000),
         });
         match which {
-            "host" => out["points"] = json!(points(&self.store.rows("host", from, to))),
+            "host" => out["points"] = json!(points(&self.store.rows("host", from, to), false)),
             "all" => {
                 let mut merged: BTreeMap<u64, Row> = BTreeMap::new();
                 for series in &tunnels {
                     for (minute, row) in self.store.rows(series, from, to) {
-                        let m = merged.entry(minute).or_default();
+                        let m = merged.entry(minute).or_insert_with(|| Row { peak_both: f32::NAN, ..Row::default() });
                         m.down += row.down;
                         m.up += row.up;
-                        m.peak_down += row.peak_down;
-                        m.peak_up += row.peak_up;
+                        // Separate peaks were not at the same moment: adding them up would invent
+                        // a peak. The highest one is a floor; the minute's average is another.
+                        m.peak_down = m.peak_down.max(row.peak_down);
+                        m.peak_up = m.peak_up.max(row.peak_up);
                         m.samples = m.samples.max(row.samples);
                     }
                 }
+                // Minutes since the all-tunnels series exists come from it (a peak measured at
+                // one moment); earlier ones are added up, without a combined peak.
+                for (minute, row) in self.store.rows("all", from, to) {
+                    merged.insert(minute, row);
+                }
                 let rows: Vec<(u64, Row)> = merged.into_iter().collect();
-                out["points"] = json!(points(&rows));
+                out["points"] = json!(points(&rows, true));
             }
             "tunnels" => {
                 let mut map = serde_json::Map::new();
@@ -532,7 +594,7 @@ impl History {
                     let last_day: Vec<(u64, Row)> = rows.iter().filter(|(m, _)| *m >= day).copied().collect();
                     map.insert(
                         series.trim_start_matches("t:").to_string(),
-                        json!({"points": points(&rows), "uptime_pct": uptime(&rows), "uptime_24h_pct": uptime(&last_day)}),
+                        json!({"points": points(&rows, true), "uptime_pct": uptime(&rows), "uptime_24h_pct": uptime(&last_day)}),
                     );
                 }
                 out["tunnels"] = Value::Object(map);
@@ -588,6 +650,7 @@ impl Store for DemoStore {
                     loss: f32::NAN,
                     sessions: 4.0,
                     cpu: (20.0 + 15.0 * daily) as f32,
+                    peak_both: (down_rate * 1.5) as f32,
                     mem: 41.0,
                     disk: 38.0,
                     samples: 30,
@@ -711,7 +774,8 @@ mod tests {
         assert_eq!(far.len(), 1);
         assert_eq!((far[0].1.samples, far[0].1.running), (2, 2));
         assert_eq!(history.store.rows("host", minute, minute + 1)[0].1.samples, 2);
-        assert_eq!(history.store.series().len(), 2, "a tunnel without a name is skipped");
+        // host, the one named tunnel and the all-tunnels series: a tunnel without a name is skipped.
+        assert_eq!(history.store.series(), ["all", "host", "t:far"]);
     }
 
     #[test]
@@ -720,6 +784,28 @@ mod tests {
         assert_eq!(directory_of("t:"), None);
         assert_eq!(directory_of("other"), None);
         assert_eq!(directory_of("t:web-wss").as_deref(), Some("t-web-wss"));
+    }
+
+    /// A snapshot with thousands of tunnel names (a broken or hostile agent) adds at most
+    /// `MAX_SNAPSHOT_TUNNELS` series, names that are not tunnel names none, and a history never
+    /// holds more than `MAX_SERIES` series.
+    #[test]
+    fn a_flood_of_tunnel_names_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileStore::open(dir.path()).unwrap();
+        let history = History::new(Box::new(FileStore::open(dir.path()).unwrap()));
+        let tunnels: Vec<_> = (0..5000).map(|n| serde_json::json!({"name": format!("t{n}"), "state": "running"}))
+            .chain([serde_json::json!({"name": "../x", "state": "running"}), serde_json::json!({"name": "UPPER", "state": "running"})])
+            .collect();
+        let at = 30_000_000 * 60_000;
+        history.record_value(&serde_json::json!({"host": {}, "tunnels": tunnels}), at);
+        history.record_value(&serde_json::json!({"host": {}, "tunnels": []}), at + 60_000);
+        // host, the all-tunnels series and at most MAX_SNAPSHOT_TUNNELS tunnels.
+        assert_eq!(store.series().len(), 2 + MAX_SNAPSHOT_TUNNELS);
+        for n in 0..(MAX_SERIES + 10) {
+            let _ = store.put(&format!("t:x{n}"), 30_000_000, &row(1));
+        }
+        assert!(store.series().len() <= MAX_SERIES);
     }
 
     #[test]
@@ -765,6 +851,30 @@ mod tests {
         history.record(&snapshot((minute - 89) * 60_000, 1000.0, "running"));
         let store = FileStore::open(dir.path()).unwrap();
         assert_eq!(store.rows("t:game", minute - 100, minute + 10).len(), 2);
+    }
+
+    /// Two tunnels busy at different moments: the combined peak is what was carried at one
+    /// moment, not the sum of each tunnel's own peak.
+    #[test]
+    fn the_combined_peak_is_measured_not_added_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let history = History::new(Box::new(FileStore::open(dir.path()).unwrap()));
+        let minute = 30_000_000u64;
+        let sample = |at: u64, a: f64, b: f64| {
+            let snapshot = serde_json::json!({"host": {}, "tunnels": [
+                {"name": "a", "state": "running", "down_bps": a, "up_bps": 0.0},
+                {"name": "b", "state": "running", "down_bps": b, "up_bps": 0.0}]});
+            history.record_value(&snapshot, at);
+        };
+        sample(minute * 60_000, 1000.0, 0.0);
+        sample(minute * 60_000 + 2000, 0.0, 1000.0);
+        sample((minute + 1) * 60_000, 0.0, 0.0);
+        let all = history.query("24h", "all", (minute + 1) * 60_000 + 30_000, 0).unwrap();
+        let peak = all["points"].as_array().unwrap().iter().filter_map(|p| p["peak"].as_f64()).fold(0.0, f64::max);
+        assert_eq!(peak, 1000.0, "one tunnel at a time: never 2000");
+        let tunnels = history.query("24h", "tunnels", (minute + 1) * 60_000 + 30_000, 0).unwrap();
+        let a = tunnels["tunnels"]["a"]["points"].as_array().unwrap().iter().filter_map(|p| p["peak"].as_f64()).fold(0.0, f64::max);
+        assert_eq!(a, 1000.0);
     }
 
     #[test]

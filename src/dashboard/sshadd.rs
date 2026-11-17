@@ -56,7 +56,7 @@ pub fn run_join(state_dir: &Path, host: &str, port: u16, user: &str, command: &s
     ensure!(user_ok(user), "the user name may hold lowercase letters, digits, _ and -");
     ensure!(port > 0, "the port must be 1 to 65535");
     // The join command is ours (a fixed form with the code); it is passed as one argument to bash.
-    ensure!(command.starts_with("bash <(curl ") && !command.contains(['\n', '\r']), "unexpected join command");
+    ensure!(command.starts_with("s=$(curl ") && !command.contains(['\n', '\r']), "unexpected join command");
     let key = key_path(state_dir);
     ensure!(key.exists(), "the dashboard has no SSH key yet; open Add over SSH first");
     let known = state_dir.join("ssh").join("known_hosts");
@@ -74,18 +74,42 @@ pub fn run_join(state_dir: &Path, host: &str, port: u16, user: &str, command: &s
         .stderr(Stdio::piped())
         .spawn()
         .context("run ssh")?;
+    // Both outputs are read while it runs: a full pipe would stop the program before it exits.
+    let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut kept = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let mut buffer = [0u8; 8192];
+                while let Ok(n) = pipe.read(&mut buffer) {
+                    if n == 0 {
+                        break;
+                    }
+                    kept.extend_from_slice(&buffer[..n]);
+                    // Only the end is shown; keep at most the last 64 KiB.
+                    if kept.len() > 128 * 1024 {
+                        kept.drain(..kept.len() - 64 * 1024);
+                    }
+                }
+            }
+            kept
+        })
+    };
+    let stdout = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>));
+    let stderr = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>));
     let started = std::time::Instant::now();
-    loop {
-        if child.try_wait()?.is_some() {
-            break;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
         }
         if started.elapsed() > Duration::from_secs(300) {
             let _ = child.kill();
+            let _ = child.wait();
             bail!("the server did not finish joining within 5 minutes");
         }
         std::thread::sleep(Duration::from_millis(300));
-    }
-    let output = child.wait_with_output()?;
+    };
+    let (stdout, stderr) = (stdout.join().unwrap_or_default(), stderr.join().unwrap_or_default());
+    let output = std::process::Output { status, stdout, stderr };
     let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
     let tail: Vec<&str> = text.lines().rev().take(15).collect::<Vec<_>>().into_iter().rev().collect();
     let tail = tail.join("\n");
@@ -118,7 +142,7 @@ mod tests {
             assert!(!user_ok(bad), "{bad}");
         }
         let dir = tempfile::tempdir().unwrap();
-        assert!(run_join(dir.path(), "203.0.113.5", 22, "root", "bash <(curl -fsSL http://x/join.sh) ezj1-x").is_err(), "no key yet");
+        assert!(run_join(dir.path(), "203.0.113.5", 22, "root", "s=$(curl -fsSL http://x/join.sh) && bash -c \"$s\" join.sh ezj1-x").is_err(), "no key yet");
         assert!(run_join(dir.path(), "203.0.113.5", 22, "root", "rm -rf /").is_err());
     }
 }

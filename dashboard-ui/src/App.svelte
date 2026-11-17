@@ -1,4 +1,5 @@
 <script>
+  import { tick } from "svelte";
   import Logo from "./lib/Logo.svelte";
   import Footer from "./lib/Footer.svelte";
   import Icon from "./lib/Icon.svelte";
@@ -42,6 +43,8 @@
   let routeTunnel = $state(readTunnel());
   let routeSource = $state(readParam("v"));
   let routeServer = $state(readParam("s") || "local");
+  /** The page heading: where the focus goes after moving to another page. */
+  let heading = $state(null);
   let menuOpen = $state(false);
   let firstLink = $state();
   let side = $state();
@@ -144,12 +147,21 @@
 
 <svelte:window
   onhashchange={() => {
+    const before = { route, routeTunnel };
+    // The control in use (a server picker) is rebuilt with the page; it gets the focus back.
+    const focused = document.activeElement?.id;
     route = readRoute();
     routeTunnel = readTunnel();
     routeSource = readParam("v");
     routeServer = readParam("s") || "local";
     if (menuOpen) setMenu(false);
     window.scrollTo(0, 0);
+    const newPage = before.route !== route || before.routeTunnel !== routeTunnel;
+    tick().then(() => {
+      const again = !newPage && focused ? document.getElementById(focused) : null;
+      if (again) again.focus({ preventScroll: true });
+      else if (newPage) heading?.focus({ preventScroll: true });
+    });
   }}
   onkeydown={(e) => {
     if (e.key === "Escape" && menuOpen) setMenu(false);
@@ -195,7 +207,7 @@
       <header class="top">
         <button class="btn icon menu-btn" onclick={() => setMenu(true)} aria-label={t("menu")} aria-controls="side" aria-expanded={menuOpen}><Icon name="menu" /></button>
         <div>
-          <h1>{t(page.title)}</h1>
+          <h1 tabindex="-1" bind:this={heading}>{t(page.title)}</h1>
           {#if page.sub}<p class="sub">{t(page.sub)}</p>{/if}
         </div>
         <div class="grow"></div>

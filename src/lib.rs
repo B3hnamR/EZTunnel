@@ -10,6 +10,7 @@ pub mod spoof_test;
 pub mod spoof_session;
 pub mod spoof_fec;
 pub mod parallax_carrier;
+pub mod parallax_lanes;
 pub mod checker;
 pub mod pathprobe;
 pub mod config;

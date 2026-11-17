@@ -10,10 +10,12 @@
   import { t, num, pct } from "./i18n.svelte.js";
   import { copyText, saveFile, csvLine, stamp } from "./share.js";
 
-  const PROFILES = ["udp", "icmp", "tcp", "gre", "ipip", "dns"];
+  // The backend's list (it arrives with the status); this one matches it until then.
+  const FALLBACK_PROFILES = ["udp", "icmp", "tcp", "icmpv6", "gre", "ipip", "bip"];
+  const PROFILES = $derived(Array.isArray(state?.profiles) && state.profiles.length ? state.profiles : FALLBACK_PROFILES);
   const places = $derived([
-    { id: LOCAL, name: t("thisServerIs", live.snapshot?.host?.hostname ?? ""), address: live.snapshot?.host?.address ?? "", online: true },
-    ...fleet.list.map((s) => ({ id: s.id, name: s.name, address: s.snapshot?.host?.address ?? "", online: s.online })),
+    { id: LOCAL, name: t("thisServerIs", live.snapshot?.host?.hostname ?? ""), address: live.snapshot?.host?.address ?? "", address6: live.snapshot?.host?.address6 ?? "", online: true },
+    ...fleet.list.map((s) => ({ id: s.id, name: s.name, address: s.snapshot?.host?.address ?? "", address6: s.snapshot?.host?.address6 ?? "", online: s.online })),
   ]);
   const placeOf = (id) => places.find((p) => p.id === id);
   let f = $state({ iran: LOCAL, foreign: "", sources: "", reverse: "real", profiles: ["udp", "icmp"], depth: "quick" });

@@ -527,6 +527,8 @@ mod tests {
             seconds: 0,
             iran_ip: String::new(),
             foreign_ip: String::new(),
+            iran_ip6: None,
+            foreign_ip6: None,
             options: Options::default(),
             baseline: None,
             cases: Vec::new(),

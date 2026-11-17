@@ -7,24 +7,38 @@
   import { say, ask } from "../lib/actions.svelte.js";
   import { t, num, duration, ui, setTheme, clock } from "../lib/i18n.svelte.js";
   import { copyText } from "../lib/share.js";
+  import { plainDigits } from "../lib/view.js";
 
   let info = $state(null);
+  // The first load failed: say so and offer to try again, instead of "Loading" for ever.
+  let loadFailed = $state(false);
+  let loading = $state(false);
   let sessions = $state([]);
   let form = $state({ days: "7", proxy: "", tg: { enabled: false, token: "", chats: "", lang: "en", level: "bad", resolved: true } });
   let metricsToken = $state("");
   let saving = $state("");
 
   async function load() {
+    if (loading) return;
+    loading = true;
     try {
       const { status, data } = await getSettings();
-      if (status !== 200) return;
+      if (status !== 200) {
+        loadFailed = !info;
+        return;
+      }
+      loadFailed = false;
       info = data;
       const p = data.prefs;
       form = {
         days: String(p.auto_backup_days), proxy: p.proxy ?? "",
         tg: { enabled: p.telegram.enabled, token: "", chats: p.telegram.chats.join(", "), lang: p.telegram.lang, level: p.telegram.level, resolved: p.telegram.resolved },
       };
-    } catch {}
+    } catch {
+      loadFailed = !info;
+    } finally {
+      loading = false;
+    }
     loadSessions();
   }
   async function loadSessions() {
@@ -35,6 +49,10 @@
   }
   $effect(() => {
     untrack(load);
+    // Back online after a failed first load: try again by itself.
+    const again = () => { if (!info) load(); };
+    window.addEventListener("online", again);
+    return () => window.removeEventListener("online", again);
   });
 
   async function save(part, body) {
@@ -58,7 +76,8 @@
   }
 
   // Telegram: what is saved, what the form would change, and how the last message went.
-  const chatList = (text) => text.split(/[,\s]+/).filter(Boolean).map(Number);
+  // Persian digits and commas count like plain ones.
+  const chatList = (text) => plainDigits(text).split(/[,\s]+/).filter(Boolean).map(Number);
   const tgSaved = $derived(info?.prefs?.telegram);
   const tgDirty = $derived(Boolean(tgSaved) && (
     form.tg.token.trim() !== "" || form.tg.enabled !== tgSaved.enabled || form.tg.lang !== tgSaved.lang ||
@@ -159,7 +178,14 @@
 </script>
 
 {#if !info}
-  <div class="panel act-empty">{t("loadingT")}</div>
+  {#if loadFailed}
+    <div class="panel act-empty" role="alert">
+      <p class="m0">{t("stLoadFailed")}</p>
+      <button class="btn mt12" onclick={load} disabled={loading} aria-busy={loading}>{t("retry")}</button>
+    </div>
+  {:else}
+    <div class="panel act-empty">{t("loadingT")}</div>
+  {/if}
 {:else}
   <div class="tp-grid">
     <section class="panel" aria-labelledby="st-panel">

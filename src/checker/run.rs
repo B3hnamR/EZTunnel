@@ -34,6 +34,11 @@ const REPAIR_LIMIT: Duration = Duration::from_secs(60);
 pub struct View {
     pub iran_ip: String,
     pub foreign_ip: String,
+    /// The IPv6 addresses of the IPv6 cases, when the check has them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iran_ip6: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foreign_ip6: Option<String>,
     pub rows: Vec<CaseResult>,
     /// The case running now.
     pub current: Option<u32>,
@@ -66,6 +71,8 @@ pub fn spawn(code: CheckCode, me: Side) -> Handle {
     let (view_tx, view) = watch::channel(View {
         iran_ip: code.iran_ip.to_string(),
         foreign_ip: code.foreign_ip.to_string(),
+        iran_ip6: code.iran_ip6.map(|ip| ip.to_string()),
+        foreign_ip6: code.foreign_ip6.map(|ip| ip.to_string()),
         rows: code
             .options
             .cases()
@@ -99,11 +106,23 @@ pub fn spawn(code: CheckCode, me: Side) -> Handle {
         }
         hint_view.send_modify(|v| v.path_hint = None);
     });
+    let done_view = view_tx.clone();
     let task = tokio::spawn(async move {
-        match me {
+        let result = match me {
             Side::Iran => coordinate(code, view_tx, commands_rx).await,
             Side::Foreign => follow(code, view_tx, commands_rx).await,
-        }
+        };
+        // However it ended (also stopped or failed before the other server joined), it is over:
+        // the path hints above stop with it.
+        done_view.send_modify(|v| {
+            if !v.finished {
+                v.finished = true;
+                if let Err(error) = &result {
+                    v.step = format!("ended: {error:#}");
+                }
+            }
+        });
+        result
     });
     Handle {
         view,
@@ -421,6 +440,8 @@ async fn coordinate(
         seconds: board.started.elapsed().as_secs(),
         iran_ip: code.iran_ip.to_string(),
         foreign_ip: code.foreign_ip.to_string(),
+        iran_ip6: code.iran_ip6.map(|ip| ip.to_string()),
+        foreign_ip6: code.foreign_ip6.map(|ip| ip.to_string()),
         options,
         baseline,
         cases: board.view.borrow().rows.clone(),
@@ -621,7 +642,12 @@ async fn run_case(
     let label = format!("{} · {} dials", spec.transport_name(), spec.dialer_label());
     let mut result = CaseResult::new(spec);
     board.row(spec.id, |row| *row = result.clone());
-    if let Some(reason) = case::impossible(&spec, code.iran_ip, code.foreign_ip) {
+    let Some((iran_ip, foreign_ip)) = code.pair_for(&spec) else {
+        result.verdict = Some(Verdict::NotPossible);
+        result.note = Some("no IPv6 addresses for this case".into());
+        return Ok(result);
+    };
+    if let Some(reason) = case::impossible(&spec, iran_ip, foreign_ip) {
         result.verdict = Some(Verdict::NotPossible);
         result.note = Some(reason);
         return Ok(result);
@@ -635,8 +661,8 @@ async fn run_case(
         spec,
         side: Side::Iran,
         key: code.key.clone(),
-        iran_ip: code.iran_ip,
-        foreign_ip: code.foreign_ip,
+        iran_ip,
+        foreign_ip,
         port: 0,
         map_port,
         service_port: peer.service_port,
@@ -646,7 +672,7 @@ async fn run_case(
     let iran_listens = setup.listens();
     let mut iran_tunnel = None;
     if iran_listens {
-        setup.port = match case::choose_port(&spec, options) {
+        setup.port = match case::choose_port(&spec, options, Side::Iran) {
             Ok(port) => port,
             Err(error) => return Ok(not_possible(result, format!("Iran server: {error:#}"))),
         };
@@ -683,6 +709,14 @@ async fn run_case(
     }
     if !iran_listens {
         setup.port = port.context("the foreign server sent no port")?;
+        // The foreign server chose the port; Game mode also needs the port after it here.
+        if spec.variant == super::Variant::Game && !case::game_port_free(setup.port, Side::Iran) {
+            stop_remote(peer, spec.id).await?;
+            return Ok(not_possible(
+                result,
+                format!("Iran server: the Game mode port {} is in use", crate::manager::plan::game_port(setup.port)),
+            ));
+        }
         match Running::start(&setup).await {
             Ok(running) => iran_tunnel = Some(running),
             Err(error) => {
@@ -853,6 +887,23 @@ async fn measure_case(
     board.row(id, |row| row.handshake_ms = Some(handshake));
     // Let the first session confirm itself before the first stream.
     time::sleep(Duration::from_millis(300)).await;
+    let game = result.spec.variant == super::Variant::Game;
+    if game {
+        // UDP that starts before the game path is up goes through the tunnel and stays there; the
+        // measurement would test the fallback, not Game mode.
+        board.step(format!("{label} · waiting for the Game mode path"));
+        let waited = Instant::now();
+        while !tunnel.stats.gaming_ready.load(Relaxed) {
+            if waited.elapsed() > GAME_PATH_LIMIT || tunnel.finished() {
+                result.game_path = Some(false);
+                let note = "the Game mode path did not come up (its UDP port may be blocked)";
+                result.note = Some(note.into());
+                board.row(id, |row| row.note = Some(note.into()));
+                return result;
+            }
+            time::sleep(Duration::from_millis(50)).await;
+        }
+    }
     let hold_sec = options.hold_sec;
     if options.pings > 0 && checkpoint(board, gate).await {
         board.step(format!("{label} · ping"));
@@ -868,13 +919,19 @@ async fn measure_case(
     }
     let seconds = Duration::from_secs(u64::from(options.speed_sec));
     let nothing_passes = result.ping.as_ref().is_some_and(|p| p.answered == 0);
+    // Game mode: for each UDP measurement reported, whether its own datagrams took the game path
+    // (a later one can fall back to the tunnel when the path went away in between).
+    let game_sent = || tunnel.stats.gaming_datagrams.load(Relaxed);
+    let mut game_stages: Vec<(&str, bool)> = Vec::new();
     if options.udp && !nothing_passes && checkpoint(board, gate).await {
         board.step(format!("{label} · UDP"));
+        let before = game_sent();
         let stats = measure::udp_probe(map, UDP_IDLE_PACKETS, |stats| {
             let stats = stats.clone();
             board.row(id, |row| row.udp = Some(stats));
         })
         .await;
+        game_stages.push(("the idle UDP measurement", game_sent() > before));
         board.row(id, |row| row.udp = Some(stats.clone()));
         result.udp = Some(stats);
     }
@@ -883,6 +940,7 @@ async fn measure_case(
     if options.download && !nothing_passes && checkpoint(board, gate).await {
         board.step(format!("{label} · download {}s", options.speed_sec));
         let transfer = if udp_carried {
+            let before = game_sent();
             let packets = options.speed_sec * measure::UDP_RATE;
             let(warm_tx,warm_rx)=tokio::sync::oneshot::channel();
             let(load_tx,load_rx)=tokio::sync::oneshot::channel();
@@ -897,7 +955,11 @@ async fn measure_case(
             // download. If the download failed, part of the sample ran without load, so it is
             // not reported as "UDP during download".
             match loaded_sample(loaded, &transfer) {
-                Some(loaded) => {board.row(id, |row| row.udp_loaded = Some(loaded.clone()));result.udp_loaded = Some(loaded);}
+                Some(loaded) => {
+                    game_stages.push(("the UDP measurement during the download", game_sent() > before));
+                    board.row(id, |row| row.udp_loaded = Some(loaded.clone()));
+                    result.udp_loaded = Some(loaded);
+                }
                 None => board.row(id, |row| row.udp_loaded = None),
             }
             transfer
@@ -964,8 +1026,27 @@ async fn measure_case(
         }
         result.hold = Some(hold);
     }
+    if game {
+        // Every UDP figure reported must have come over the game path; one that fell back to
+        // the tunnel makes the case not a Game mode result.
+        let fell_back: Vec<&str> = game_stages.iter().filter(|(_, used)| !used).map(|(stage, _)| *stage).collect();
+        let used = if game_stages.is_empty() { !options.udp } else { fell_back.is_empty() };
+        result.game_path = Some(used);
+        if !used {
+            let note = if fell_back.is_empty() {
+                "no UDP measurement ran over the Game mode path".to_string()
+            } else {
+                format!("{} went through the tunnel, not the Game mode path", fell_back.join(" and "))
+            };
+            board.row(id, |row| row.note = Some(note.clone()));
+            result.note = Some(note);
+        }
+    }
     result
 }
+
+/// How long a Game mode case waits for its datagram path after the handshake.
+const GAME_PATH_LIMIT: Duration = Duration::from_secs(10);
 
 /// The foreign server's part: runs its half of each case on request, forwards its keys, shows
 /// the view it receives.
@@ -1129,16 +1210,24 @@ async fn start_half(
         spec,
         side: Side::Foreign,
         key: code.key.clone(),
-        iran_ip: code.iran_ip,
-        foreign_ip: code.foreign_ip,
+        iran_ip: code.pair_for(&spec).map_or(code.iran_ip, |(iran, _)| iran),
+        foreign_ip: code.pair_for(&spec).map_or(code.foreign_ip, |(_, foreign)| foreign),
         port: 0,
         map_port,
         service_port: service.address.port(),
         udp: false,
     };
     setup.port = match port {
+        // The Iran server chose the port; Game mode also needs the port after it here.
+        Some(port)
+            if spec.variant == super::Variant::Game
+                && !setup.own_is_loopback()
+                && !case::game_port_free(port, Side::Foreign) =>
+        {
+            return failed(format!("the Game mode port {} is in use", crate::manager::plan::game_port(port)));
+        }
         Some(port) => port,
-        None => match case::choose_port(&spec, &code.options) {
+        None => match case::choose_port(&spec, &code.options, Side::Foreign) {
             Ok(port) => port,
             Err(error) => return failed(format!("{error:#}")),
         },
@@ -1220,7 +1309,7 @@ mod retry_tests {
     use crate::config::Transport;
 
     fn failed_first() -> CaseResult {
-        let mut first = CaseResult::new(CaseSpec { id: 3, transport: Transport::Tcp, dialer: Some(Side::Foreign), variant: super::super::Variant::Plain, profile: None });
+        let mut first = CaseResult::new(CaseSpec { id: 3, transport: Transport::Tcp, dialer: Some(Side::Foreign), variant: super::super::Variant::Plain, profile: None, round: 0, ipv6: false, });
         first.handshake_ms = Some(5);
         first.runs = 1;
         first

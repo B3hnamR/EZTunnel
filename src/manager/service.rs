@@ -209,6 +209,19 @@ pub fn install(store: &Store, name: &str) -> Result<()> {
 /// Like `install`, for a service that runs the program at `binary` (an update installs the new
 /// program under the usual path before the services are written again).
 pub fn install_with(store: &Store, name: &str, binary: &Path) -> Result<()> {
+    write_service(store, name, binary)?;
+    systemctl(&["enable", "--quiet", &unit_name(name)])?;
+    systemctl(&["restart", &unit_name(name)])
+}
+
+/// Writes the unit again for the tunnel's current file and leaves it as it is: a stopped tunnel
+/// stays stopped, and starts later with what its file now needs (a restore, for example).
+pub fn rewrite(store: &Store, name: &str, binary: &Path) -> Result<()> {
+    write_service(store, name, binary)
+}
+
+/// The unit (and its firewall rules) for the tunnel's current file, without starting anything.
+fn write_service(store: &Store, name: &str, binary: &Path) -> Result<()> {
     ensure!(store.system, "systemd is not available on this machine");
     ensure_service_user(store)?;
     let path = store.path(name);
@@ -236,6 +249,14 @@ pub fn install_with(store: &Store, name: &str, binary: &Path) -> Result<()> {
         }
     }
     let launch = false;
+    // Never take over a unit this tunnel did not write (another program's service of that name).
+    if let Ok(existing) = std::fs::read_to_string(unit_path(name)) {
+        ensure!(
+            existing.contains(&path.display().to_string()),
+            "{} exists and does not run this tunnel; choose another name",
+            unit_name(name)
+        );
+    }
     write_unit(
         unit_path(name),
         &unit_text_with(name, &binary, &path, &config, launch),
@@ -246,8 +267,7 @@ pub fn install_with(store: &Store, name: &str, binary: &Path) -> Result<()> {
     if let Err(error) = super::rawfw::refresh(name, &config) {
         super::ui::warn(&format!("Could not update the firewall rules: {error:#}"));
     }
-    systemctl(&["enable", "--quiet", &unit_name(name)])?;
-    systemctl(&["restart", &unit_name(name)])
+    Ok(())
 }
 
 fn debug_drop_in(name: &str) -> String {
@@ -458,7 +478,20 @@ fn still_running(name: &str) -> bool {
 /// Stops the service and removes its unit. Missing services are not an error; a service that
 /// will not stop is: removing its unit and configuration would leave a tunnel running that the
 /// manager can no longer see.
+/// Whether the unit file of `name`, if there is one, runs this tunnel's configuration (one this
+/// program wrote). Another program's `eztunnel-NAME.service` is not ours to stop or remove.
+fn unit_is_ours(name: &str) -> bool {
+    match std::fs::read_to_string(unit_path(name)) {
+        Ok(text) => text.contains("--config") && text.contains(&format!("/{name}.json")),
+        Err(_) => true,
+    }
+}
+
 pub fn remove(name: &str) -> Result<()> {
+    if !unit_is_ours(name) {
+        tracing::warn!(unit = %unit_name(name), "the service unit does not run this tunnel; it was left as it is");
+        return Ok(());
+    }
     let _ = systemctl(&["disable", "--now", "--quiet", &unit_name(name)]);
     if still_running(name) {
         let _ = systemctl(&["stop", &unit_name(name)]);

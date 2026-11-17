@@ -42,6 +42,11 @@ impl SpeedMode {
         SpeedMode::Fast3,
     ];
 
+    /// The mode a label names (`default`, `normal`, `fast`, `fast2`, `fast3`).
+    pub fn from_label(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.label() == word)
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             SpeedMode::Default => "default",
@@ -82,19 +87,27 @@ impl SpeedMode {
 }
 
 /// Which carrier object holds the timing fields, and whether it has the batching fields.
-fn target(transport: Transport) -> Option<(&'static str, bool)> {
+/// Parallax has timing modes only in packet mode, where the FEC session runs above the lanes.
+fn target(transport: Transport, packet: bool) -> Option<(&'static str, bool)> {
     match transport {
         Transport::Kcp => Some(("kcp", false)),
         Transport::FecUdp | Transport::FecRaw | Transport::FecRawGaming | Transport::Mirage => {
             Some(("fec", true))
         }
+        Transport::Parallax if packet => Some(("fec", true)),
         _ => None,
     }
 }
 
-/// Whether a carrier has timing modes.
-pub fn applies(transport: Transport) -> bool {
-    target(transport).is_some()
+/// Whether a carrier has timing modes (`packet`: Parallax packet mode).
+pub fn applies(transport: Transport, packet: bool) -> bool {
+    target(transport, packet).is_some()
+}
+
+/// Whether the configuration's Parallax entry runs in packet mode.
+fn packet_mode(config: &Value) -> bool {
+    let list = if config["mode"] == "server" { "listeners" } else { "paths" };
+    config[list][0]["parallax"]["mode"] == "packet"
 }
 
 /// The timing fields of the carrier object (the batching ones exist only for FEC).
@@ -125,7 +138,7 @@ fn entry_mut(config: &mut Value) -> Option<&mut Value> {
 
 /// Writes `mode` into a configuration. `Default` removes the timing fields again.
 pub fn apply_config(config: &mut Value, transport: Transport, mode: SpeedMode) {
-    let Some((key, batching)) = target(transport) else {
+    let Some((key, batching)) = target(transport, packet_mode(config)) else {
         return;
     };
     let Some(entry) = entry_mut(config).and_then(Value::as_object_mut) else {
@@ -159,7 +172,7 @@ pub fn apply_config(config: &mut Value, transport: Transport, mode: SpeedMode) {
 /// The mode a configuration is in: `Some(Default)` when no timing field is set, the named mode
 /// when the fields match one exactly, and `None` for custom values.
 pub fn detect(config: &Value, transport: Transport) -> Option<SpeedMode> {
-    let (key, batching) = target(transport)?;
+    let (key, batching) = target(transport, packet_mode(config))?;
     let list = if config["mode"] == "server" {
         "listeners"
     } else {
@@ -176,6 +189,7 @@ pub fn detect(config: &Value, transport: Transport) -> Option<SpeedMode> {
             let mut probe = Value::Object(Map::new());
             probe["mode"] = config["mode"].clone();
             probe[list] = Value::Array(vec![Value::Object(Map::new())]);
+            probe[list][0]["parallax"] = config[list][0]["parallax"].clone();
             apply_config(&mut probe, transport, *mode);
             timing_fields(probe[list][0].get(key), batching) == current
         })
@@ -213,16 +227,34 @@ mod tests {
             Transport::FecRaw,
             Transport::FecRawGaming,
         ] {
-            assert!(applies(transport), "{transport:?}");
+            assert!(applies(transport, false), "{transport:?}");
         }
         for transport in [
             Transport::Tcp,
             Transport::Wss,
             Transport::Xhttp,
             Transport::Tun,
+            Transport::Parallax,
         ] {
-            assert!(!applies(transport), "{transport:?}");
+            assert!(!applies(transport, false), "{transport:?}");
         }
+        assert!(applies(Transport::Parallax, true));
+    }
+
+    #[test]
+    fn parallax_packet_mode_has_fec_timing_modes() {
+        for mode in SpeedMode::ALL {
+            let mut config = client("parallax");
+            config["paths"][0]["parallax"] = json!({"mode": "packet"});
+            apply_config(&mut config, Transport::Parallax, mode);
+            assert_eq!(detect(&config, Transport::Parallax), Some(mode), "{mode:?}");
+            assert_eq!(config["paths"][0]["parallax"]["mode"], "packet");
+        }
+        // Stream mode has no timer to set: nothing is written.
+        let mut stream = client("parallax");
+        apply_config(&mut stream, Transport::Parallax, SpeedMode::Fast2);
+        assert!(stream["paths"][0].get("fec").is_none());
+        assert_eq!(detect(&stream, Transport::Parallax), None);
     }
 
     #[test]

@@ -18,9 +18,11 @@
     <a class="foot-lic" href="https://github.com/B3hnamR/EZTunnel/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">AGPL-3.0</a>
   </div>
   {#if status}
-    <div class="foot-live" role="status">
+    <div class="foot-live">
       <span class="mark {live.link === 'lost' ? 'bad' : live.link === 'up' ? 'ok' : 'off'}"></span>
-      {#if live.link === "lost"}{t("footLost")}{:else if live.link === "up" && live.lastAt}{t("footLive", clock(live.lastAt))}{:else}{t("loadingT")}{/if}
+      <!-- Announced when the connection changes, not every time the clock moves. -->
+      <span class="sr" role="status">{live.link === "lost" ? t("footLost") : live.link === "up" ? t("footUp") : t("loadingT")}</span>
+      <span aria-hidden="true">{#if live.link === "lost"}{t("footLost")}{:else if live.link === "up" && live.lastAt}{t("footLive", clock(live.lastAt))}{:else}{t("loadingT")}{/if}</span>
     </div>
   {/if}
   <nav class="foot-links" aria-label={t("footAuthor")}>

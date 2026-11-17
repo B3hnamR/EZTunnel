@@ -58,7 +58,7 @@ function failure(name, status, data) {
 }
 
 /** The key `pending` uses for a tunnel: its name here, "server/name" on another server. */
-export const pendingKey = (name, server) => (server && server !== "local" ? `${server}/${name}` : name);
+export const pendingKey = (name, server) => `${server && server !== "local" ? server : "local"}/${name}`;
 
 /** Runs one action and reports it; `quiet` returns the report ([text, bad]) instead. */
 export async function runAction(name, action, server, quiet = false) {

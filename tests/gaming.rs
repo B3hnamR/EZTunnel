@@ -160,3 +160,57 @@ async fn ordinary_udp_map_survives_reliable_session_restart_with_direct_flow_ide
         echo_task.await??;Ok::<_,anyhow::Error>(())
     }).await??;Ok(())
 }
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn copies_race_over_extra_ports_and_each_datagram_arrives_once()->Result<()> {
+    timeout(Duration::from_secs(20),async {
+        let control=tcp_port();let su=udp_port();let cu=udp_port();
+        // The target echoes and counts: a copy that slipped through would arrive twice.
+        let echo=UdpSocket::bind("127.0.0.1:0").await?;let target=echo.local_addr()?;
+        let echo_task=tokio::spawn(async move {
+            let mut seen=std::collections::HashSet::new();let mut buffer=[0;2048];
+            for _ in 0..50 {
+                let(size,source)=echo.recv_from(&mut buffer).await?;
+                ensure!(seen.insert(buffer[..size].to_vec()),"a datagram reached the target twice");
+                echo.send_to(&buffer[..size],source).await?;
+            }
+            // Nothing more may arrive: every extra copy was absorbed before the target.
+            ensure!(timeout(Duration::from_millis(600),echo.recv_from(&mut buffer)).await.is_err(),"a late copy reached the target");
+            Ok::<_,anyhow::Error>(())
+        });
+        let key=eztunnel::tunnel_key::TunnelKey::generate()?.display();
+        let gaming=|udp:u16|json!({"control_address":format!("127.0.0.1:{control}"),"udp_bind":format!("127.0.0.1:{udp}"),"copies":3});
+        let(_sd,server)=config(json!({"mode":"server","tunnel_key":key,"listeners":[{"addr":"127.0.0.1:25551"}],"gaming":gaming(su)}))?;
+        let(_cd,client)=config(json!({"mode":"client","tunnel_key":key,"paths":[{"addr":"127.0.0.1:25551"}],
+            "allowed_targets":[target.to_string()],"gaming":gaming(cu)}))?;
+        let absorbed_before=eztunnel::transport_metrics::GAMING_COPIES_ABSORBED.load(std::sync::atomic::Ordering::Relaxed);
+        let origin=Hub::start(&server).await?;let destination=Hub::start(&client).await?;let(flow,mut replies)=origin.register().await?;
+        // Both ends validate their own return path; until the far end has, its replies are held
+        // back. Measure only once both are ready (on a slow machine this takes a moment).
+        for _ in 0..400 {if origin.usable().await&&destination.usable().await{break;}sleep(Duration::from_millis(25)).await;}
+        ensure!(origin.usable().await&&destination.usable().await,"the game path never became ready at both ends");
+        for index in 0..50u8 {
+            let payload=[index;40];
+            for _ in 0..100 {if origin.send(flow,&target.to_string(),&payload).await?{break;}sleep(Duration::from_millis(25)).await;}
+            ensure!(timeout(Duration::from_secs(2),replies.recv()).await?.as_deref()==Some(payload.as_slice()),"reply {index} missing or wrong");
+        }
+        // No reply arrives twice either.
+        ensure!(timeout(Duration::from_millis(600),replies.recv()).await.is_err(),"a reply copy reached the origin");
+        echo_task.await??;
+        let absorbed=eztunnel::transport_metrics::GAMING_COPIES_ABSORBED.load(std::sync::atomic::Ordering::Relaxed)-absorbed_before;
+        // Two extra copies of 50 datagrams each way; loopback loses none.
+        ensure!(absorbed>=150,"only {absorbed} copies were absorbed");
+        origin.unregister(flow).await;Ok::<_,anyhow::Error>(())
+    }).await??;Ok(())
+}
+
+#[test]
+fn copies_must_be_one_to_four()->Result<()> {
+    for (copies,good) in [(0,false),(1,true),(4,true),(5,false)] {
+        let options:eztunnel::gaming::Options=serde_json::from_value(json!({"copies":copies}))?;
+        ensure!(options.validate().is_ok()==good,"copies {copies}");
+    }
+    let old:eztunnel::gaming::Options=serde_json::from_value(json!({}))?;
+    ensure!(old.copies==1,"a config without copies sends one");
+    Ok(())
+}

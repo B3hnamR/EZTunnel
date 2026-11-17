@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.11.0 (2026-11-18)
+
+- Added **GAME**, a FEC-UDP preset that sends game UDP as authenticated datagrams over multiple
+  ports. It sends three copies by default and uses the first one to arrive. FEC-RAW now offers a
+  **Gaming / low delay** profile, and existing `fec-raw-gaming` configurations still load.
+  See [docs/game-mode.md](docs/game-mode.md).
+- Added **Parallax packet mode**. Packets travel with error correction across several TCP lanes.
+  Each lane can reconnect independently while the remaining lanes carry traffic. Both endpoints
+  must use the same Parallax mode. See [docs/parallax.md](docs/parallax.md).
+- Added an **IPv6** choice to tunnel setup for compatible transports. The dashboard shows server
+  IPv6 addresses and adds IPv6 routes to Path Finder. **Find** and **Tune** can check IPv4, IPv6,
+  or both. Existing `tcp6` configurations still load.
+- Split the transport checker into **Find transports** and **Tune transports**. Find compares
+  default settings. Tune compares the selected transports and their options across multiple rounds.
+  Results can launch **Tune the best 3** or create a tunnel with the tested settings. Long IPv6
+  transport names now fit the terminal result table. See [docs/checker.md](docs/checker.md).
+- Added per-tunnel carrier settings in the terminal and dashboard, including speed mode, TLS
+  options, TCP congestion control, FEC pacing, and Parallax mode.
+- Improved dashboard backup and restore. When replacing tunnels from a backup, running tunnels
+  restart with the restored settings and stopped tunnels stay stopped. Live logs now resume from
+  their last entry after reconnecting. Added audit log rotation and improved alert recovery and the
+  connection-test layout. See [docs/dashboard.md](docs/dashboard.md).
+
 ## 0.10.0 (2026-11-15)
 
 - Web dashboard (optional): an HTTPS dashboard in English and Persian, set up from **Tools → Web

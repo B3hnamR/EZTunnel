@@ -5,6 +5,7 @@ use crate::{
     manager::{
         manage::{current_ports, current_proxy, with_ports},
         plan::{self, Protocol, apply_setting, format_ports, parse_ports, read_setting},
+        scope::{Scope, Section, section},
         tune::settings_of,
     },
     settings::{Place, Setting},
@@ -51,19 +52,28 @@ pub fn editable(config: &Value) -> Result<Value> {
     } else {
         Value::Null
     };
-    // The traffic limit and the scheduled restart have their own parts of the screen.
-    let settings: Vec<Value> = settings_of(config)?
-        .iter()
+    // The traffic limit and the scheduled restart have their own parts of the screen. The rest
+    // is listed by group, the carrier's own settings first, as in the terminal manager.
+    let scope = Scope::of_config(config)?;
+    let mut listed: Vec<Setting> = settings_of(config)?
+        .into_iter()
         .filter(|s| !s.name.starts_with("quota.") && !s.name.starts_with("schedule."))
+        .collect();
+    listed.sort_by_key(|s| Section::ALL.iter().position(|g| *g == section(s)));
+    let settings: Vec<Value> = listed
+        .iter()
         .map(|s| {
+            let group = section(s);
             json!({
                 "name": s.name, "place": place_word(s.place), "unit": s.unit, "min": s.min, "max": s.max,
                 "default": s.default, "value": read_setting(config, s), "description": s.description,
+                "group": group.id(), "group_title": group.title(&scope), "carrier": scope.carrier_title(),
             })
         })
         .collect();
     Ok(json!({
         "ports": ports,
+        "carrier": carrier_of(config, &scope),
         "quota": {
             "limit_gb": config["quota"]["limit_gb"].as_u64().unwrap_or(0),
             "period_days": config["quota"]["period_days"].as_u64().unwrap_or(30),
@@ -71,6 +81,167 @@ pub fn editable(config: &Value) -> Result<Value> {
         "settings": settings,
         "restart_hours": config["schedule"]["restart_every_hours"].as_u64().unwrap_or(0),
     }))
+}
+
+/// The listener or path the tunnel's carrier settings live in.
+fn entry_key(scope: &Scope) -> &'static str {
+    match scope.mode {
+        crate::config::Mode::Server => "listeners",
+        crate::config::Mode::Client => "paths",
+    }
+}
+
+/// The carrier choices the terminal's Change settings has, each only where it applies to this
+/// tunnel (`null` otherwise): Parallax mode, parallel connections and the TLS look and
+/// fragmentation of the side that dials, and the speed mode.
+fn carrier_of(config: &Value, scope: &Scope) -> Value {
+    use crate::config::Transport;
+    let entry = &config[entry_key(scope)][0];
+    let single = crate::manager::plan::is_raw(scope.transport) || config["tun"].is_object();
+    let tls = scope.transport.uses_tls() && scope.dials();
+    let speed = crate::manager::speed::applies(scope.transport, scope.parallax_packet).then(|| {
+        crate::manager::speed::detect(config, scope.transport).map_or("custom", |mode| mode.label())
+    });
+    json!({
+        "transport": scope.transport,
+        "parallax_mode": (scope.transport == Transport::Parallax)
+            .then(|| if scope.parallax_packet { "packet" } else { "stream" }),
+        "pool": (scope.dials() && !single).then(|| entry["connection_pool"].as_u64().unwrap_or(1)),
+        "speed": speed,
+        "tls_profile": tls.then(|| entry["tls_profile"].as_str().unwrap_or("classic")),
+        "tls_fragment": tls.then(|| entry["tls_fragment"]["enabled"].as_bool().unwrap_or(false)),
+        // Game mode where users' UDP goes through (UDP maps or SOCKS5 on the Iran end) and no
+        // hand-made gaming setup would be overwritten.
+        "game": game_offered(config, scope).then(|| match crate::manager::pairing::game_of(config) {
+            Some((port, copies)) => json!({"on": true, "port": port, "copies": copies,
+                "iran_address": iran_address(config)}),
+            None => json!({"on": false, "port": crate::manager::plan::game_port(tunnel_port(config, scope)),
+                "copies": crate::manager::plan::GAME_COPIES, "iran_address": null}),
+        }),
+        "game_needs_iran_address": crate::manager::tune::game_asks_iran_ip(config),
+    })
+}
+
+fn game_offered(config: &Value, scope: &Scope) -> bool {
+    let custom = config["gaming"]["control_address"].is_string() && crate::manager::pairing::game_of(config).is_none();
+    let udp = scope.mode == crate::config::Mode::Client
+        || config["socks5"].is_string()
+        || config["listeners"][0]["maps"].as_array().is_some_and(|maps| maps.iter().any(|m| m["type"] == "udp"));
+    udp && !custom && !config["tun"].is_object() && !crate::manager::plan::is_raw(scope.transport)
+}
+
+fn tunnel_port(config: &Value, scope: &Scope) -> u16 {
+    config[entry_key(scope)][0]["addr"].as_str().and_then(|a| a.rsplit_once(':'))
+        .and_then(|(_, p)| p.parse().ok()).unwrap_or(7000)
+}
+
+/// The Iran address a foreign end's Game mode connects to, when it is set.
+fn iran_address(config: &Value) -> Option<String> {
+    (config["mode"] == "client").then_some(())?;
+    let address = config["gaming"]["control_address"].as_str()?;
+    Some(address.rsplit_once(':')?.0.trim_matches(['[', ']']).to_string())
+}
+
+/// Applies `{"parallax_mode", "pool", "speed", "tls_profile", "tls_fragment"}` (each optional).
+/// A choice this tunnel does not have is refused. Values of the old Parallax mode or of TLS
+/// fragmentation that no longer apply are removed, as the terminal manager does when it saves.
+fn apply_carrier(config: &mut Value, carrier: &Value) -> Result<()> {
+    use crate::manager::speed::{self, SpeedMode};
+    let before = Scope::of_config(config)?;
+    let offered = carrier_of(config, &before);
+    let key = entry_key(&before);
+    let has = |name: &str| !offered[name].is_null();
+    if let Some(mode) = carrier.get("parallax_mode").filter(|v| !v.is_null()) {
+        ensure!(has("parallax_mode"), "Parallax mode applies to Parallax tunnels only");
+        match mode.as_str() {
+            Some("packet") => crate::settings::set_dotted(&mut config[key][0], "parallax.mode", json!("packet")),
+            Some("stream") => {
+                if before.parallax_packet {
+                    // Stream mode has no packet timer: the speed mode's fields go first.
+                    speed::apply_config(config, before.transport, SpeedMode::Default);
+                }
+                if let Some(parallax) = config[key][0]["parallax"].as_object_mut() {
+                    parallax.remove("mode");
+                    if parallax.is_empty()
+                        && let Some(entry) = config[key][0].as_object_mut()
+                    {
+                        entry.remove("parallax");
+                    }
+                }
+            }
+            _ => bail!("Parallax mode must be stream or packet"),
+        }
+    }
+    if let Some(word) = carrier.get("speed").filter(|v| !v.is_null()) {
+        let now = Scope::of_config(config)?;
+        ensure!(speed::applies(now.transport, now.parallax_packet), "this carrier has no speed mode");
+        let mode = word.as_str().and_then(SpeedMode::from_label).context("unknown speed mode")?;
+        speed::apply_config(config, now.transport, mode);
+    }
+    if let Some(pool) = carrier.get("pool").filter(|v| !v.is_null()) {
+        ensure!(has("pool"), "only the side that connects has parallel connections");
+        let pool = pool.as_u64().filter(|p| (1..=16).contains(p)).context("parallel connections must be 1 to 16")?;
+        let entry = &mut config[key][0];
+        if pool == 1 {
+            if let Some(object) = entry.as_object_mut() {
+                object.remove("connection_pool");
+            }
+        } else {
+            entry["connection_pool"] = json!(pool);
+        }
+    }
+    if let Some(profile) = carrier.get("tls_profile").filter(|v| !v.is_null()) {
+        ensure!(has("tls_profile"), "the TLS look applies to the connecting side of a TLS carrier only");
+        let entry = &mut config[key][0];
+        match profile.as_str() {
+            Some("classic") => {
+                if let Some(object) = entry.as_object_mut() {
+                    object.remove("tls_profile");
+                }
+            }
+            Some("chrome") => entry["tls_profile"] = json!("chrome"),
+            _ => bail!("the TLS look must be classic or chrome"),
+        }
+    }
+    if let Some(on) = carrier.get("tls_fragment").filter(|v| !v.is_null()) {
+        ensure!(has("tls_fragment"), "TLS fragmentation applies to the connecting side of a TLS carrier only");
+        let entry = &mut config[key][0];
+        if on.as_bool().context("tls_fragment must be true or false")? {
+            entry["tls_fragment"] = json!({"enabled": true});
+        } else if let Some(object) = entry.as_object_mut() {
+            object.remove("tls_fragment");
+        }
+    }
+    if let Some(game) = carrier.get("game").filter(|v| !v.is_null()) {
+        ensure!(has("game"), "Game mode is not offered for this tunnel");
+        if game["on"].as_bool().unwrap_or(false) {
+            let port = game["port"].as_u64().and_then(|p| u16::try_from(p).ok()).filter(|p| *p > 0)
+                .context("the Game mode port must be 1 to 65535")?;
+            let copies = game["copies"].as_u64().filter(|c| (1..=4).contains(c)).context("Game mode copies must be 1 to 4")? as u8;
+            let iran_host = game["iran_address"].as_str().map(str::trim).filter(|h| !h.is_empty()).map(str::to_string);
+            crate::manager::tune::set_game_config(config, Some((port, copies, iran_host)))?;
+            let now = Scope::of_config(config)?;
+            if speed::applies(now.transport, now.parallax_packet)
+                && speed::detect(config, now.transport) == Some(SpeedMode::Default)
+            {
+                speed::apply_config(config, now.transport, SpeedMode::Fast3);
+            }
+        } else {
+            crate::manager::tune::set_game_config(config, None)?;
+        }
+    }
+    let after = Scope::of_config(config)?;
+    for setting in crate::manager::scope::stale(&before, &after, config) {
+        apply_setting(config, &setting, None)?;
+    }
+    // A carrier object left empty by the removals is not written either.
+    if let Some(entry) = config[key][0].as_object_mut() {
+        entry.retain(|name, value| {
+            !(matches!(name.as_str(), "parallax" | "fec" | "tls_fragment")
+                && value.as_object().is_some_and(|o| o.is_empty()))
+        });
+    }
+    Ok(())
 }
 
 /// The configuration with `changes` applied: `{"ports": {"text", "protocol"}, "quota": {"limit_gb",
@@ -148,6 +319,9 @@ pub fn apply(config: &Value, changes: &Value) -> Result<Value> {
             apply_setting(&mut edited, setting, value)?;
         }
     }
+    if let Some(carrier) = changes.get("carrier").filter(|c| !c.is_null()) {
+        apply_carrier(&mut edited, carrier)?;
+    }
     plan::check(&edited).context("the changed settings are not valid")?;
     Ok(edited)
 }
@@ -178,6 +352,88 @@ mod tests {
         let foreign = json!({"mode": "client", "tunnel_key": iran()["tunnel_key"], "allowed_targets": ["127.0.0.1:443"],
             "paths": [{"addr": "203.0.113.10:7000", "transport": "tcp"}]});
         assert!(editable(&foreign).unwrap()["ports"].is_null());
+    }
+
+    #[test]
+    fn carrier_choices_follow_the_tunnel_and_mode_switches_clean_up() {
+        let key = iran()["tunnel_key"].clone();
+        // The foreign end of a reverse Parallax tunnel dials: mode, pool and (packet) speed.
+        let foreign = json!({"mode": "client", "tunnel_key": key, "allowed_targets": ["127.0.0.1:*"],
+            "paths": [{"addr": "203.0.113.10:7003", "transport": "parallax", "connection_pool": 4,
+                       "parallax": {"buffer_bytes": 131072}}]});
+        let carrier = &editable(&foreign).unwrap()["carrier"];
+        assert_eq!(carrier["parallax_mode"], "stream");
+        assert_eq!(carrier["pool"], 4);
+        assert!(carrier["speed"].is_null(), "stream mode has no speed mode");
+        assert!(carrier["tls_profile"].is_null());
+        // To packet mode with a speed mode: the stream-only value goes, the FEC timer is written.
+        let packet = apply(&foreign, &json!({"carrier": {"parallax_mode": "packet", "speed": "fast2"}})).unwrap();
+        let path = &packet["paths"][0];
+        assert_eq!(path["parallax"]["mode"], "packet");
+        assert!(path["parallax"].get("buffer_bytes").is_none(), "{path}");
+        assert_eq!(path["fec"]["interval_ms"], 20);
+        let screen = editable(&packet).unwrap();
+        assert_eq!(screen["carrier"]["speed"], "fast2");
+        let names: Vec<&str> = screen["settings"].as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"parallax.lanes") && names.contains(&"fec.sndwnd"), "{names:?}");
+        assert!(!names.contains(&"parallax.buffer_bytes"), "{names:?}");
+        // And back: the packet timer and packet-only values go again.
+        let mut tuned = packet.clone();
+        tuned["paths"][0]["parallax"]["lanes"] = json!(4);
+        let stream = apply(&tuned, &json!({"carrier": {"parallax_mode": "stream"}})).unwrap();
+        assert!(stream["paths"][0].get("fec").is_none(), "{}", stream["paths"][0]);
+        assert!(stream["paths"][0].get("parallax").is_none(), "{}", stream["paths"][0]);
+        // Pool 1 is the default and is not written.
+        let one = apply(&foreign, &json!({"carrier": {"pool": 1}})).unwrap();
+        assert!(one["paths"][0].get("connection_pool").is_none());
+        // TLS look and fragmentation: only on the dialing side of a TLS carrier.
+        let wss = json!({"mode": "client", "tunnel_key": iran()["tunnel_key"], "allowed_targets": ["127.0.0.1:*"],
+            "paths": [{"addr": "203.0.113.10:443", "transport": "wss", "tls_auto": true}]});
+        let on = apply(&wss, &json!({"carrier": {"tls_fragment": true}})).unwrap();
+        assert_eq!(on["paths"][0]["tls_fragment"]["enabled"], true);
+        let mut set = on.clone();
+        set["paths"][0]["tls_fragment"]["min_bytes"] = json!(20);
+        let off = apply(&set, &json!({"carrier": {"tls_fragment": false}})).unwrap();
+        assert!(off["paths"][0].get("tls_fragment").is_none());
+        // Choices the tunnel does not have are refused.
+        for (config, carrier) in [
+            (iran(), json!({"parallax_mode": "packet"})),
+            (iran(), json!({"pool": 2})),
+            (iran(), json!({"tls_fragment": true})),
+            (iran(), json!({"speed": "fast"})),
+            (foreign.clone(), json!({"speed": "fast"})),
+            (foreign.clone(), json!({"pool": 17})),
+            (foreign.clone(), json!({"parallax_mode": "turbo"})),
+            (wss.clone(), json!({"tls_profile": "firefox"})),
+        ] {
+            assert!(apply(&config, &json!({"carrier": carrier})).is_err(), "{carrier}");
+        }
+    }
+
+    #[test]
+    fn game_mode_can_be_switched_from_edit() {
+        let screen = editable(&iran()).unwrap();
+        assert_eq!(screen["carrier"]["game"]["on"], false, "a UDP map offers Game mode");
+        assert_eq!(screen["carrier"]["game"]["port"], 7001);
+        let on = apply(&iran(), &json!({"carrier": {"game": {"on": true, "port": 45001, "copies": 3}}})).unwrap();
+        assert_eq!(on["gaming"], json!({"control_address": "0.0.0.0:45001", "udp_bind": "0.0.0.0:45001", "copies": 3}));
+        assert_eq!(editable(&on).unwrap()["carrier"]["game"]["on"], true);
+        let off = apply(&on, &json!({"carrier": {"game": {"on": false}}})).unwrap();
+        assert!(off.get("gaming").is_none());
+        // A foreign end of a reverse tunnel connects to the Iran address it already dials.
+        let foreign = json!({"mode": "client", "tunnel_key": iran()["tunnel_key"], "allowed_targets": ["127.0.0.1:*"],
+            "paths": [{"addr": "203.0.113.10:7000", "transport": "fec-udp"}]});
+        let on = apply(&foreign, &json!({"carrier": {"game": {"on": true, "port": 7001, "copies": 2}}})).unwrap();
+        assert_eq!(on["gaming"]["control_address"], "203.0.113.10:7001");
+        assert_eq!(on["paths"][0]["fec"]["interval_ms"], 10, "fast3 comes with it");
+        // TCP-only forwarding: nothing to speed up.
+        let mut tcp = iran();
+        tcp["listeners"][0]["maps"] = json!([{"type": "tcp", "bind": "0.0.0.0:443", "target": "127.0.0.1:443"}]);
+        assert!(editable(&tcp).unwrap()["carrier"]["game"].is_null());
+        assert!(apply(&tcp, &json!({"carrier": {"game": {"on": true, "port": 7001, "copies": 3}}})).is_err());
+        for bad in [json!({"on": true, "port": 0, "copies": 3}), json!({"on": true, "port": 7001, "copies": 9})] {
+            assert!(apply(&iran(), &json!({"carrier": {"game": bad}})).is_err());
+        }
     }
 
     #[test]

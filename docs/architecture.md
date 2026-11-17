@@ -28,6 +28,7 @@ With `transport: "tun"`, each IP packet is an independent encrypted datagram on 
 | `carrier.rs` | TLS, HTTP, WebSocket, and streaming HTTP adapters. |
 | `kcp_carrier.rs` | Reliable UDP stream carrier. |
 | `parallax_carrier.rs` | Paired directional authenticated TCP lanes, bounded records and cooperative batching. |
+| `parallax_lanes.rs` | Parallax packet mode: KCP/FEC packets over several authenticated TCP lanes with a random warm-up, one receive path and lane redial. |
 | `mirage.rs` | Experimental local raw-spoof consent and configuration rules. |
 | `fec_carrier.rs` | 10+1 FEC, UDP knock, FEC over UDP and raw stream adapters. |
 | `fec_tuning.rs` | Local RTT/throughput measurements, bounded adaptive socket buffers and KCP windows. |

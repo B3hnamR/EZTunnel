@@ -168,6 +168,21 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Writes a new private file (never an existing one), and makes sure it is on disk.
+fn write_new_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
 /// The version a signed program reports, when it runs on this CPU.
 fn probe_version(path: &Path, arch: &str) -> Option<String> {
     if arch != std::env::consts::ARCH {
@@ -269,8 +284,34 @@ pub fn versions() -> Value {
         "previous": previous.exists().then(|| version_of(&previous)).flatten(),
         "has_previous": previous.exists(),
         "running": env!("CARGO_PKG_VERSION"),
+        "restart_needed": restart_needed(installed),
         "arch": std::env::consts::ARCH,
     })
+}
+
+/// Whether this process (the agent or the dashboard) runs the installed program as it was before
+/// the file was replaced: then it shows the new version but still runs the old program until it
+/// restarts. Version numbers cannot tell (a new build of the same version).
+fn restart_needed(installed: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(exe) = std::fs::read_link("/proc/self/exe") else { return false };
+        let exe = exe.to_string_lossy();
+        let installed_text = installed.to_string_lossy();
+        if exe != installed_text && exe != format!("{installed_text} (deleted)") {
+            return false;
+        }
+        match (std::fs::metadata("/proc/self/exe"), std::fs::metadata(installed)) {
+            (Ok(running), Ok(file)) => running.ino() != file.ino() || running.dev() != file.dev(),
+            _ => false,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = installed;
+        false
+    }
 }
 
 pub fn rollback() -> Result<Value> {
@@ -328,8 +369,39 @@ pub fn save_backup(dir: &Path, server: &str, document: &Value, keep: usize) -> R
         let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
     }
     let server = if server.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') { server } else { "server" };
-    let file = format!("{}-{server}.json", super::now());
-    write_private(&dir.join(&file), serde_json::to_string_pretty(document)?.as_bytes())?;
+    // Written whole to a file of its own, then published under a name nobody else has: two
+    // backups in the same second (a manual one beside the scheduled one) never share a file.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temporary = dir.join(format!(".backup-{}-{unique}.tmp", std::process::id()));
+    let _ = std::fs::remove_file(&temporary);
+    write_new_private(&temporary, serde_json::to_string_pretty(document)?.as_bytes())?;
+    // Always after the newest backup of this server (also when the clock went back): the one
+    // just made is never the oldest, so keeping the newest `keep` never removes it.
+    let newest = backups(dir)
+        .iter()
+        .filter(|b| b["server"] == server)
+        .filter_map(|b| b["at"].as_u64())
+        .max();
+    let first = newest.map_or(super::now(), |newest| super::now().max(newest + 1));
+    let mut published = None;
+    for later in 0..1000 {
+        let file = format!("{}-{server}.json", first + later);
+        // A hard link fails when the name exists: the publish is exclusive and atomic.
+        match std::fs::hard_link(&temporary, dir.join(&file)) {
+            Ok(()) => {
+                published = Some(file);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                let _ = std::fs::remove_file(&temporary);
+                return Err(error).context("save the backup");
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&temporary);
+    let file = published.context("no free backup name")?;
     let mine: Vec<String> = backups(dir).into_iter().filter(|b| b["server"] == server).filter_map(|b| b["file"].as_str().map(str::to_string)).collect();
     for old in mine.iter().skip(keep) {
         let _ = std::fs::remove_file(dir.join(old));
@@ -374,6 +446,49 @@ mod tests {
         for bad in ["../x.json", "1-../../x.json", "abc-local.json", "1-.json"] {
             assert!(!backup_name_ok(bad), "{bad}");
         }
+    }
+
+    /// Many backups in one second with the real retention: each one saved is kept (it is the
+    /// newest), and only the oldest go.
+    #[test]
+    fn a_backup_just_saved_is_never_the_one_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        for n in 0..30 {
+            let file = save_backup(dir.path(), "local", &json!({"n": n}), 12).unwrap();
+            assert!(dir.path().join(&file).exists(), "backup {n} ({file}) was removed at once");
+        }
+        let kept: Vec<u64> = backups(dir.path())
+            .iter()
+            .map(|b| serde_json::from_slice::<Value>(&std::fs::read(dir.path().join(b["file"].as_str().unwrap())).unwrap()).unwrap()["n"].as_u64().unwrap())
+            .collect();
+        assert_eq!(kept, (18..30).rev().collect::<Vec<u64>>(), "the newest twelve");
+    }
+
+    /// Backups made at the same moment each get their own whole file.
+    #[test]
+    fn backups_in_the_same_second_never_share_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let saves: Vec<_> = (0..8)
+            .map(|n| {
+                let path = path.clone();
+                std::thread::spawn(move || save_backup(&path, "local", &json!({"n": n, "pad": "x".repeat(n * 1000)}), 100).unwrap())
+            })
+            .collect();
+        let mut names: Vec<String> = saves.into_iter().map(|s| s.join().unwrap()).collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), 8, "every backup has its own name");
+        let mut seen: Vec<u64> = names
+            .iter()
+            .map(|name| {
+                let value: Value = serde_json::from_slice(&std::fs::read(path.join(name)).unwrap()).unwrap();
+                value["n"].as_u64().unwrap()
+            })
+            .collect();
+        seen.sort();
+        assert_eq!(seen, (0..8).collect::<Vec<u64>>(), "each file holds one whole backup");
+        assert!(std::fs::read_dir(&path).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().ends_with(".tmp")));
     }
 
     #[test]

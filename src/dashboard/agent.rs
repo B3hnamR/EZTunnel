@@ -297,14 +297,14 @@ async fn serve(mut reader: LinkReader<Stream>, mut writer: LinkWriter<Stream>) -
                 let started = if follows.len() >= MAX_FOLLOWS {
                     Err(anyhow::anyhow!("too many logs followed on this server"))
                 } else {
-                    LocalOps.follow(request["name"].as_str().unwrap_or(""))
+                    LocalOps.follow(request["name"].as_str().unwrap_or(""), request["after"].as_str().map(str::to_string))
                 };
                 let answer = match started {
                     Ok(mut log) => {
                         let out = out_tx.clone();
                         follows.insert(stream, tokio::spawn(async move {
-                            while let Some(line) = log.next_line().await {
-                                if out.send(json!({"type": "log_line", "stream": stream, "line": line})).await.is_err() {
+                            while let Some((line, cursor)) = log.next_line().await {
+                                if out.send(json!({"type": "log_line", "stream": stream, "line": line, "cursor": cursor})).await.is_err() {
                                     return;
                                 }
                             }

@@ -60,12 +60,12 @@ does the same with a join code, and **Leave the dashboard** ends it. Leaving nev
 | Page | What it is for |
 |---|---|
 | Overview | Every server and tunnel at a glance: traffic, ping, loss, sessions, CPU, memory and disk, with 24 hours, 7 days and 30 days of history. |
-| Tunnels | Each tunnel's live figures and status, as cards or as a compact list (the choice is remembered). Open one for its own page: speed, traffic limit, history, the two ends of the pair, and its log. Create a tunnel on any two servers in four steps (a dice button picks a free random port), edit its settings (with a review of the changes and an undo), start, stop, restart or delete it. When the other end of the pair is on a managed server, stop, start, restart and delete offer to do the same there. |
+| Tunnels | Each tunnel's live figures and status, as cards or as a compact list (the choice is remembered). Open one for its own page: speed, traffic limit, history, the two ends of the pair, and its log. Create a tunnel on any two servers in four steps (a dice button picks a free random port), with the carrier's own options (Parallax mode, speed mode, TLS look and fragmentation, TCP congestion control, FEC pacer, parallel connections); edit its settings (with a review of the changes and an undo): the carrier's choices, and only the numeric settings its carrier, mode and side use, grouped as in the terminal manager; start, stop, restart or delete it. When the other end of the pair is on a managed server, stop, start, restart and delete offer to do the same there. |
 | Servers | The servers in the dashboard, online or not, with their version; add or remove servers. |
 | Health | A score for every server at once; open one for its checks (time sync, network tuning, UDP buffers, memory, disk, firewall, tunnel files and services) and fix what it can with one click. |
-| Connection test | The transport checker between two servers ([checker](checker.md)) with a preset or **Custom** (every transport, raw TUN packet type, measurement, variant and port chosen by hand), and a button that creates a tunnel from the best result; the path finder (can the two servers reach each other, what the Iran server reaches abroad, which other server could relay); and the Mirage source test ([Mirage](mirage.md)), whose results can be filtered, sorted, copied and saved as CSV or JSON. |
+| Connection test | The transport checker between two servers ([checker](checker.md)): **Find transports** (every transport with its defaults) or **Tune transports** (the chosen ones with every option they have, in rounds), each with a depth preset or **Custom** (transports, raw TUN packet types, measurements, extra checks, rounds and ports chosen by hand). Find results offer **Tune the best 3**; tune results list every transport's options best first. A tunnel is created from any result with its tested option; the path finder (can the two servers reach each other, over IPv4 and, when both have one, IPv6; what the Iran server reaches abroad; which other server could relay); and the Mirage source test ([Mirage](mirage.md)), whose results can be filtered, sorted, copied and saved as CSV or JSON. |
 | Logs | Any tunnel's log, live, with level filter, search, copy and download; and the dashboard's own activity log (sign-ins, every action). |
-| Maintenance | The EZTunnel version on each server. **Update** brings a server to the newest official release: the dashboard knows each server's CPU and downloads and checks the right file itself. **Update all** does every server in turn and stops at the first one that fails. A program file can also be uploaded (only officially signed files are accepted) and installed on one server or on all of them in turn (the first one as a canary), or a server rolled back. Back up every server's tunnels now or on a schedule, and restore a kept backup, or a backup file, on any server. |
+| Maintenance | The EZTunnel version on each server. **Update** brings a server to the newest official release: the dashboard knows each server's CPU and downloads and checks the right file itself. **Update all** does every server in turn and stops at the first one that fails. A program file can also be uploaded (only officially signed files are accepted) and installed on one server or on all of them in turn (the first one as a canary), or a server rolled back. Back up every server's tunnels now or on a schedule, and restore a kept backup, or a backup file, on any server. A restore starts the tunnels it adds; with **Replace**, tunnels that were running restart with the restored settings and stopped ones stay stopped. |
 | Alerts | Problems found now (a tunnel down, high loss, steady UDP drops, a traffic limit reached, a server offline, low disk) and their history. |
 | Settings | Language and theme, password and signed-in sessions, Telegram alerts, a proxy for downloads and Telegram, and a metrics endpoint. |
 
@@ -130,6 +130,14 @@ screen.
 - The link between an agent and the dashboard is encrypted and both ends prove their keys; an agent
   answers only a fixed list of requests.
 - Every sign-in and action is written to the activity log (`/var/lib/eztunnel-dashboard/audit.log`).
+  Repeated refused sign-ins from one address are written once a minute with a count, and the log
+  moves to `audit.log.1` when it passes 8 MiB, so it stays small whatever is sent to the dashboard.
+- Every server reports its IPv4 address and, when it has one, its stable IPv6 address (shown on
+  Servers). **IPv6** in the new-tunnel transport list runs the transport chosen under it between
+  the servers' IPv6 addresses, for a route that blocks IPv4 (the transport check shows which
+  family works); the listening server must have an IPv6 address.
+- Tunnels cannot be named `dashboard` or `agent`: those are the names of the dashboard's and the
+  agent's own services.
 - The dashboard's settings, history and backups are in `/var/lib/eztunnel-dashboard/`, readable by
   root only.
 

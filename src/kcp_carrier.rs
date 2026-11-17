@@ -84,6 +84,14 @@ pub enum Acceptor {
 
 impl Acceptor {
     pub async fn bind(listener: &Listener) -> Result<Self> {
+        if listener.transport == Transport::Parallax
+            && listener.parallax.mode == crate::parallax_carrier::Mode::Packet
+        {
+            listener.parallax.validate()?;
+            return Ok(Self::Fec(Box::new(
+                crate::fec_carrier::FecListener::bind(listener).await?,
+            )));
+        }
         if listener.transport == Transport::Parallax {
             return Ok(Self::Parallax(
                 crate::parallax_carrier::Acceptor::bind(listener).await?,

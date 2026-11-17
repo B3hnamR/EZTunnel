@@ -72,6 +72,11 @@ Top-level configuration, alongside existing UDP maps or SOCKS:
 {"gaming":{"control_address":"203.0.113.10:45001","udp_bind":"0.0.0.0:45002","advertise":"203.0.113.10:45002","migrate":true,"mtu":1200,"renewal_sec":300,"max_flows":1024}}
 ```
 
+`copies` (1 to 4, default 1) sends every datagram that many times, each from its own UDP port; the
+receiver keeps the first copy and drops the rest by its sequence number. [Game mode](game-mode.md)
+sets 3. Without `advertise` on a wildcard `udp_bind`, each side announces the address the peer
+reached it at during the control handshake.
+
 The logical server binds `control_address`; the logical client connects to it.
 Each host selects its own UDP bind and advertised address. A separate Noise IK
 domain authenticates the existing static identities and mutually negotiates

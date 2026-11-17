@@ -106,6 +106,11 @@ pub struct FecOptions {
     #[serde(skip)]
     pub packet_lane_key: Option<crate::packet_lane::Key>,
     #[serde(skip)]
+    pub parallax_lanes_key: Option<crate::parallax_lanes::Key>,
+    /// Parallax packet lanes: how long a lane may hear nothing (from the tunnel's probe time).
+    #[serde(skip)]
+    pub lane_silence: Option<Duration>,
+    #[serde(skip)]
     pub packet_hopping_enabled: bool,
 }
 impl Default for FecOptions {
@@ -137,6 +142,8 @@ impl Default for FecOptions {
             adaptive: crate::adaptive::AdaptiveOptions::default(),
             tcp_fallback: crate::packet_lane::Options::default(),
             packet_lane_key: None,
+            parallax_lanes_key: None,
+            lane_silence: None,
             packet_hopping_enabled: false,
         }
     }
@@ -305,9 +312,19 @@ enum NetworkSocket {
         last_probe: Mutex<Instant>,
         idle: Duration,
     },
+    /// Parallax packet mode: packets over authenticated TCP lanes.
+    Lanes(crate::parallax_lanes::Lanes),
 }
 impl NetworkSocket {
-    fn payload_limit(&self)->Option<usize>{match self{Self::Udp(_)=>None,Self::Raw(socket)=>Some(socket.max_payload()),Self::Multipath{raw,..}=>raw.payload_limit()}}
+    /// Parallax packet lanes: whether the session behind `peer` was heard (padding too) within
+    /// `within`. Other networks keep no such mark.
+    fn heard_within(&self, peer: SocketAddr, within: Duration) -> bool {
+        match self {
+            Self::Lanes(lanes) => lanes.heard_within(peer, within),
+            _ => false,
+        }
+    }
+    fn payload_limit(&self)->Option<usize>{match self{Self::Udp(_)=>None,Self::Raw(socket)=>Some(socket.max_payload()),Self::Multipath{raw,..}=>raw.payload_limit(),Self::Lanes(_)=>Some(crate::parallax_lanes::MAX_PACKET)}}
     fn lane_active(&self)->bool {
         match self {Self::Multipath{lane,last_raw,idle,..}=>lane.connected()&&last_raw.lock().unwrap_or_else(|e|e.into_inner()).elapsed()>=*idle,_=>false}
     }
@@ -323,6 +340,7 @@ impl NetworkSocket {
                     lane.send(data).await
                 } else {Box::pin(raw.send_to(data,peer)).await}
             }
+            Self::Lanes(lanes) => lanes.send_to(data, peer).await,
         }
     }
     /// Receives the datagrams that are waiting: up to 64 from a UDP socket in one system call,
@@ -349,6 +367,12 @@ impl NetworkSocket {
                     }
                 }
             }
+            Self::Lanes(lanes) => {
+                let (packet, source) = lanes.recv().await?;
+                let size = packet.len().min(incoming.slot_mut().len());
+                incoming.slot_mut()[..size].copy_from_slice(&packet[..size]);
+                Ok(incoming.finish_one(size, Some(source)))
+            }
         }
     }
     fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -357,6 +381,7 @@ impl NetworkSocket {
             #[cfg(target_os = "linux")]
             Self::Raw(socket) => Ok(socket.local_addr()),
             Self::Multipath {raw,..}=>raw.local_addr(),
+            Self::Lanes(lanes) => Ok(lanes.local_addr()),
         }
     }
     fn set_socket_buffer_bytes(&self, bytes: usize) -> io::Result<()> {
@@ -365,6 +390,8 @@ impl NetworkSocket {
             Self::Raw(socket) => socket.set_socket_buffer_bytes(bytes),
             Self::Udp(socket) => set_udp_buffers(socket, bytes),
             Self::Multipath {raw,..}=>raw.set_socket_buffer_bytes(bytes),
+            // Lanes are TCP connections with their own kernel buffers.
+            Self::Lanes(_) => Ok(()),
         }
     }
 
@@ -1101,7 +1128,7 @@ impl PacketSink for FecSink {
             }
             #[cfg(target_os = "linux")]
             NetworkSocket::Raw(_) => 0,
-            NetworkSocket::Multipath {..} => 0,
+            NetworkSocket::Multipath {..} | NetworkSocket::Lanes(_) => 0,
         };
         for packet in encoded.iter().skip(sent) {
             if self.delayed.try_send(packet.to_vec()).is_err() {
@@ -1139,9 +1166,17 @@ pub async fn connect(path: &ClientPath) -> Result<BoxIo> {
     if path.transport == Transport::FecRawGaming {
         options.profile = FecProfile::Gaming;
     }
+    let lanes = path.transport == Transport::Parallax;
+    if lanes {
+        options.knock = false;
+    }
     let peer = if raw {
         let settings = path.raw.as_ref().context("raw carrier options required")?;
         SocketAddr::new(IpAddr::V4(settings.peer_ip), settings.l4_port)
+    } else if lanes {
+        // Lanes dial the configured address themselves (and again after a break); the FEC layer
+        // only needs a stable address for this session.
+        "[::1]:1".parse()?
     } else {
         resolve(&path.addr).await?
     };
@@ -1154,14 +1189,26 @@ pub async fn connect(path: &ClientPath) -> Result<BoxIo> {
         .await?;
     }
     let mut mtu = options.envelope_mtu(raw);
-    let network = if raw {
-        raw_network(path.raw.as_ref(), false, mtu, options.initial_buffer()).await?
+    let (network, peer) = if raw {
+        (raw_network(path.raw.as_ref(), false, mtu, options.initial_buffer()).await?, peer)
+    } else if lanes {
+        let key = options
+            .parallax_lanes_key
+            .clone()
+            .context("Parallax packet mode requires tunnel_key")?;
+        let client = crate::parallax_lanes::ClientLanes::open(
+            path.clone(),
+            key,
+            crate::parallax_lanes::Settings::from_options(&path.parallax).with_silence(path.fec.lane_silence),
+        )?;
+        let source = client.source();
+        (NetworkSocket::Lanes(crate::parallax_lanes::Lanes::Client(client)), source)
     } else {
         let socket = crate::carrier::udp_for_peer(peer, path.local_address.as_deref()).await?;
         socket.connect(peer).await?;
-        NetworkSocket::Udp(socket)
+        (NetworkSocket::Udp(socket), peer)
     };
-    let outside = Arc::new(network.fallback(&options,false,peer).await?);
+    let outside = Arc::new(if lanes { network } else { network.fallback(&options,false,peer).await? });
     if let Some(limit)=outside.payload_limit(){mtu=mtu.min(limit);ensure!(mtu>=512,"raw Mirage overhead leaves less than the minimum 512-byte FEC MTU; reduce padding/redundancy or increase interface MTU");}
     if raw{let outer=mtu+100+if options.packet_hopping_enabled{crate::port_hop::OVERHEAD}else{0};options.mtu=outer;options.peer_mtu=Some(outer);}
     outside.set_socket_buffer_bytes(options.initial_buffer())?;
@@ -1314,12 +1361,28 @@ impl FecListener {
         if settings.transport == Transport::FecRawGaming {
             options.profile = FecProfile::Gaming;
         }
-        if raw {
+        let lanes = settings.transport == Transport::Parallax;
+        if raw || lanes {
             options.knock = false;
         }
         let mut mtu = options.envelope_mtu(raw);
         let network = if raw {
             raw_network(settings.raw.as_ref(), true, mtu, options.initial_buffer()).await?
+        } else if lanes {
+            let key = options
+                .parallax_lanes_key
+                .clone()
+                .context("Parallax packet mode requires tunnel_key")?;
+            NetworkSocket::Lanes(crate::parallax_lanes::Lanes::Server(
+                crate::parallax_lanes::ServerLanes::bind(
+                    &settings.addr,
+                    key,
+                    crate::parallax_lanes::Settings::from_options(&settings.parallax)
+                        .with_congestion(settings.tcp_congestion.clone())
+                        .with_silence(settings.fec.lane_silence),
+                )
+                .await?,
+            ))
         } else {
             NetworkSocket::Udp(
                 UdpSocket::bind(&settings.addr)
@@ -1333,7 +1396,7 @@ impl FecListener {
             // The TCP lane must use the identical demux key, not the wire source port.
             SocketAddr::new(raw.peer_ip.into(),raw.l4_port)
         } else {network.local_addr()?};
-        let outside = Arc::new(network.fallback(&options,true,fallback_peer).await?);
+        let outside = Arc::new(if lanes { network } else { network.fallback(&options,true,fallback_peer).await? });
         if let Some(limit)=outside.payload_limit(){mtu=mtu.min(limit);ensure!(mtu>=512,"raw Mirage overhead leaves less than the minimum 512-byte FEC MTU; reduce padding/redundancy or increase interface MTU");}
         if raw{let outer=mtu+100+if options.packet_hopping_enabled{crate::port_hop::OVERHEAD}else{0};options.mtu=outer;options.peer_mtu=Some(outer);}
         outside.set_socket_buffer_bytes(options.initial_buffer())?;
@@ -1445,7 +1508,9 @@ impl FecListener {
                         }
                         Ok(())
                     }.await,
-                    _=cleanup.tick()=>{ peers.retain(|_,p|p.activity.idle()<Duration::from_secs(options.peer_idle_sec));
+                    // Packet lanes that still hear their keepalives keep an idle session's entry.
+                    _=cleanup.tick()=>{ let idle=Duration::from_secs(options.peer_idle_sec);
+                        peers.retain(|key,p|p.activity.idle()<idle||outside.heard_within(key.0,idle));
                         knocks.retain(|_,time|time.elapsed()<Duration::from_secs(options.knock_ttl_sec)); Ok(()) },
                 };
                 if let Err(error) = result {

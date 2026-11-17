@@ -253,6 +253,8 @@ fn status(stats: &Stats, server: bool) -> Value {
         "window_frames_limit": stats.window_budget.limit(),
         "rtt_ms": rtt,
         "transport_extensions":crate::transport_metrics::snapshot(),
+        "gaming_ready": stats.gaming_ready.load(Relaxed),
+        "gaming_datagrams": stats.gaming_datagrams.load(Relaxed),
     })
 }
 

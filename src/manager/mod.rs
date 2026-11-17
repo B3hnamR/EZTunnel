@@ -20,6 +20,7 @@ pub mod optimize;
 pub mod pairing;
 pub mod plan;
 pub mod rawfw;
+pub mod scope;
 pub mod service;
 pub mod speed;
 pub mod store;
@@ -43,6 +44,29 @@ pub(crate) fn local_ip() -> Option<String> {
     let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("192.0.2.1:9").ok()?;
     Some(socket.local_addr().ok()?.ip().to_string())
+}
+
+/// The first stable global IPv6 address in `/proc/net/if_inet6`.
+pub(crate) fn local_ip6() -> Option<std::net::Ipv6Addr> {
+    stable_global_ipv6(&std::fs::read_to_string("/proc/net/if_inet6").ok()?)
+}
+
+/// From `/proc/net/if_inet6` lines (`address ifindex prefix scope flags name`): global scope, not
+/// temporary (privacy addresses change often), deprecated or still being checked, and not a
+/// unique-local or documentation address.
+fn stable_global_ipv6(text: &str) -> Option<std::net::Ipv6Addr> {
+    const UNSTABLE: u32 = 0x01 | 0x20 | 0x40; // temporary, deprecated, tentative
+    text.lines().find_map(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let [hex, _, _, scope, flags, ..] = fields[..] else { return None };
+        if scope != "00" || u32::from_str_radix(flags, 16).ok()? & UNSTABLE != 0 || hex.len() != 32 {
+            return None;
+        }
+        let ip = std::net::Ipv6Addr::from(u128::from_str_radix(hex, 16).ok()?);
+        let first = ip.segments()[0];
+        let local = (first & 0xfe00) == 0xfc00 || (first == 0x2001 && ip.segments()[1] == 0x0db8);
+        (!local && !ip.is_loopback() && !ip.is_unspecified()).then_some(ip)
+    })
 }
 
 fn status_line(store: &Store) -> String {
@@ -618,6 +642,19 @@ fn uninstall(store: &Store) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_stable_global_ipv6_address_is_found() {
+        let text = "\
+00000000000000000000000000000001 01 80 10 80       lo
+fe800000000000000000000000000001 02 40 20 80     eth0
+2a0100000000000000000000000000aa 02 40 00 01     eth0
+fd000000000000000000000000000001 02 40 00 80     eth0
+2a01000000000000000000000000beef 02 40 00 00     eth0
+";
+        assert_eq!(stable_global_ipv6(text), Some("2a01::beef".parse().unwrap()), "not loopback, link-local, temporary or ULA");
+        assert_eq!(stable_global_ipv6("fe800000000000000000000000000001 02 40 20 80 eth0\n"), None);
+    }
 
     #[test]
     fn tools_have_one_stable_route_per_action_and_one_combined_link_test(){

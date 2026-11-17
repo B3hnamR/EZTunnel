@@ -53,6 +53,41 @@ pub(super) async fn listeners(port: u16) -> Result<Vec<TcpListener>> {
 /// Longest a temporary listener or forwarder stays open.
 const MAX_LIFE: u64 = 120;
 
+/// The temporary listeners open now, by port. A new one on the same port replaces the old (a
+/// second scan right after the first is not refused by its leftovers), and a scan closes its own
+/// when it is done.
+static OPEN: std::sync::Mutex<Vec<(u16, tokio::task::AbortHandle)>> = std::sync::Mutex::new(Vec::new());
+
+/// Closes the temporary listeners on `port`.
+fn close(port: u16) {
+    let mut open = OPEN.lock().unwrap_or_else(|p| p.into_inner());
+    open.retain(|(p, task)| {
+        if *p == port {
+            task.abort();
+        }
+        *p != port && !task.is_finished()
+    });
+}
+
+/// Takes `port` for a temporary listener: closes what this server had there, and waits a moment
+/// for the old sockets to go.
+async fn take(port: u16) -> Result<Vec<TcpListener>> {
+    close(port);
+    let mut last = None;
+    for _ in 0..20 {
+        match listeners(port).await {
+            Ok(listeners) => return Ok(listeners),
+            Err(error) => last = Some(error),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("port {port} is in use")))
+}
+
+fn own(port: u16, task: &tokio::task::JoinHandle<()>) {
+    OPEN.lock().unwrap_or_else(|p| p.into_inner()).push((port, task.abort_handle()));
+}
+
 /// Well-known addresses abroad: reaching some but not others shows a whitelist, and the
 /// reachable ones are what a relay path could use.
 pub const KNOWN: [(&str, &str); 16] = [
@@ -88,9 +123,9 @@ fn life(request: &Value) -> Duration {
 
 /// Echoes one complete 16-byte path-check marker, then closes.
 async fn echo(port: u16, life: Duration) -> Result<()> {
-    let listeners = listeners(port).await.with_context(|| format!("listen on {port} over IPv4 and IPv6"))?;
+    let listeners = take(port).await.with_context(|| format!("listen on {port} over IPv4 and IPv6"))?;
     for listener in listeners {
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let _ = timeout(life, async {
                 while let Ok((mut stream, _)) = listener.accept().await {
                     tokio::spawn(async move {
@@ -103,16 +138,17 @@ async fn echo(port: u16, life: Duration) -> Result<()> {
             })
             .await;
         });
+        own(port, &task);
     }
     Ok(())
 }
 
 /// A forwarder from a local port to a target, for a short while.
 async fn forward(port: u16, target: SocketAddr, life: Duration) -> Result<()> {
-    let listeners = listeners(port).await.with_context(|| format!("listen on {port} over IPv4 and IPv6"))?;
+    let listeners = take(port).await.with_context(|| format!("listen on {port} over IPv4 and IPv6"))?;
     ensure!(target.is_ipv4() || listeners.len() > 1, "IPv6 relay listening is unavailable on this host");
     for listener in listeners {
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let _ = timeout(life, async {
                 while let Ok((mut inbound, _)) = listener.accept().await {
                     tokio::spawn(async move {
@@ -124,6 +160,7 @@ async fn forward(port: u16, target: SocketAddr, life: Duration) -> Result<()> {
             })
             .await;
         });
+        own(port, &task);
     }
     Ok(())
 }
@@ -178,6 +215,10 @@ pub async fn answer(request: &Value) -> Result<Value> {
         Some("echo") => {
             echo(port_ok(request["port"].as_u64().unwrap_or(0))?, life(request)).await?;
             Ok(json!({"listening": true}))
+        }
+        Some("close") => {
+            close(port_ok(request["port"].as_u64().unwrap_or(0))?);
+            Ok(json!({"closed": true}))
         }
         Some("forward") => {
             let target: SocketAddr = request["target"].as_str().unwrap_or("").parse().context("the target must be address:port")?;
@@ -250,6 +291,20 @@ mod tests {
             let _client = TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, port)).await.unwrap();
             timeout(Duration::from_secs(1), listeners[1].accept()).await.unwrap().unwrap();
         }
+    }
+
+    /// A second scan right after the first takes over its ports instead of failing on them, and a
+    /// closed listener is gone at once, not when its time runs out.
+    #[tokio::test]
+    async fn listeners_of_a_scan_are_replaced_and_closed_on_request() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let target = format!("127.0.0.1:{port}");
+        answer(&json!({"step": "echo", "port": port, "secs": 60})).await.unwrap();
+        answer(&json!({"step": "echo", "port": port, "secs": 60})).await.expect("the second scan takes the port over");
+        assert_eq!(answer(&json!({"step": "echo_check", "target": target})).await.unwrap()["ok"], true);
+        answer(&json!({"step": "close", "port": port})).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(answer(&json!({"step": "echo_check", "target": target})).await.unwrap()["ok"], false, "closed");
     }
 
     #[tokio::test]

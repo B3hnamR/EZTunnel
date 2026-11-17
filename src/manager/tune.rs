@@ -1,7 +1,6 @@
 //! "Customize" screens: transport options and every numeric limit, each with its default.
-use super::plan::{
-    IpMode, Plan, apply_setting, check, is_raw, is_xhttp, read_setting, relevant_settings,
-};
+use super::plan::{IpMode, Plan, apply_setting, check, is_raw, is_xhttp, read_setting};
+use super::scope::{self, Scope, Section};
 use super::speed::{self, SpeedMode};
 use super::ui;
 use crate::config::{Mode, Transport, XhttpMode};
@@ -26,7 +25,8 @@ enum Item {
     TunMtu,
     TunName,
     Speed,
-    Number(Setting),
+    Game,
+    Group(Section),
     Done,
 }
 
@@ -36,6 +36,104 @@ fn value_text(current: Option<u64>, setting: &Setting) -> String {
         (None, Some(default)) => format!("{default} {}", setting.unit),
         (None, None) => "off".into(),
     }
+}
+
+/// The settings of each group that has any, in screen order.
+fn groups(settings: &[Setting]) -> Vec<(Section, Vec<Setting>)> {
+    Section::ALL
+        .iter()
+        .filter_map(|section| {
+            let list: Vec<Setting> = settings
+                .iter()
+                .filter(|s| scope::section(s) == *section)
+                .cloned()
+                .collect();
+            (!list.is_empty()).then_some((*section, list))
+        })
+        .collect()
+}
+
+/// The row that opens one group: its title, how many settings it has and how many are changed.
+fn group_label(section: Section, scope: &Scope, count: usize, changed: usize) -> String {
+    let detail = if changed > 0 {
+        format!(
+            "{count} {} · {}",
+            if count == 1 { "setting" } else { "settings" },
+            ui::yellow(&format!("{changed} changed"))
+        )
+    } else {
+        format!("{count} {}", if count == 1 { "setting" } else { "settings" })
+    };
+    format!("{:<38} {detail}", format!("▸ {}", section.title(scope)))
+}
+
+/// One group's settings: choose one to change, until Back. `read` and `write` reach the value
+/// wherever this screen keeps it (the wizard's answers or a saved file).
+fn edit_group<T>(
+    section: Section,
+    scope: &Scope,
+    settings: &[Setting],
+    state: &mut T,
+    read: fn(&T, &Setting) -> Option<u64>,
+    write: fn(&mut T, &Setting, Option<u64>) -> Result<()>,
+) -> Result<()> {
+    let mut cursor = 0;
+    loop {
+        ui::heading(&section.title(scope), section.detail());
+        let changed = settings.iter().filter(|s| read(state, s).is_some()).count();
+        let mut labels: Vec<String> = settings
+            .iter()
+            .map(|s| format!("{:<38} {}", s.name, value_text(read(state, s), s)))
+            .collect();
+        let reset = (changed > 0).then(|| {
+            labels.push(ui::red(&format!("↺ Put the {changed} changed back to the defaults")));
+            labels.len() - 1
+        });
+        let Some(choice) = ui::choose("Change", &labels, cursor)? else {
+            return Ok(());
+        };
+        if Some(choice) == reset {
+            for setting in settings {
+                if read(state, setting).is_some() {
+                    write(state, setting, None)?;
+                }
+            }
+            cursor = 0;
+            continue;
+        }
+        cursor = choice;
+        let setting = &settings[choice];
+        match ask_number(setting, read(state, setting)) {
+            Ok(Some(value)) => write(state, setting, value)?,
+            Ok(None) => {}
+            Err(error) if ui::is_back(&error) => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn plan_value(plan: &Plan, setting: &Setting) -> Option<u64> {
+    plan.tuned
+        .iter()
+        .find(|(s, _)| s.name == setting.name && s.place == setting.place)
+        .map(|(_, v)| *v)
+}
+
+fn set_plan_value(plan: &mut Plan, setting: &Setting, value: Option<u64>) -> Result<()> {
+    plan.tuned
+        .retain(|(s, _)| !(s.name == setting.name && s.place == setting.place));
+    if let Some(value) = value {
+        plan.tuned.push((setting.clone(), value));
+    }
+    Ok(())
+}
+
+fn file_value(config: &Value, setting: &Setting) -> Option<u64> {
+    read_setting(config, setting)
+}
+
+fn set_file_value(config: &mut Value, setting: &Setting, value: Option<u64>) -> Result<()> {
+    apply_setting(config, setting, value)
 }
 
 /// Asks what the TLS client of the dialing side looks like. `None` keeps the current choice.
@@ -188,6 +286,99 @@ fn number_outcome(text:&str,current:Option<u64>,default:Option<u64>,batch:bool)-
     Ok(Some(Some(value)))
 }
 
+fn explain_game() {
+    ui::note(
+        "Game mode sends the users' game UDP straight between the servers as encrypted datagrams,\n\
+         each in several copies over different ports, and uses whichever copy arrives first. It\n\
+         skips the tunnel's ordered stream, so a resent packet never holds the game back. Both\n\
+         servers need it: the pairing code carries it, or turn it on at the other server too.\n\
+         The Iran server listens on the Game mode port, TCP and UDP; open it in its firewall.",
+    );
+}
+
+/// Port and copies of Game mode.
+fn ask_game(port: &mut u16, copies: &mut u8) -> Result<()> {
+    let text = ui::ask("Game mode port (TCP and UDP, the same on both servers)", Some(&port.to_string()), |t: &String| {
+        match t.parse::<u16>() {
+            Ok(1..=65535) => Ok(()),
+            _ => Err("enter a port from 1 to 65535".into()),
+        }
+    })?;
+    *port = text.parse()?;
+    let text = ui::ask("Copies of each game packet (1 to 4; 3 recommended)", Some(&copies.to_string()), |t: &String| {
+        match t.parse::<u8>() {
+            Ok(1..=4) => Ok(()),
+            _ => Err("enter 1 to 4".into()),
+        }
+    })?;
+    *copies = text.parse()?;
+    Ok(())
+}
+
+/// The Iran server's address, for a foreign server that does not dial it (a direct tunnel).
+pub(crate) fn ask_iran_host(current: Option<&str>) -> Result<String> {
+    ui::ask("IP address of the Iran server (for Game mode)", current, |t: &String| {
+        if t.trim_matches(['[', ']']).parse::<std::net::IpAddr>().is_ok() {
+            Ok(())
+        } else {
+            Err("enter the Iran server's IP address (Game mode cannot use a host name)".into())
+        }
+    })
+    .map(|t| t.trim_matches(['[', ']']).to_string())
+}
+
+/// The host of a saved tunnel's carrier address (`host:port`), without brackets.
+fn carrier_host(config: &Value) -> Option<String> {
+    let server = config["mode"] == "server";
+    let entry = if server { &config["listeners"][0] } else { &config["paths"][0] };
+    let addr = entry["addr"].as_str()?;
+    Some(addr.rsplit_once(':')?.0.trim_matches(['[', ']']).to_string())
+}
+
+/// Whether turning Game mode on in this saved configuration needs the Iran server's IP: the
+/// foreign end of a direct tunnel, or one whose carrier address is not an IP (a host name, a CDN).
+pub(crate) fn game_asks_iran_ip(config: &Value) -> bool {
+    let client = config["mode"] == "client";
+    let server_dials = config["server_dials"].as_bool().or(config["reverse"].as_bool()).unwrap_or(false);
+    client && (server_dials || !carrier_host(config).is_some_and(|h| h.parse::<std::net::IpAddr>().is_ok()))
+}
+
+/// Turns Game mode on or off in a saved configuration (see `plan::GamePlan`).
+pub(crate) fn set_game_config(config: &mut Value, on: Option<(u16, u8, Option<String>)>) -> Result<()> {
+    use anyhow::Context;
+    let carrier_address = carrier_host(config);
+    let Some(object) = config.as_object_mut() else { anyhow::bail!("not a configuration") };
+    let Some((port, copies, iran_host)) = on else {
+        object.remove("gaming");
+        return Ok(());
+    };
+    let server = object.get("mode").and_then(Value::as_str) == Some("server");
+    let server_dials = object.get("server_dials").or_else(|| object.get("reverse")).and_then(Value::as_bool).unwrap_or(false);
+    let entry = if server { &object["listeners"][0] } else { &object["paths"][0] };
+    let (control, wildcard) = if server {
+        let ipv6 = entry["addr"].as_str().is_some_and(|a| a.starts_with('['));
+        let wildcard = if ipv6 { "[::]" } else { "0.0.0.0" };
+        (format!("{wildcard}:{port}"), wildcard)
+    } else {
+        // The Iran server's IP: the one given, else the carrier's address when it is an IP.
+        let carrier = (!server_dials).then_some(carrier_address).flatten();
+        let host = [iran_host.map(|h| h.trim_matches(['[', ']']).to_string()), carrier]
+            .into_iter()
+            .flatten()
+            .find(|host| host.parse::<std::net::IpAddr>().is_ok())
+            .context("Game mode needs the Iran server's IP address (a host name or a CDN domain cannot carry its datagrams)")?;
+        // The game socket sends to the Iran server: the same address family.
+        let wildcard = if host.contains(':') { "[::]" } else { "0.0.0.0" };
+        let control = if host.contains(':') { format!("[{host}]:{port}") } else { format!("{host}:{port}") };
+        (control, wildcard)
+    };
+    object.insert(
+        "gaming".into(),
+        serde_json::json!({"control_address": control, "udp_bind": format!("{wildcard}:{port}"), "copies": copies}),
+    );
+    Ok(())
+}
+
 /// Customizes a tunnel that is still being created.
 pub fn tune_plan(plan: &mut Plan) -> Result<()> {
     loop {
@@ -198,7 +389,7 @@ pub fn tune_plan(plan: &mut Plan) -> Result<()> {
         let mut items = Vec::new();
         let mut labels = Vec::new();
         let mut add = |item: Item, label: &str, value: String| {
-            labels.push(format!("{:<34} {value}", label));
+            labels.push(format!("{:<38} {value}", label));
             items.push(item);
         };
         add(Item::Done, &ui::green("✔ Done"), String::new());
@@ -312,23 +503,33 @@ pub fn tune_plan(plan: &mut Plan) -> Result<()> {
             add(Item::TunName, "TUN interface name", tun.name.clone());
             add(Item::TunMtu, "TUN MTU", tun.mtu.to_string());
         }
-        if speed::applies(plan.transport) {
+        let scope = Scope::of_plan(plan);
+        if plan.carries_udp() && plan.tun.is_none() {
+            add(
+                Item::Game,
+                "Game mode (fast path for game UDP)",
+                match &plan.game {
+                    Some(game) => ui::yellow(&format!("on · {} copies · port {}", game.copies, game.port)),
+                    None => "off".into(),
+                },
+            );
+        }
+        if speed::applies(plan.transport, scope.parallax_packet) {
             add(
                 Item::Speed,
                 "Speed mode (CPU against latency)",
                 plan.speed.label().to_string(),
             );
         }
-        let server_dials = plan.direction == super::plan::Direction::Direct;
-        for setting in relevant_settings(plan.mode(), plan.transport, server_dials) {
-            let current = plan
-                .tuned
-                .iter()
-                .find(|(s, _)| s.name == setting.name && s.place == setting.place)
-                .map(|(_, v)| *v);
-            let label = setting.name;
-            let text = value_text(current, &setting);
-            add(Item::Number(setting.clone()), label, text);
+        // A value kept from before a change of carrier or mode would only be a warning.
+        let offered = scope::relevant(&scope);
+        plan.tuned
+            .retain(|(s, _)| offered.iter().any(|o| o.name == s.name && o.place == s.place));
+        for (section, list) in groups(&offered) {
+            let changed = list.iter().filter(|s| plan_value(plan, s).is_some()).count();
+            let label = group_label(section, &scope, list.len(), changed);
+            labels.push(label);
+            items.push(Item::Group(section));
         }
         let Some(choice) = ui::choose("Option", &labels, 0)? else {
             return Err(ui::Back.into());
@@ -543,28 +744,35 @@ pub fn tune_plan(plan: &mut Plan) -> Result<()> {
                         }
                     }
                 }
+                Item::Game => {
+                    explain_game();
+                    let on = ui::choose_required(
+                        "Game mode",
+                        &["Off".to_string(), "On (recommended for games)".to_string()],
+                        usize::from(plan.game.is_some()),
+                    )? == 1;
+                    plan.set_game(on);
+                    let needs_ip = plan.game_needs_iran_ip();
+                    if let Some(game) = &mut plan.game {
+                        ask_game(&mut game.port, &mut game.copies)?;
+                        if needs_ip {
+                            game.iran_host = Some(ask_iran_host(game.iran_host.as_deref())?);
+                        }
+                    }
+                }
                 Item::Speed => {
                     if let Some(mode) = ask_speed_mode(plan.speed)? {
                         plan.speed = mode;
                     }
                 }
-                Item::Number(setting) => {
-                    let current = plan
-                        .tuned
-                        .iter()
-                        .position(|(s, _)| s.name == setting.name && s.place == setting.place);
-                    match ask_number(setting, current.map(|i| plan.tuned[i].1))? {
-                        None => {}
-                        Some(None) => {
-                            if let Some(index) = current {
-                                plan.tuned.remove(index);
-                            }
-                        }
-                        Some(Some(value)) => match current {
-                            Some(index) => plan.tuned[index].1 = value,
-                            None => plan.tuned.push((setting.clone(), value)),
-                        },
-                    }
+                Item::Group(section) => {
+                    let section = *section;
+                    let scope = Scope::of_plan(plan);
+                    let list: Vec<Setting> = scope::relevant(&scope)
+                        .into_iter()
+                        .filter(|s| scope::section(s) == section)
+                        .collect();
+                    edit_group(section, &scope, &list, plan, plan_value, set_plan_value)?;
                 }
             }
             Ok(())
@@ -595,10 +803,35 @@ fn ask_speed_mode(current: SpeedMode) -> Result<Option<SpeedMode>> {
     Ok(ui::choose("Mode", &labels, start)?.map(|index| SpeedMode::ALL[index]))
 }
 
+/// The optional capabilities a tunnel can use, by number: 0 adaptive controller (FEC
+/// carriers), 1 TCP packet fallback and 2 adaptive raw ports (raw FEC carriers), 3 direct gaming
+/// datagrams (anything but TUN).
+fn extensions(config: &Value, transport: Transport) -> Vec<usize> {
+    let raw = is_raw(transport) && transport != Transport::Tun;
+    let fec = matches!(
+        transport,
+        Transport::FecUdp | Transport::FecRaw | Transport::FecRawGaming | Transport::Mirage
+    );
+    let mut list = Vec::new();
+    if fec {
+        list.push(0);
+    }
+    if raw {
+        list.extend([1, 2]);
+    }
+    if !config["tun"].is_object() && transport != Transport::Tun {
+        list.push(3);
+    }
+    list
+}
+
 fn transport_extensions(config:&mut Value,entry_key:&str,transport:Transport)->Result<()> {
     ui::heading("Adaptive paths and gaming", "Optional; existing peers and settings are unchanged while disabled");
-    let items=["Adaptive controller and shared bandwidth", "Authenticated TCP packet fallback", "Authenticated adaptive raw ports", "Direct gaming datagrams and UDP migration", "Back"].map(str::to_string);
-    let Some(choice)=ui::choose("Capability",&items,0)? else{return Ok(());};
+    let names=["Adaptive controller and shared bandwidth", "Authenticated TCP packet fallback", "Authenticated adaptive raw ports", "Direct gaming datagrams and UDP migration"];
+    let offered=extensions(config,transport);
+    let items:Vec<String>=offered.iter().map(|i|names[*i].to_string()).collect();
+    let Some(picked)=ui::choose("Capability",&items,0)? else{return Ok(());};
+    let Some(&choice)=offered.get(picked) else{return Ok(());};
     let raw=is_raw(transport)&&transport!=Transport::Tun;
     match choice {
         0=>{
@@ -771,130 +1004,133 @@ fn legacy_mirage_draft(
     Ok(draft)
 }
 
-/// Mode, direction and carrier of a saved tunnel.
-fn describe(config: &Value) -> Result<(Mode, bool, Transport)> {
-    let mode: Mode = serde_json::from_value(config["mode"].clone())?;
-    let server_dials = config
-        .get("server_dials")
-        .or_else(|| config.get("reverse"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let entry = match mode {
-        Mode::Server => &config["listeners"][0],
-        Mode::Client => &config["paths"][0],
-    };
-    let transport: Transport =
-        serde_json::from_value(entry.get("transport").cloned().unwrap_or(Value::Null))
-            .unwrap_or_default();
-    Ok((mode, server_dials, transport))
-}
-
 /// The numeric settings offered for a saved tunnel.
 pub(crate) fn settings_of(config: &Value) -> Result<Vec<Setting>> {
-    let (mode, server_dials, transport) = describe(config)?;
-    Ok(relevant_settings(mode, transport, server_dials))
+    Ok(scope::relevant(&Scope::of_config(config)?))
 }
 
-/// Changes the numeric settings of a saved tunnel. Returns the new configuration when the
-/// operator saved changes that pass the program's checks.
+/// Changes the settings of a saved tunnel. Returns the new configuration when the operator
+/// saved changes that pass the program's checks. Only what this tunnel's carrier, mode and side
+/// use is offered; the numeric settings are grouped, the carrier's own group first.
 pub fn tune_config(config: &Value) -> Result<Option<Value>> {
-    let (mode, server_dials, transport) = describe(config)?;
-    let settings = relevant_settings(mode, transport, server_dials);
+    let original = Scope::of_config(config)?;
+    let (mode, transport) = (original.mode, original.transport);
     let mut edited = config.clone();
+    let mut cursor = 0;
     loop {
+        let scope = Scope::of_config(&edited)?;
+        let settings = scope::relevant(&scope);
         ui::heading(
             "Change settings",
-            "values in yellow differ from the default",
+            &format!(
+                "{} · {} · values in yellow differ from the default",
+                scope.carrier_title(),
+                if mode == Mode::Server { "Iran server" } else { "foreign server" }
+            ),
         );
         let entry_key = match mode {
             Mode::Server => "listeners",
             Mode::Client => "paths",
         };
-        let fragment_on = edited[entry_key][0]["tls_fragment"]["enabled"]
-            .as_bool()
-            .unwrap_or(false);
+        let dials = scope.dials();
         let mut labels = vec![
             ui::green("✔ Save and restart"),
             ui::red("✘ Discard changes"),
-            format!(
-                "{:<34} {}",
-                "TLS fragmentation (dialing side)",
-                if !transport.uses_tls() {
-                    ui::dim("only for TLS carriers")
-                } else if fragment_on {
-                    ui::yellow("on")
-                } else {
-                    "off".into()
-                }
-            ),
         ];
-        let dials = (mode == Mode::Client) != server_dials;
-        let local_row = can_choose_local_address(dials, transport).then(|| {
-            labels.push(format!(
-                "{:<34} {}",
-                "Connect from address (local IP)",
-                edited[entry_key][0]["local_address"]
-                    .as_str()
-                    .map_or("automatic".to_string(), |ip| ui::yellow(ip).to_string())
-            ));
+        let row = |labels: &mut Vec<String>, name: &str, value: String| {
+            labels.push(format!("{name:<38} {value}"));
             labels.len() - 1
+        };
+        let parallax_row = (transport == Transport::Parallax).then(|| {
+            let value = if scope.parallax_packet { ui::yellow("packet") } else { "stream".to_string() };
+            row(&mut labels, "Parallax mode (same on both servers)", value)
         });
-        let tun_row = edited["tun"].is_object().then(|| {
-            labels.push(format!(
-                "{:<34} {}",
-                "TUN MTU",
-                edited["tun"]["mtu"]
-                    .as_u64()
-                    .map_or("1400".to_string(), |mtu| mtu.to_string())
-            ));
-            labels.len() - 1
+        let single = is_raw(transport) || edited["tun"].is_object();
+        let pool_row = (dials && !single).then(|| {
+            let pool = edited[entry_key][0]["connection_pool"].as_u64().unwrap_or(1);
+            let value = if pool == 1 { "1".to_string() } else { ui::yellow(&pool.to_string()) };
+            row(&mut labels, "Parallel connections (pool)", value)
+        });
+        let speed_row = speed::applies(transport, scope.parallax_packet).then(|| {
+            let value = speed::detect(&edited, transport)
+                .map_or_else(|| ui::yellow("custom"), |m| m.label().to_string());
+            row(&mut labels, "Speed mode (CPU against latency)", value)
+        });
+        let fragment_row = (transport.uses_tls() && dials).then(|| {
+            let value = if scope.tls_fragment { ui::yellow("on") } else { "off".into() };
+            row(&mut labels, "TLS fragmentation (dialing side)", value)
         });
         let profile_row = (dials && transport.uses_tls()).then(|| {
-            labels.push(format!(
-                "{:<34} {}",
-                "TLS look (dialing side)",
-                match edited[entry_key][0]["tls_profile"].as_str() {
-                    Some("chrome") => ui::yellow("chrome"),
-                    _ => "classic".to_string(),
-                }
-            ));
-            labels.len() - 1
+            let value = match edited[entry_key][0]["tls_profile"].as_str() {
+                Some("chrome") => ui::yellow("chrome"),
+                _ => "classic".to_string(),
+            };
+            row(&mut labels, "TLS look (dialing side)", value)
         });
-        let speed_row = speed::applies(transport).then(|| {
-            labels.push(format!(
-                "{:<34} {}",
-                "Speed mode (CPU against latency)",
-                speed::detect(&edited, transport)
-                    .map_or_else(|| ui::yellow("custom"), |m| m.label().to_string())
-            ));
-            labels.len() - 1
+        let local_row = can_choose_local_address(dials, transport).then(|| {
+            let value = edited[entry_key][0]["local_address"]
+                .as_str()
+                .map_or("automatic".to_string(), |ip| ui::yellow(ip).to_string());
+            row(&mut labels, "Connect from address (local IP)", value)
+        });
+        let tun_row = edited["tun"].is_object().then(|| {
+            let value = edited["tun"]["mtu"]
+                .as_u64()
+                .map_or("1400".to_string(), |mtu| mtu.to_string());
+            row(&mut labels, "TUN MTU", value)
         });
         let mirage_row = (transport == Transport::Mirage).then(|| {
-            labels.push(format!(
-                "{:<34} {}",
-                "Mirage spoofing and routing",
-                edited[entry_key][0]["raw"]["spoof_src_ip"]
-                    .as_str()
-                    .unwrap_or("not configured")
-            ));
-            labels.len() - 1
+            let value = edited[entry_key][0]["raw"]["spoof_src_ip"]
+                .as_str()
+                .unwrap_or("not configured")
+                .to_string();
+            row(&mut labels, "Mirage spoofing and routing", value)
         });
-        let extension_row=labels.len();labels.push("Adaptive paths and gaming".to_string());
-        let first_setting = labels.len();
-        labels.extend(
-            settings
-                .iter()
-                .map(|s| format!("{:<34} {}", s.name, value_text(read_setting(&edited, s), s))),
-        );
-        let Some(choice) = ui::choose("Setting", &labels, 0)? else {
+        let game_now = super::pairing::game_of(&edited);
+        let custom_gaming = edited["gaming"]["control_address"].is_string() && game_now.is_none();
+        let carries_udp = mode == Mode::Client
+            || edited["socks5"].is_string()
+            || edited["listeners"][0]["maps"].as_array().is_some_and(|maps| maps.iter().any(|m| m["type"] == "udp"));
+        let game_row = (carries_udp && !edited["tun"].is_object() && !custom_gaming).then(|| {
+            let value = match game_now {
+                Some((port, copies)) => ui::yellow(&format!("on · {copies} copies · port {port}")),
+                None => "off".to_string(),
+            };
+            row(&mut labels, "Game mode (fast path for game UDP)", value)
+        });
+        let extension_row = (!extensions(&edited, transport).is_empty())
+            .then(|| row(&mut labels, "Adaptive paths and gaming", ui::dim("optional")));
+        let mut group_rows = Vec::new();
+        for (section, list) in groups(&settings) {
+            let changed = list.iter().filter(|s| read_setting(&edited, s).is_some()).count();
+            labels.push(group_label(section, &scope, list.len(), changed));
+            group_rows.push((labels.len() - 1, section, list));
+        }
+        let Some(choice) = ui::choose("Setting", &labels, cursor)? else {
             return Ok(None);
         };
+        cursor = choice;
         if choice == 1 {
             return Ok(None);
         }
         if choice == 0 {
-            match check(&edited) {
-                Ok(_) => return Ok((edited != *config).then_some(edited)),
+            // Values of the old Parallax mode or TLS fragmentation would only be warnings now.
+            let gone = scope::stale(&original, &scope, &edited);
+            let mut saved = edited.clone();
+            for setting in &gone {
+                apply_setting(&mut saved, setting, None)?;
+            }
+            match check(&saved) {
+                Ok(_) => {
+                    if !gone.is_empty() {
+                        let names: Vec<&str> = gone.iter().map(|s| s.name).collect();
+                        ui::note(&format!(
+                            "Removed values that no longer apply: {}",
+                            names.join(", ")
+                        ));
+                    }
+                    return Ok((saved != *config).then_some(saved));
+                }
                 Err(error) => {
                     ui::fail(&format!("{error:#}"));
                     ui::pause();
@@ -904,17 +1140,77 @@ pub fn tune_config(config: &Value) -> Result<Option<Value>> {
         }
         let previous = edited.clone();
         let result = (|| -> Result<()> {
-            if choice==extension_row {return transport_extensions(&mut edited,entry_key,transport);}
-            if choice == 2 {
-                if transport.uses_tls() {
-                    let entry = &mut edited[entry_key][0];
-                    if fragment_on {
-                        if let Some(object) = entry.as_object_mut() {
-                            object.remove("tls_fragment");
-                        }
-                    } else {
-                        entry["tls_fragment"] = serde_json::json!({"enabled": true});
+            if Some(choice) == game_row {
+                explain_game();
+                let current = super::pairing::game_of(&edited);
+                let on = ui::choose_required(
+                    "Game mode",
+                    &["Off".to_string(), "On (recommended for games)".to_string()],
+                    usize::from(current.is_some()),
+                )? == 1;
+                if !on {
+                    return set_game_config(&mut edited, None);
+                }
+                let tunnel_port = edited[entry_key][0]["addr"].as_str()
+                    .and_then(|a| a.rsplit_once(':')).and_then(|(_, p)| p.parse::<u16>().ok()).unwrap_or(7000);
+                let (mut port, mut copies) = current.unwrap_or((super::plan::game_port(tunnel_port), super::plan::GAME_COPIES));
+                ask_game(&mut port, &mut copies)?;
+                // The Iran IP Game mode uses now: kept unless it is changed here (a reverse tunnel's
+                // Game address may differ from its carrier's).
+                let known = (mode == Mode::Client && current.is_some())
+                    .then(|| edited["gaming"]["control_address"].as_str()
+                        .and_then(|a| a.rsplit_once(':')).map(|(h, _)| h.trim_matches(['[', ']']).to_string()))
+                    .flatten();
+                let iran_host = if mode == Mode::Client && game_asks_iran_ip(&edited) {
+                    Some(ask_iran_host(known.as_deref())?)
+                } else {
+                    known
+                };
+                set_game_config(&mut edited, Some((port, copies, iran_host)))?;
+                // The carrier's own resends never hold game packets back now, but its timer
+                // still paces the control and game TCP: use the fastest where it has one.
+                if speed::applies(transport, scope.parallax_packet) && speed::detect(&edited, transport) == Some(SpeedMode::Default) {
+                    speed::apply_config(&mut edited, transport, SpeedMode::Fast3);
+                }
+                ui::note("Turn Game mode on at the other server too, with the same port and copies.");
+                return Ok(());
+            }
+            if Some(choice) == extension_row {
+                return transport_extensions(&mut edited, entry_key, transport);
+            }
+            if let Some((_, section, list)) = group_rows.iter().find(|(row, _, _)| *row == choice) {
+                return edit_group(*section, &scope, list, &mut edited, file_value, set_file_value);
+            }
+            if Some(choice) == fragment_row {
+                let entry = &mut edited[entry_key][0];
+                if scope.tls_fragment {
+                    if let Some(object) = entry.as_object_mut() {
+                        object.remove("tls_fragment");
                     }
+                } else {
+                    entry["tls_fragment"] = serde_json::json!({"enabled": true});
+                }
+                return Ok(());
+            }
+            if Some(choice) == pool_row {
+                let current = edited[entry_key][0]["connection_pool"].as_u64().unwrap_or(1);
+                ui::note("Parallel tunnel connections this side opens. More spread users and limit the effect of one dropping.");
+                let text = ui::ask(
+                    "Parallel connections between the servers",
+                    Some(&current.to_string()),
+                    |t: &String| match t.parse::<u64>() {
+                        Ok(1..=16) => Ok(()),
+                        _ => Err("enter 1 to 16".into()),
+                    },
+                )?;
+                let pool: u64 = text.parse()?;
+                let entry = &mut edited[entry_key][0];
+                if pool == 1 {
+                    if let Some(object) = entry.as_object_mut() {
+                        object.remove("connection_pool");
+                    }
+                } else {
+                    entry["connection_pool"] = pool.into();
                 }
                 return Ok(());
             }
@@ -940,6 +1236,30 @@ pub fn tune_config(config: &Value) -> Result<Option<Value>> {
                     .flatten();
                 if let Some(mtu) = ask_tun_mtu(current, max)? {
                     edited["tun"]["mtu"] = mtu.into();
+                }
+                return Ok(());
+            }
+            if Some(choice) == parallax_row {
+                use crate::parallax_carrier::Mode as ParallaxMode;
+                let current = match edited[entry_key][0]["parallax"]["mode"].as_str() {
+                    Some("packet") => ParallaxMode::Packet,
+                    _ => ParallaxMode::Stream,
+                };
+                let chosen = super::wizard::ask_parallax_mode(current)?;
+                if current == ParallaxMode::Packet && chosen == ParallaxMode::Stream {
+                    // Stream mode has no packet timer: drop the speed mode's fields first.
+                    speed::apply_config(&mut edited, transport, SpeedMode::Default);
+                }
+                let entry = &mut edited[entry_key][0];
+                if chosen == ParallaxMode::Packet {
+                    crate::settings::set_dotted(entry, "parallax.mode", serde_json::json!("packet"));
+                } else if let Some(parallax) = entry["parallax"].as_object_mut() {
+                    parallax.remove("mode");
+                    if parallax.is_empty()
+                        && let Some(object) = entry.as_object_mut()
+                    {
+                        object.remove("parallax");
+                    }
                 }
                 return Ok(());
             }
@@ -984,11 +1304,6 @@ pub fn tune_config(config: &Value) -> Result<Option<Value>> {
                     let draft=legacy_mirage_draft(&edited[entry_key][0]["raw"],super::mirage::legacy_settings,super::mirage::local_settings)?;
                     edited[entry_key][0]["raw"]=draft;                }
                 return Ok(());
-            }
-            let setting = &settings[choice - first_setting];
-            match ask_number(setting, read_setting(&edited, setting))? {
-                None => {}
-                Some(value) => apply_setting(&mut edited, setting, value)?,
             }
             Ok(())
         })();

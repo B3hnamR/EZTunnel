@@ -9,8 +9,8 @@
   import { t, num, list } from "./i18n.svelte.js";
 
   const places = $derived([
-    { id: LOCAL, name: t("thisServerIs", live.snapshot?.host?.hostname ?? ""), address: live.snapshot?.host?.address ?? "", online: true },
-    ...fleet.list.map((s) => ({ id: s.id, name: s.name, address: s.snapshot?.host?.address ?? "", online: s.online })),
+    { id: LOCAL, name: t("thisServerIs", live.snapshot?.host?.hostname ?? ""), address: live.snapshot?.host?.address ?? "", address6: live.snapshot?.host?.address6 ?? "", online: true },
+    ...fleet.list.map((s) => ({ id: s.id, name: s.name, address: s.snapshot?.host?.address ?? "", address6: s.snapshot?.host?.address6 ?? "", online: s.online })),
   ]);
   const placeOf = (id) => places.find((p) => p.id === id);
   let f = $state({ iran: LOCAL, foreign: "", iranIp: "", foreignIp: "", iranIpTouched: false, foreignIpTouched: false });
@@ -44,7 +44,9 @@
     problem = "";
     result = null;
     try {
-      const { status, data } = await findPath({ iran: f.iran, foreign: f.foreign, iran_ip: f.iranIp.trim(), foreign_ip: f.foreignIp.trim() });
+      // The servers' IPv6 addresses go along: the direct path is tried over IPv6 as well.
+      const { status, data } = await findPath({ iran: f.iran, foreign: f.foreign, iran_ip: f.iranIp.trim(), foreign_ip: f.foreignIp.trim(),
+        iran_ip6: placeOf(f.iran)?.address6 || undefined, foreign_ip6: placeOf(f.foreign)?.address6 || undefined });
       if (status === 200) result = data;
       else problem = data?.detail ?? t("failedShort");
     } catch {
@@ -61,6 +63,7 @@
   const verdict = $derived.by(() => {
     if (!result) return null;
     if (works(result.iran_to_foreign) || works(result.foreign_to_iran)) return ["ok", t("pfDirect")];
+    if (works(result.iran_to_foreign_v6) || works(result.foreign_to_iran_v6)) return ["ok", t("pfDirect6")];
     if (relaysOk.length) return ["warn", t("pfRelay", list(relaysOk.map((r) => r.name)))];
     return ["bad", t("pfNone")];
   });
@@ -104,6 +107,12 @@
           <h4 class="mt-sub">{t("pfForeignToIran")}</h4>
           <span class="pill {works(result.foreign_to_iran) ? 'ok' : 'bad'}">{works(result.foreign_to_iran) ? t("pfWorks", num(result.foreign_to_iran.ms ?? 0)) : t("pfBlocked")}</span>
         {/if}
+        {#each [["pfIranToForeign6", result.iran_to_foreign_v6], ["pfForeignToIran6", result.foreign_to_iran_v6]] as [label, way] (label)}
+          {#if way}
+            <h4 class="mt-sub">{t(label)}</h4>
+            <span class="pill {works(way) ? 'ok' : 'bad'}">{works(way) ? t("pfWorks", num(way.ms ?? 0)) : t("pfBlocked")}</span>
+          {/if}
+        {/each}
       </div>
       {#each [["pfFromIran", result.from_iran], ["pfFromForeign", result.from_foreign]] as [label, side] (label)}
         {#if side}

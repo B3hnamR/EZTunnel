@@ -990,6 +990,42 @@ pub fn all() -> Vec<Setting> {
         description: "TLS fragmentation (when on): longest random pause between pieces; 0 = none.",
         needs: &[],
     });
+    for (place, role) in [(Listener, "server"), (Path, "client")] {
+        // The side that dials opens the lanes: the client, or the server of a direct tunnel.
+        list.push(Setting {
+            name: "parallax.lanes",
+            place,
+            role,
+            default: json!(2),
+            min: 1,
+            max: 16,
+            unit: "lanes",
+            description: "Parallax packet mode: TCP lanes per tunnel connection; a broken lane is dialed again while the others carry on.",
+            needs: &[],
+        });
+        list.push(Setting {
+            name: "parallax.warmup_min",
+            place,
+            role,
+            default: json!(32768),
+            min: 0,
+            max: 1_048_576,
+            unit: "bytes",
+            description: "Parallax packet mode: smallest encrypted warm-up this side sends at the start of each lane.",
+            needs: &[("./parallax.warmup_max", 1_048_576)],
+        });
+        list.push(Setting {
+            name: "parallax.warmup_max",
+            place,
+            role,
+            default: json!(65536),
+            min: 0,
+            max: 1_048_576,
+            unit: "bytes",
+            description: "Parallax packet mode: largest encrypted warm-up (the size is random in between); 0 and 0 turn it off.",
+            needs: &[("./parallax.warmup_min", 0)],
+        });
+    }
     list.push(Setting {
         name: "max_open_files",
         place: Top,

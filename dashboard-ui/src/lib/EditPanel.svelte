@@ -94,6 +94,7 @@
       limit: String(data.quota.limit_gb),
       days: String(data.quota.period_days),
       values,
+      carrier: { ...(data.carrier ?? {}), pool: data.carrier?.pool == null ? null : String(data.carrier.pool), game: data.carrier?.game ? { ...data.carrier.game } : null },
     };
     limitOn = data.quota.limit_gb > 0;
     if (limitOn) lastLimit = String(data.quota.limit_gb);
@@ -227,6 +228,23 @@
     if (gb !== screen.quota.limit_gb || (gb > 0 && period !== screen.quota.period_days)) {
       out.quota = { limit_gb: gb, period_days: period };
     }
+    // Carrier choices: only the ones that changed (a switched Parallax mode drops speed changes
+    // that would not apply).
+    const was = screen.carrier ?? {};
+    const now = form.carrier ?? {};
+    const carrier = {};
+    if (was.parallax_mode != null && now.parallax_mode !== was.parallax_mode) carrier.parallax_mode = now.parallax_mode;
+    const speedNow = now.parallax_mode === "stream" && was.parallax_mode === "packet" ? null : now.speed;
+    if (speedNow != null && speedNow !== "custom" && speedNow !== was.speed) carrier.speed = speedNow;
+    if (was.pool != null && whole(now.pool) && +plain(now.pool) !== was.pool) carrier.pool = +plain(now.pool);
+    if (was.tls_profile != null && now.tls_profile !== was.tls_profile) carrier.tls_profile = now.tls_profile;
+    if (was.tls_fragment != null && now.tls_fragment !== was.tls_fragment) carrier.tls_fragment = now.tls_fragment;
+    if (was.game && now.game) {
+      const g = now.game;
+      const same = g.on === was.game.on && (!g.on || (+g.port === was.game.port && +g.copies === was.game.copies && (g.iran_address ?? "") === (was.game.iran_address ?? "")));
+      if (!same) carrier.game = g.on ? { on: true, port: +g.port, copies: +g.copies, iran_address: g.iran_address || null } : { on: false };
+    }
+    if (Object.keys(carrier).length) out.carrier = carrier;
     const settings = [];
     for (const s of screen.settings) {
       const value = settingValue(s);
@@ -252,6 +270,13 @@
     }
     if (c.proxy_protocol != null) rows.push([t("chProxy"), proxyName(screen.ports.proxy_protocol ?? 0), proxyName(c.proxy_protocol)]);
     if (c.quota) rows.push([t("chLimit"), limitName(screen.quota.limit_gb, screen.quota.period_days), limitName(c.quota.limit_gb, c.quota.period_days)]);
+    const speedName = (v) => t("ntSpeedOpts")[v] ?? v;
+    if (c.carrier?.parallax_mode) rows.push([t("chPxMode"), t(screen.carrier.parallax_mode === "packet" ? "ntPacket" : "ntStream"), t(c.carrier.parallax_mode === "packet" ? "ntPacket" : "ntStream")]);
+    if (c.carrier?.speed) rows.push([t("chSpeed"), speedName(screen.carrier.speed ?? "default"), speedName(c.carrier.speed)]);
+    if (c.carrier?.pool != null) rows.push([t("chPool"), num(screen.carrier.pool), num(c.carrier.pool)]);
+    if (c.carrier?.tls_profile) rows.push([t("chTlsLook"), t(screen.carrier.tls_profile === "chrome" ? "ntChrome" : "ntClassic"), t(c.carrier.tls_profile === "chrome" ? "ntChrome" : "ntClassic")]);
+    if (c.carrier?.game) rows.push([t("chGame"), screen.carrier.game.on ? `${t("chOn")} · ${screen.carrier.game.copies}× · ${screen.carrier.game.port}` : t("chOff"), c.carrier.game.on ? `${t("chOn")} · ${c.carrier.game.copies}× · ${c.carrier.game.port}` : t("chOff")]);
+    if (c.carrier?.tls_fragment != null) rows.push([t("chTlsFrag"), screen.carrier.tls_fragment ? t("chOn") : t("chOff"), c.carrier.tls_fragment ? t("chOn") : t("chOff")]);
     if (c.restart_hours != null) rows.push([t("chRestart"), t("restartEveryT", String(screen.restart_hours ?? 0)), t("restartEveryT", String(c.restart_hours))]);
     for (const s of c.settings ?? []) {
       const old = screen.settings.find((x) => x.name === s.name && x.place === s.place);
@@ -262,7 +287,12 @@
   });
 
   const changed = $derived(Object.keys(changes).length > 0);
-  const invalid = $derived(Boolean(limitError || daysError || portsError || restartError || draftError || screen?.settings.some(settingError)));
+  // Only a changed pool is checked: a saved one above 16 (set by hand) stays as it is.
+  const poolChanged = $derived(form.carrier?.pool != null && String(form.carrier.pool).trim() !== String(screen?.carrier?.pool ?? ""));
+  const poolError = $derived(poolChanged && (!whole(form.carrier.pool) || +plain(form.carrier.pool) < 1 || +plain(form.carrier.pool) > 16) ? t("poolErr") : "");
+  /** Speed modes exist for KCP and FEC carriers, and for Parallax in packet mode. */
+  const speedShown = $derived(screen?.carrier?.speed != null || (screen?.carrier?.parallax_mode != null && form.carrier?.parallax_mode === "packet"));
+  const invalid = $derived(Boolean(poolError || limitError || daysError || portsError || restartError || draftError || screen?.settings.some(settingError)));
   const portsChanged = $derived(Boolean(changes.ports || changes.proxy_protocol != null));
 
   function failureText(status) {
@@ -336,6 +366,60 @@
       <div class="note bad" role="alert"><Icon name="warn" /><span>{t("editLoadFail")}{#if loadError}{" "}<span class="ltr">{loadError}</span>{/if}</span></div>
     {:else}
       <fieldset disabled={working}>
+        {#if screen.carrier && (screen.carrier.parallax_mode != null || screen.carrier.pool != null || speedShown || screen.carrier.tls_profile != null || screen.carrier.game)}
+          <section class="ed-sec" aria-labelledby="ed-carrier-h">
+            <header><h3 id="ed-carrier-h">{t("edCarrier")} <span class="dlg-sub ltr">{screen.carrier.transport}</span></h3>{#if changes.carrier}<span class="dot" title={t("changesN", 1)}></span>{/if}</header>
+            <p class="muted small m0">{t("edCarrierHelp")}</p>
+            <div class="ed-grid mt12">
+              {#if screen.carrier.parallax_mode != null}
+                <div>
+                  <span class="flabel" id="ed-pxm-l">{t("ntPxMode")}</span>
+                  <div class="seg full" role="group" aria-labelledby="ed-pxm-l">
+                    {#each [["stream", "ntStream"], ["packet", "ntPacket"]] as [v, k]}<button type="button" aria-pressed={form.carrier.parallax_mode === v} onclick={() => (form.carrier.parallax_mode = v)}>{t(k)}</button>{/each}
+                  </div>
+                </div>
+              {/if}
+              {#if speedShown}
+                <div>
+                  <label class="flabel" for="ed-speed">{t("ntSpeed")}</label>
+                  <select id="ed-speed" class="input" value={form.carrier.speed ?? "default"} onchange={(e) => (form.carrier.speed = e.currentTarget.value)}>
+                    {#each [...(form.carrier.speed === "custom" ? ["custom"] : []), "default", "normal", "fast", "fast2", "fast3"] as v}<option value={v}>{t("ntSpeedOpts")[v]}</option>{/each}
+                  </select>
+                </div>
+              {/if}
+              {#if screen.carrier.pool != null}
+                <div>
+                  <label class="flabel" for="ed-pool">{t("ntPool")}</label>
+                  <input id="ed-pool" class="input ltr" inputmode="numeric" bind:value={form.carrier.pool} aria-invalid={Boolean(poolError)} />
+                  {#if poolError}<p class="small m0 bad-t">{poolError}</p>{/if}
+                </div>
+              {/if}
+              {#if screen.carrier.tls_profile != null}
+                <div>
+                  <span class="flabel" id="ed-tls-l">{t("ntTlsLook")}</span>
+                  <div class="seg full" role="group" aria-labelledby="ed-tls-l">
+                    {#each [["classic", "ntClassic"], ["chrome", "ntChrome"]] as [v, k]}<button type="button" aria-pressed={form.carrier.tls_profile === v} onclick={() => (form.carrier.tls_profile = v)}>{t(k)}</button>{/each}
+                  </div>
+                </div>
+              {/if}
+            </div>
+            {#if form.carrier.game}
+              <label class="chk mt12"><input type="checkbox" bind:checked={form.carrier.game.on} /><span>{t("ntGame")}</span></label>
+              <p class="muted small m0">{t("ntGameHelp")}</p>
+              {#if form.carrier.game.on}
+                <div class="ed-grid mt8">
+                  <div><label class="flabel" for="ed-gport">{t("ntGamePort")}</label><input id="ed-gport" class="input ltr" inputmode="numeric" bind:value={form.carrier.game.port} /></div>
+                  <div><label class="flabel" for="ed-gcopies">{t("ntGameCopies")}</label><input id="ed-gcopies" class="input ltr" type="number" min="1" max="4" bind:value={form.carrier.game.copies} /></div>
+                  {#if screen.carrier.game_needs_iran_address}<div><label class="flabel" for="ed-giran">{t("ntIranAddr")}</label><input id="ed-giran" class="input ltr" bind:value={form.carrier.game.iran_address} /></div>{/if}
+                </div>
+              {/if}
+            {/if}
+            {#if screen.carrier.tls_fragment != null}
+              <label class="chk mt12"><input type="checkbox" bind:checked={form.carrier.tls_fragment} /><span>{t("ntTlsFrag")}</span></label>
+              {#if form.carrier.tls_fragment && !screen.carrier.tls_fragment}<p class="small m0 warn-t">{t("ntTlsFragHelp")}</p>{/if}
+            {/if}
+          </section>
+        {/if}
         {#if screen.ports}
           <section class="ed-sec" aria-labelledby="ed-ports-h">
             <header><h3 id="ed-ports-h">{t("fwdPorts")}</h3>{#if portsChanged}<span class="dot" title={t("changesN", 1)}></span>{/if}</header>
@@ -440,6 +524,9 @@
             <div class="elist">
               {#each shown as s, i (settingKey(s))}
                 {@const err = settingError(s)}
+                {#if s.group && (i === 0 || shown[i - 1].group !== s.group)}
+                  <h4 class="egroup">{s.group === "carrier" ? t("grp_carrier", s.carrier ?? s.group_title) : t("grp_" + s.group)}</h4>
+                {/if}
                 <div class="eset" class:changed={settingChanged(s)}>
                   <div class="eset-h">
                     <label class="ltr mono" for="ed-s{i}">{s.name}</label>

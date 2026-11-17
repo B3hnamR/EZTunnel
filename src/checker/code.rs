@@ -19,6 +19,11 @@ pub struct CheckCode {
     pub starter: Side,
     pub iran_ip: IpAddr,
     pub foreign_ip: IpAddr,
+    /// The servers' IPv6 addresses, for the IPv6 cases (`Options::ipv6`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iran_ip6: Option<IpAddr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foreign_ip6: Option<IpAddr>,
     pub options: Options,
 }
 
@@ -34,8 +39,24 @@ impl CheckCode {
             starter,
             iran_ip,
             foreign_ip,
+            iran_ip6: None,
+            foreign_ip6: None,
             options,
         })
+    }
+
+    /// Adds the servers' IPv6 addresses: every case that can then also runs over IPv6.
+    pub fn with_ipv6(mut self, iran: IpAddr, foreign: IpAddr) -> Result<Self> {
+        ensure!(iran.is_ipv6() && foreign.is_ipv6() && iran != foreign, "two different IPv6 addresses are needed");
+        self.iran_ip6 = Some(iran);
+        self.foreign_ip6 = Some(foreign);
+        self.options.ipv6 = true;
+        Ok(self)
+    }
+
+    /// The (Iran, foreign) addresses a case runs between: the IPv6 pair for an IPv6 case.
+    pub fn pair_for(&self, spec: &super::CaseSpec) -> Option<(IpAddr, IpAddr)> {
+        if spec.ipv6 { Some((self.iran_ip6?, self.foreign_ip6?)) } else { Some((self.iran_ip, self.foreign_ip)) }
     }
 
     pub fn ip(&self, side: Side) -> IpAddr {
@@ -88,6 +109,14 @@ pub fn decode(text: &str) -> Result<CheckCode> {
     ensure!(
         code.iran_ip != code.foreign_ip,
         "the check code names the same address for both servers"
+    );
+    ensure!(
+        !code.options.ipv6 || matches!((code.iran_ip6, code.foreign_ip6), (Some(a), Some(b)) if a.is_ipv6() && b.is_ipv6() && a != b),
+        "the check code asks for IPv6 cases without two IPv6 addresses"
+    );
+    ensure!(
+        !code.options.ipv6_only || (code.iran_ip6 == Some(code.iran_ip) && code.foreign_ip6 == Some(code.foreign_ip)),
+        "the IPv6-only check needs to use its IPv6 addresses for the control link"
     );
     Ok(code)
 }

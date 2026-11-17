@@ -298,3 +298,55 @@ async fn stop_works_while_waiting_for_the_other_server() -> Result<()> {
     }
     Ok(())
 }
+
+/// Game mode as a checker variant: its UDP measurement really travels as datagram copies, and the
+/// plain case next to it stays on the tunnel's stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_game_mode_variant_carries_the_udp_measurement() -> Result<()> {
+    use eztunnel::checker::Variant;
+    use std::sync::atomic::Ordering::Relaxed;
+    let options = Options {
+        transports: vec![Transport::Tcp, Transport::FecUdp],
+        dialers: vec![Side::Foreign, Side::Iran],
+        pings: 3,
+        download: false,
+        upload: false,
+        hold_sec: 0,
+        mtu: false,
+        udp: true,
+        repeat_failed: false,
+        also_game: true,
+        tls_port: free_port()?,
+        control_port: free_port()?,
+        ..Options::default()
+    };
+    let received = eztunnel::transport_metrics::GAMING_RX.load(Relaxed);
+    let code = code(options)?;
+    let iran = run::spawn(code.clone(), Side::Iran);
+    let foreign = run::spawn(code, Side::Foreign);
+    let (iran, foreign) = tokio::join!(
+        finish(iran, Duration::from_secs(120)),
+        finish(foreign, Duration::from_secs(120))
+    );
+    let (iran, _foreign) = (iran?, foreign?);
+    ensure!(iran.stopped.is_none(), "stopped: {:?}", iran.stopped);
+    eprintln!("{}", iran.text());
+    for transport in [Transport::Tcp, Transport::FecUdp] {
+        for dialer in [Side::Foreign, Side::Iran] {
+            let game = iran
+                .cases
+                .iter()
+                .find(|c| c.spec.transport == transport && c.spec.variant == Variant::Game && c.spec.dialer == Some(dialer))
+                .with_context(|| format!("no Game mode case for {transport:?}, {dialer:?} dials"))?;
+            ensure!(game.verdict.is_some_and(|v| v.usable()), "{transport:?} {dialer:?}: {:?} ({:?})", game.verdict, game.note);
+            // Each Game case proved that its own UDP took the game path.
+            ensure!(game.game_path == Some(true), "{transport:?} {dialer:?}: game path {:?}", game.game_path);
+            let udp = game.udp.as_ref().context("no UDP measurement")?;
+            ensure!(udp.answered * 10 >= udp.sent * 9, "{transport:?} {dialer:?}: UDP {}/{}", udp.answered, udp.sent);
+        }
+    }
+    // The measurement packets crossed the game path (each one, in copies, both ways).
+    let moved = eztunnel::transport_metrics::GAMING_RX.load(Relaxed) - received;
+    ensure!(moved >= 300, "only {moved} datagrams on the game path");
+    Ok(())
+}

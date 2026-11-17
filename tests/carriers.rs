@@ -45,6 +45,20 @@ async fn exercise_direction(
     chrome: bool,
     reverse: bool,
 ) -> Result<()> {
+    exercise_through(name, wire_version, chrome, reverse, None).await
+}
+
+/// `cut`, when given, puts a TCP relay between the client and the tunnel port and receives a
+/// handle that breaks every connection through it; it runs while a large echo is in flight.
+async fn exercise_through(
+    name: &str,
+    wire_version: u8,
+    chrome: bool,
+    reverse: bool,
+    cut: Option<tokio::sync::oneshot::Sender<Relay>>,
+) -> Result<()> {
+    let packet = name == "parallax-packet";
+    let name = if packet { "parallax" } else { name };
     let directory = tempfile::tempdir()?;
     let (server_private, server_public) =
         config::generate_keypair(&directory.path().join("server"))?;
@@ -110,7 +124,17 @@ async fn exercise_direction(
         {"type":"tcp","bind":tcp_bind.to_string(),"target":tcp_target.to_string()},
         {"type":"udp","bind":udp_bind.to_string(),"target":udp_target.to_string()}
     ]});
-    let mut path = json!({"addr":tunnel_addr.to_string(),"transport":name,"http_path":"/integration/tunnel", "server_public_key":server_public,"dial_timeout":3,"retry_interval":1});
+    let relay = if cut.is_some() {
+        Some(Relay::start(tunnel_addr).await?)
+    } else {
+        None
+    };
+    let dial_addr = relay.as_ref().map_or(tunnel_addr, |relay| relay.address);
+    let mut path = json!({"addr":dial_addr.to_string(),"transport":name,"http_path":"/integration/tunnel", "server_public_key":server_public,"dial_timeout":3,"retry_interval":1});
+    if packet {
+        listener["parallax"] = json!({"mode":"packet","warmup_min":2048,"warmup_max":4096});
+        path["parallax"] = json!({"mode":"packet","lanes":2,"warmup_min":2048,"warmup_max":4096});
+    }
     if name == "fec-udp" {
         listener["fec"] = json!({"knock":false});
         path["fec"] = json!({"knock":false});
@@ -185,6 +209,18 @@ async fn exercise_direction(
     timeout(Duration::from_secs(15), echo_tcp(tcp_bind, &payload))
         .await
         .context("bulk TCP credit/EOF timeout")??;
+    if let (Some(cut), Some(relay)) = (cut, relay) {
+        // Break every lane while two MiB are in flight; the echo must still arrive intact.
+        let payload: Vec<u8> = (0..2_097_152).map(|index| (index % 249) as u8).collect();
+        let echo = tokio::spawn(async move { echo_tcp(tcp_bind, &payload).await });
+        sleep(Duration::from_millis(150)).await;
+        let cuts = relay.cut();
+        ensure!(cuts > 0, "the relay carried no connection to cut");
+        let _ = cut.send(relay);
+        timeout(Duration::from_secs(30), echo)
+            .await
+            .context("echo across the lane cut timed out")???;
+    }
     let socket = UdpSocket::bind("127.0.0.1:0").await?;
     for index in 0..40u8 {
         let message = vec![index; if index == 0 { 0 } else { 1000 }];
@@ -227,6 +263,78 @@ async fn all_carriers_forward_tcp_udp_and_socks() -> Result<()> {
             .with_context(|| format!("carrier {name} timed out"))?
             .with_context(|| format!("carrier {name}"))?;
     }
+    Ok(())
+}
+
+/// A TCP relay whose connections a test can break at once.
+struct Relay {
+    address: SocketAddr,
+    connections: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>,
+    _task: tokio::task::JoinHandle<()>,
+}
+impl Relay {
+    async fn start(target: SocketAddr) -> Result<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let connections: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>> =
+            Default::default();
+        let tracked = connections.clone();
+        let task = tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                let handle = tokio::spawn(async move {
+                    if let Ok(mut outbound) = TcpStream::connect(target).await {
+                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                    }
+                });
+                tracked.lock().unwrap().push(handle.abort_handle());
+            }
+        });
+        Ok(Self {
+            address,
+            connections,
+            _task: task,
+        })
+    }
+    /// Breaks every connection through the relay; returns how many there were.
+    fn cut(&self) -> usize {
+        let mut connections = self.connections.lock().unwrap();
+        let live = connections.iter().filter(|c| !c.is_finished()).count();
+        for connection in connections.drain(..) {
+            connection.abort();
+        }
+        live
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parallax_packet_mode_forwards_tcp_udp_and_socks_both_ways() -> Result<()> {
+    for wire in [1, 3] {
+        timeout(
+            Duration::from_secs(40),
+            exercise_carrier("parallax-packet", wire, false),
+        )
+        .await?
+        .with_context(|| format!("forward, wire version {wire}"))?;
+    }
+    timeout(
+        Duration::from_secs(40),
+        exercise_direction("parallax-packet", 3, false, true),
+    )
+    .await?
+    .context("reverse (server dials)")?;
+    Ok(())
+}
+
+/// Packet mode keeps the tunnel session when every TCP lane breaks: the lanes are dialed again
+/// and KCP resends what was lost, so a transfer in flight completes intact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parallax_packet_mode_survives_every_lane_breaking_mid_transfer() -> Result<()> {
+    let (cut, _relay) = tokio::sync::oneshot::channel();
+    timeout(
+        Duration::from_secs(70),
+        exercise_through("parallax-packet", 3, false, false, Some(cut)),
+    )
+    .await??;
     Ok(())
 }
 

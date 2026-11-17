@@ -36,7 +36,7 @@ async function pollOnce(request) {
       const tunnels = server.snapshot?.tunnels ?? [];
       const per = (fleetSeries[server.id] ??= {});
       for (const x of tunnels) {
-        const list = (per[x.name] ??= []);
+        const list = Object.hasOwn(per, x.name) ? per[x.name] : (per[x.name] = []);
         list.push(server.online ? x.down_bps ?? 0 : 0);
         if (list.length > POINTS) list.splice(0, list.length - POINTS);
       }

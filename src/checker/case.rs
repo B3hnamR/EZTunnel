@@ -35,6 +35,14 @@ pub struct Setup {
 }
 
 impl Setup {
+    /// Both ends on one machine (tests): the foreign end's Game mode UDP takes any free port.
+    pub fn own_is_loopback(&self) -> bool {
+        match self.side {
+            Side::Iran => self.iran_ip.is_loopback(),
+            Side::Foreign => self.foreign_ip.is_loopback(),
+        }
+    }
+
     /// Whether this side opens the connection (raw transports: neither does).
     pub fn dials(&self) -> bool {
         !plan::is_raw(self.spec.transport) && self.spec.dialer == Some(self.side)
@@ -60,8 +68,8 @@ impl Setup {
             _ => Direction::Reverse,
         };
         let mut plan = Plan::new(self.key.clone(), side, direction, self.spec.transport);
-        // Match the control channel's wire version.
-        plan.wire_version = 2;
+        // The wire version the wizard writes, so a case tests what a new tunnel will run.
+        plan.wire_version = crate::stealth::new_version();
         plan.tunnel_port = self.port;
         let other = match self.side {
             Side::Iran => self.foreign_ip,
@@ -100,6 +108,17 @@ impl Setup {
                 plan.tcp_congestion = Some(super::CONGESTION_TEST_ALGORITHM.into())
             }
             Variant::Pacer => plan.fec_pacer = true,
+            Variant::Packet => plan.parallax_mode = crate::parallax_carrier::Mode::Packet,
+            Variant::Game => {
+                // The UDP measurement is what Game mode carries: the Iran map forwards UDP too.
+                if self.side == Side::Iran {
+                    plan.protocol = Protocol::Both;
+                }
+                plan.set_game(true);
+                if let Some(game) = &mut plan.game {
+                    game.iran_host = Some(self.iran_ip.to_string());
+                }
+            }
         }
         if plan::is_raw(self.spec.transport) {
             let IpAddr::V4(peer_ip) = other else {
@@ -144,6 +163,17 @@ impl Setup {
             plan.raw = Some(raw);
         }
         let mut config = plan.to_json()?;
+        if self.spec.variant == Variant::Game && own.is_loopback() {
+            // Both ends on one machine (tests): each end sends its datagrams from its own
+            // address (a wildcard socket would send from 127.0.0.1 for both), and the foreign end
+            // takes any free port, which it announces during the handshake.
+            let port = if self.side == Side::Iran {
+                crate::manager::plan::game_port(self.port)
+            } else {
+                0
+            };
+            config["gaming"]["udp_bind"] = format!("{own}:{port}").into();
+        }
         if self.spec.transport == Transport::Tun {
             config["tun"]["mtu_probe"] = true.into();
         }
@@ -228,26 +258,31 @@ pub const TLS_PORTS: [u16; 6] = [443, 8443, 2053, 2083, 2087, 2096];
 /// The same for plain HTTP; the ws, http and xhttp transports use the first free one.
 pub const HTTP_PORTS: [u16; 7] = [80, 8080, 8880, 2052, 2082, 2086, 2095];
 
-fn chosen(transport: Transport, port: u16) -> Result<u16> {
-    if port_free(transport, port) {
-        Ok(port)
-    } else {
-        bail!("port {port} is in use on this server")
-    }
+/// Whether this server can take the Game mode port that goes with tunnel port `port`: both ends
+/// bind its UDP; only the Iran server also listens on it for the TCP control connection.
+pub fn game_port_free(port: u16, side: Side) -> bool {
+    let extra = crate::manager::plan::game_port(port);
+    udp_free(extra) && (side == Side::Foreign || tcp_free(extra))
 }
 
-/// The port the listening side uses for `spec`: the one the user chose, otherwise the first free
-/// web port for the TLS and HTTP transports, otherwise a free random port.
-pub fn choose_port(spec: &CaseSpec, options: &Options) -> Result<u16> {
+/// The port the listening side (`side`) uses for `spec`: the one the user chose, otherwise the
+/// first free web port for the TLS and HTTP transports, otherwise a free random port.
+pub fn choose_port(spec: &CaseSpec, options: &Options, side: Side) -> Result<u16> {
     let transport = spec.transport;
+    // A Game mode case also needs the port after it on this server.
+    let game = spec.variant == Variant::Game;
+    let free = |port: u16| port_free(transport, port) && (!game || game_port_free(port, side));
+    let chosen = |port: u16| -> Result<u16> {
+        if free(port) { Ok(port) } else { bail!("port {port} (or the Game mode port after it) is in use on this server") }
+    };
     let web: &[u16] = if transport.uses_tls() {
         if options.tls_port != 0 {
-            return chosen(transport, options.tls_port);
+            return chosen(options.tls_port);
         }
         &TLS_PORTS
     } else {
         if options.port != 0 {
-            return chosen(transport, options.port);
+            return chosen(options.port);
         }
         if transport.uses_http() {
             &HTTP_PORTS
@@ -255,9 +290,17 @@ pub fn choose_port(spec: &CaseSpec, options: &Options) -> Result<u16> {
             &[]
         }
     };
-    match web.iter().find(|port| port_free(transport, **port)) {
+    match web.iter().find(|port| free(**port)) {
         Some(port) => Ok(*port),
-        None => random_port(transport),
+        None => {
+            for _ in 0..200 {
+                let port = random_port(transport)?;
+                if free(port) {
+                    return Ok(port);
+                }
+            }
+            bail!("no free port found")
+        }
     }
 }
 
@@ -445,6 +488,24 @@ impl Drop for Running {
 mod tests {
     use super::*;
 
+    /// Both ends bind the Game mode UDP port; only the Iran server listens on its TCP control.
+    #[test]
+    fn the_game_port_is_checked_for_what_each_side_binds() {
+        // A TCP listener on the Game port (tunnel port + 1) blocks only the Iran side.
+        let taken = std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        let game = taken.local_addr().unwrap().port();
+        let tunnel = game - 1;
+        if !udp_free(game) {
+            return; // the matching UDP port happens to be in use; nothing to learn here
+        }
+        assert!(game_port_free(tunnel, Side::Foreign), "a TCP listener does not block the foreign side");
+        assert!(!game_port_free(tunnel, Side::Iran), "the Iran side needs the TCP port too");
+        drop(taken);
+        let udp = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        let game = udp.local_addr().unwrap().port();
+        assert!(!game_port_free(game - 1, Side::Foreign) && !game_port_free(game - 1, Side::Iran));
+    }
+
     /// C01: a command that never exits is killed and reaped at the deadline; ordinary
     /// success/failure and a missing program are reported without waiting.
     #[test]
@@ -466,6 +527,7 @@ mod tests {
                 dialer,
                 variant: Variant::Plain,
                 profile: None,
+                round: 0, ipv6: false,
             },
             side,
             key: crate::tunnel_key::TunnelKey::generate().unwrap().display(),
@@ -489,8 +551,8 @@ mod tests {
                     let setup = setup(transport, Some(dialer), side);
                     let value = setup.config().unwrap();
                     assert_eq!(
-                        value["wire_version"], 2,
-                        "carrier probes explicitly select their wire setting"
+                        value["wire_version"], crate::stealth::new_version(),
+                        "a case runs the wire version new tunnels get"
                     );
                     let config = plan::check(&value)
                         .unwrap_or_else(|e| panic!("{transport:?} {dialer:?} {side:?}: {e:#}"));
@@ -586,6 +648,7 @@ mod tests {
             dialer: Some(Side::Iran),
             variant: Variant::Plain,
             profile: None,
+                round: 0, ipv6: false,
         };
         assert!(impossible(&tcp6, v4, v4).is_some());
         assert!(impossible(&tcp6, v6, v6).is_none());
@@ -604,23 +667,25 @@ mod tests {
             dialer: Some(Side::Foreign),
             variant: Variant::Plain,
             profile: None,
+                round: 0, ipv6: false,
         };
-        assert!(choose_port(&spec, &options).is_err());
+        assert!(choose_port(&spec, &options, Side::Foreign).is_err());
         let random = choose_port(
             &spec,
             &Options {
                 port: 0,
                 ..Options::default()
             },
+            Side::Foreign,
         )
         .unwrap();
         assert!(random >= 20_000);
         // HTTP and TLS transports take a free web port (as a normal user, 80 and 443 are not
         // available, so one of the high ones).
         let web = |transport| CaseSpec { transport, ..spec };
-        let http = choose_port(&web(Transport::Ws), &Options::default()).unwrap();
+        let http = choose_port(&web(Transport::Ws), &Options::default(), Side::Foreign).unwrap();
         assert!(HTTP_PORTS.contains(&http) || http >= 20_000, "{http}");
-        let tls = choose_port(&web(Transport::Wss), &Options::default()).unwrap();
+        let tls = choose_port(&web(Transport::Wss), &Options::default(), Side::Foreign).unwrap();
         assert!(TLS_PORTS.contains(&tls) || tls >= 20_000, "{tls}");
     }
 }

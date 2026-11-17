@@ -24,6 +24,8 @@ struct Job {
     end: Arc<Mutex<Option<Result<Report, String>>>>,
     /// Ends the test early.
     cancel: Option<tokio::sync::oneshot::Sender<()>>,
+    /// The invitation's session: a stop for another test leaves this one running.
+    id: String,
 }
 
 static JOB: Mutex<Option<Job>> = Mutex::new(None);
@@ -73,10 +75,13 @@ pub fn answer(request: &Value) -> Result<Value> {
         }
         Some("status") => Ok(status()),
         Some("stop") => {
-            if let Some(job) = JOB.lock().unwrap().as_mut()
-                && let Some(cancel) = job.cancel.take()
-            {
-                let _ = cancel.send(());
+            if let Some(job) = JOB.lock().unwrap().as_mut() {
+                if request["id"].as_str().is_some_and(|id| id != job.id) {
+                    return Ok(json!({"stopping": false, "reason": "another test is running here"}));
+                }
+                if let Some(cancel) = job.cancel.take() {
+                    let _ = cancel.send(());
+                }
             }
             Ok(json!({"stopping": true}))
         }
@@ -85,6 +90,7 @@ pub fn answer(request: &Value) -> Result<Value> {
 }
 
 fn start(invite: Invitation, host: bool) -> Result<()> {
+    let id = invite.session.clone();
     let mut slot = JOB.lock().unwrap();
     if let Some(job) = slot.as_ref() {
         ensure!(job.end.lock().unwrap().is_some(), "a Mirage source test is already running on this server");
@@ -128,7 +134,7 @@ fn start(invite: Invitation, host: bool) -> Result<()> {
         };
         *done.lock().unwrap() = Some(result);
     }));
-    *slot = Some(Job { rows, end, cancel: Some(cancel) });
+    *slot = Some(Job { rows, end, cancel: Some(cancel), id });
     Ok(())
 }
 

@@ -38,7 +38,8 @@ export const getServers = (signal) => call("GET", "/api/servers", undefined, 10_
 export const createJoinCode = () => call("POST", "/api/join-codes", {});
 export const removeServer = (id) => call("DELETE", `/api/servers/${encodeURIComponent(id)}`);
 export const getActivity = (limit) => call("GET", `/api/activity?limit=${limit}`);
-export const followUrl = (name, server) => `${base(server)}/tunnels/${encodeURIComponent(name)}/logs/follow`;
+export const followUrl = (name, server, after) =>
+  `${base(server)}/tunnels/${encodeURIComponent(name)}/logs/follow${after ? `?after=${encodeURIComponent(after)}` : ""}`;
 // What the edit screen offers for a tunnel, and saving (or going back one version). Saving restarts
 // the tunnel and watches it come up, and may put the old settings back, so it gets a long timeout.
 export const getEditable = (name, server, signal) => call("GET", `${base(server)}/tunnels/${encodeURIComponent(name)}/settings`, undefined, 25_000, signal);
@@ -51,7 +52,7 @@ export const deleteTunnel = (name, server) => call("DELETE", `${base(server)}/tu
 export const getNewTunnel = () => call("GET", "/api/new-tunnel");
 export const createTunnel = (form) => call("POST", "/api/new-tunnel", form, 120_000);
 // A tunnel's own figures, and its tools: speedtest, pairing, quota_reset.
-export const getStatus = (name, server) => call("GET", `${base(server)}/tunnels/${encodeURIComponent(name)}/status`, undefined, 15_000);
+export const getStatus = (name, server, signal) => call("GET", `${base(server)}/tunnels/${encodeURIComponent(name)}/status`, undefined, 15_000, signal);
 export const runTool = (name, tool, body, server) =>
   call("POST", `${base(server)}/tunnels/${encodeURIComponent(name)}/tools/${tool}`, body ?? {}, tool === "speedtest" ? 160_000 : 60_000);
 // Server tools (health, fix, optimize_plan, optimize_apply, optimize_undo, files) and the

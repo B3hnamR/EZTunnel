@@ -9,7 +9,7 @@
   import State from "./State.svelte";
   import { live } from "../lib/live.svelte.js";
   import { t, num, pct, amount, duration, rate } from "../lib/i18n.svelte.js";
-  import { tunnelState, transportLabel, isUp, linkState } from "../lib/view.js";
+  import { tunnelState, transportLabel, isUp, linkState, own } from "../lib/view.js";
   import LinkLine from "../lib/LinkLine.svelte";
   import { pending, pendingKey, confirmAction, confirmRestartAll } from "../lib/actions.svelte.js";
   import LogPanel from "../lib/LogPanel.svelte";
@@ -53,7 +53,7 @@
 
   // Each card has its own range; every non-live range is one request for all tunnels.
   let ranges = $state({});
-  const rangeOf = (name) => ranges[name] ?? "live";
+  const rangeOf = (name) => own(ranges, name) ?? "live";
   const day = $derived(history[key("24h", "tunnels", server)]?.data);
 
   $effect(() => {
@@ -65,14 +65,14 @@
 
   function series(name) {
     const range = rangeOf(name);
-    if (range === "live") return remote ? fleetSeries[server]?.[name] ?? [] : live.history.map((p) => p.t?.[name]?.[0] ?? 0);
+    if (range === "live") return remote ? own(fleetSeries[server], name) ?? [] : live.history.map((p) => own(p.t, name)?.[0] ?? 0);
     const data = history[key(range, "tunnels", server)]?.data;
-    const points = data?.tunnels?.[name]?.points;
+    const points = own(data?.tunnels, name)?.points;
     return points ? trimmed(points, data.bucket_sec, range !== "30d").map((p) => p.down / data.bucket_sec) : [];
   }
 
   function uptime(name) {
-    const value = day?.tunnels?.[name]?.uptime_24h_pct;
+    const value = own(day?.tunnels, name)?.uptime_24h_pct;
     return value == null ? null : t("upLine", pct(value));
   }
 
@@ -129,7 +129,7 @@
         <article class="panel tcard" aria-labelledby="t{i}">
           <div class="hd">
             <div class="grow">
-              <div class="title"><h2 id="t{i}" class="ltr"><a class="tlink" href="#/tunnel?t={encodeURIComponent(x.name)}{remote ? `&s=${encodeURIComponent(server)}` : ''}">{x.name}</a></h2>{#if x.transport}<span class="code-chip">{transportLabel(x.transport)}</span>{/if}</div>
+              <div class="title"><h2 id="t{i}" class="ltr"><a class="tlink" href="#/tunnel?t={encodeURIComponent(x.name)}{remote ? `&s=${encodeURIComponent(server)}` : ''}">{x.name}</a></h2>{#if x.transport}<span class="code-chip">{transportLabel(x.transport)}</span>{/if}{#if x.game}<span class="code-chip" title={t("gameF")}>{t("gameF")}</span>{/if}</div>
               <div class="meta">
                 {#if x.direction}<span>{t(x.direction)}</span>{/if}
                 {#each carried(x) as [label, value], ci}{#if ci || x.direction}<span aria-hidden="true">·</span>{/if}<span>{label}{#if value}{" "}<span class="ltr">{value}</span>{/if}</span>{/each}
@@ -228,7 +228,7 @@
           <small>{#each carried(x) as [lbl, value], ci}{#if ci}<span aria-hidden="true"> · </span>{/if}{lbl}{#if value}{" "}<span class="ltr">{value}</span>{/if}{/each}</small>
         </span>
         <span role="cell" class="tl-link">
-          <span class="tl-tags">{#if x.transport}<span class="code-chip">{transportLabel(x.transport)}</span>{/if}{#if x.direction}<span class="tl-dir">{t(x.direction)}</span>{/if}</span>
+          <span class="tl-tags">{#if x.transport}<span class="code-chip">{transportLabel(x.transport)}</span>{/if}{#if x.game}<span class="code-chip">{t("gameF")}</span>{/if}{#if x.direction}<span class="tl-dir">{t(x.direction)}</span>{/if}</span>
           <small class="ltr">{up && x.rtt_ms != null ? `${num(x.rtt_ms)} ms` : "-"}{#if up && x.loss_pct != null}{" · "}{pct(x.loss_pct)}{/if}</small>
         </span>
         <span role="cell" class="tl-now">

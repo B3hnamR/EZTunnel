@@ -243,7 +243,7 @@
       try {
         const { status, data } = await restoreBackup(to, { file: b.file, replace });
         if (status !== 200) return say(`${t("failedShort")}: ${data?.detail ?? ""}`, true);
-        say(t("rsDone", num(data.imported.length), num(data.skipped.length), num(data.failed.length)), data.failed.length > 0);
+        { const down = (data.started ?? []).filter((x) => !x.came_up).map((x) => x.name); if (down.length) say(t("rsNotUp", down.join(", ")), true); else say(t("rsDone", num(data.imported.length), num(data.skipped.length), num(data.failed.length)), data.failed.length > 0); }
       } catch {
         say(t("slowShort"), true);
       }
@@ -259,7 +259,7 @@
       try {
         const { status, data } = await restoreBackup(to, { text, replace });
         if (status !== 200) return say(`${t("failedShort")}: ${data?.detail ?? ""}`, true);
-        say(t("rsDone", num(data.imported.length), num(data.skipped.length), num(data.failed.length)), data.failed.length > 0);
+        { const down = (data.started ?? []).filter((x) => !x.came_up).map((x) => x.name); if (down.length) say(t("rsNotUp", down.join(", ")), true); else say(t("rsDone", num(data.imported.length), num(data.skipped.length), num(data.failed.length)), data.failed.length > 0); }
       } catch {
         say(t("slowShort"), true);
       }
@@ -337,6 +337,7 @@
             {#if newer}<span class="pill warn">{t("verNewer", latest.version)}</span>{:else if aheadOf(p.id)}<span class="pill ok">{t("verAhead")}</span>{:else if latest}<span class="pill ok">{t("verCurrent")}</span>{/if}
           </div>
           <p class="muted small m0">{t("verPrevious")}: <span class="ltr">{v.has_previous ? (v.previous ?? "?") : "-"}</span>{#if v.has_previous && v.previous && v.previous === v.installed}{" · "}{t("verEarlierBuild")}{/if}</p>
+          {#if v.restart_needed}<p class="warn-t small m0">{t("verRestartNeeded", p.id === "local" ? t("verDashboard") : t("verAgent"))}</p>{/if}
           <div class="mt-act">
             {#if installing[p.id] === "running"}<span class="muted small" role="status">{t("working")}</span>{:else}
               {#if newer}<button class="btn primary" onclick={() => confirmUpdate(p.id)} disabled={Boolean(staged?.running) || Boolean(fetching)}><Icon name="download" />{t("updTo", latest.version)}</button>{/if}

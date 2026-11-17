@@ -73,11 +73,38 @@ fn load_settings(state_dir: &Path) -> Result<Settings> {
     Ok(settings)
 }
 
+/// Changes the settings file: under an exclusive lock (between processes too: the dashboard and
+/// the terminal commands), on the settings as they are now. A change prepared earlier (before a
+/// minute-long certificate order) cannot put back a password changed meanwhile.
+fn update_settings<T>(state_dir: &Path, change: impl FnOnce(&mut Settings) -> Result<T>) -> Result<T> {
+    let path = state_dir.join("settings.lock");
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let lock = options.open(&path).with_context(|| format!("open {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: flock on a descriptor owned here; released when `lock` is dropped.
+        ensure!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0, "lock the dashboard settings");
+    }
+    let mut settings = load_settings(state_dir)?;
+    let result = change(&mut settings)?;
+    save_settings(state_dir, &settings)?;
+    drop(lock);
+    Ok(result)
+}
+
 /// Saves a new password hash (changed from the Settings screen).
 pub(crate) fn save_password_hash(state_dir: &Path, hash: &str) -> Result<()> {
-    let mut settings = load_settings(state_dir)?;
-    settings.password_hash = hash.to_string();
-    save_settings(state_dir, &settings)
+    update_settings(state_dir, |settings| {
+        settings.password_hash = hash.to_string();
+        Ok(())
+    })
 }
 
 fn save_settings(state_dir: &Path, settings: &Settings) -> Result<()> {
@@ -225,15 +252,16 @@ pub fn setup(state_dir: &Path, port: Option<u16>, service: bool) -> Result<()> {
 pub fn set_port(state_dir: &Path, port: u16) -> Result<()> {
     require_root()?;
     ensure!(port >= 1024, "use a port from 1024 to 65535");
-    let mut settings = load_settings(state_dir)?;
-    if settings.port == port {
+    if load_settings(state_dir)?.port == port {
         println!("The dashboard already uses port {port}.");
         return Ok(());
     }
     std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))
         .with_context(|| format!("port {port} is in use by another program"))?;
-    settings.port = port;
-    save_settings(state_dir, &settings)?;
+    update_settings(state_dir, |settings| {
+        settings.port = port;
+        Ok(())
+    })?;
     println!("The dashboard's port is {port} now. Open it in the firewall if one is in use.");
     service::apply("the new port")
 }
@@ -348,10 +376,12 @@ pub fn status(state_dir: &Path) -> Result<()> {
 /// when the dashboard restarts.
 pub fn reset_password(state_dir: &Path) -> Result<()> {
     require_root()?;
-    let mut settings = load_settings(state_dir)?;
     let password = random_password()?;
-    settings.password_hash = auth::hash_password(&password)?;
-    save_settings(state_dir, &settings)?;
+    let hash = auth::hash_password(&password)?;
+    update_settings(state_dir, |settings| {
+        settings.password_hash = hash;
+        Ok(())
+    })?;
     println!("New password (shown only this once): {password}");
     service::apply("the new password; every browser signed in with the old one is signed out")
 }
@@ -418,10 +448,12 @@ pub async fn serve(state_dir: &Path, listen: Option<IpAddr>) -> Result<()> {
 /// self-signed certificate. The running dashboard uses the change after a restart.
 pub async fn certificate(state_dir: &Path, lets_encrypt: bool, staging: bool, address: Option<String>) -> Result<()> {
     require_root()?;
-    let mut settings = load_settings(state_dir)?;
+    load_settings(state_dir)?;
     if !lets_encrypt {
-        settings.acme = None;
-        save_settings(state_dir, &settings)?;
+        update_settings(state_dir, |settings| {
+            settings.acme = None;
+            Ok(())
+        })?;
         acme::forget(state_dir);
         println!("The dashboard uses its self-signed certificate again.");
         return service::apply("the self-signed certificate");
@@ -433,8 +465,11 @@ pub async fn certificate(state_dir: &Path, lets_encrypt: bool, staging: bool, ad
     println!("It checks this server over port 80, which must be free and open for about a minute.");
     let issued = acme::issue(state_dir, &wanted, 80).await?;
     let (_, until) = issued.validity()?;
-    settings.acme = Some(wanted);
-    save_settings(state_dir, &settings)?;
+    // The order took a while: change only the certificate choice, on the settings of now.
+    update_settings(state_dir, |settings| {
+        settings.acme = Some(wanted);
+        Ok(())
+    })?;
     let kind = if staging { " (staging, not trusted by browsers)" } else { "" };
     println!("Certificate ready{kind}, valid until {}.", acme::utc_text(until));
     println!("The dashboard renews it by itself from now on.");

@@ -15,7 +15,7 @@
   import { getStatus, runTool } from "../lib/api.js";
   import { pending, pendingKey, ask, say } from "../lib/actions.svelte.js";
   import { t, num, pct, amount, duration, rate as mbit } from "../lib/i18n.svelte.js";
-  import { tunnelState, transportLabel, isUp, linkState } from "../lib/view.js";
+  import { tunnelState, transportLabel, isUp, linkState, own } from "../lib/view.js";
   import LinkLine from "../lib/LinkLine.svelte";
 
   let { name, server = LOCAL } = $props();
@@ -30,9 +30,15 @@
   // The control socket's figures, read every 5 seconds while the page is open.
   let status = $state(null);
   let statusError = $state("");
+  // One read at a time; an answer for a page or tunnel left meanwhile is thrown away.
+  let statusRead = null;
   async function readStatus() {
+    if (statusRead) return;
+    const request = new AbortController();
+    statusRead = request;
     try {
-      const { status: code, data } = await getStatus(name, server);
+      const { status: code, data } = await getStatus(name, server, request.signal);
+      if (request.signal.aborted) return;
       if (code === 200) {
         status = data;
         statusError = "";
@@ -41,13 +47,26 @@
         statusError = data?.detail ?? "";
       }
     } catch {
-      statusError = t("slowShort");
+      // The figures shown stay, marked as old (below), rather than looking current.
+      if (!request.signal.aborted) statusError = t("slowShort");
+    } finally {
+      if (statusRead === request) statusRead = null;
     }
   }
   $effect(() => {
-    untrack(readStatus);
+    name;
+    server;
+    untrack(() => {
+      status = null;
+      statusError = "";
+      readStatus();
+    });
     const timer = setInterval(readStatus, 5000);
-    return () => clearInterval(timer);
+    return () => {
+      clearInterval(timer);
+      statusRead?.abort();
+      statusRead = null;
+    };
   });
 
   const rtt = $derived.by(() => {
@@ -57,7 +76,7 @@
     const jitter = samples.length > 1 ? samples.slice(1).reduce((s, v, i) => s + Math.abs(v - samples[i]), 0) / (samples.length - 1) : 0;
     return { min: Math.min(...samples), avg, max: Math.max(...samples), jitter };
   });
-  const lossOf = (s) => (s?.pings ? Math.max(0, (s.lost ?? 0) / s.pings) * 100 : null);
+  const lossOf = (s) => (s?.pings ? Math.max(0, (s.pings_lost ?? 0) / s.pings) * 100 : null);
   /** Extra figures the transport reports (FEC recovery, pool, certificate...), flattened. */
   const extra = $derived.by(() => {
     const out = [];
@@ -66,7 +85,7 @@
         for (const [k, v] of Object.entries(value)) walk(v, prefix ? `${prefix}.${k}` : k);
       } else if (value != null && !Array.isArray(value)) out.push([prefix, String(value)]);
     };
-    walk(status?.transport, "");
+    walk(status?.transport_extensions, "");
     return out;
   });
 
@@ -81,8 +100,16 @@
     ];
     if (rtt) rows.push([t("rttF"), [`${num(rtt.min)} ms`, `${num(rtt.avg)} ms`, `${num(rtt.max)} ms`, `± ${num(rtt.jitter)} ms`]]);
     rows.push([t("udpDropF"), [num(status.udp_dropped ?? 0), ...(status.udp_oversize ? [t("oversizeF", num(status.udp_oversize))] : [])]]);
+    // Game mode: whether its datagram path is up and how the copies race.
+    if (x?.game) {
+      const g = x.game;
+      rows.push([t("gameF"), [g.ready == null ? t("gameUnknown") : g.ready ? t("gameReady") : t("gameWaiting"), t("gameCopiesPort", num(g.copies), num(g.port)),
+        t("gamePackets", num(g.packets_out), num(g.packets_in)), t("gameAbsorbed", num(g.copies_absorbed))]]);
+    }
     rows.push([t("totalF"), [`${t("recv")} ${size(status.bytes_from_peer)}`, `${t("sent")} ${size(status.bytes_to_peer)}`]]);
-    if (status.window_bytes != null) rows.push([t("windowF"), [size(status.window_bytes)]]);
+    // Flow-control windows in use, in 16 KiB frames, against the memory budget.
+    if (status.window_frames_used != null)
+      rows.push([t("windowF"), [size(status.window_frames_used * 16384), ...(status.window_frames_limit ? [t("ofTotal", size(status.window_frames_limit * 16384))] : [])]]);
     rows.push([t("versionF"), [String(status.version ?? ""), String(status.role ?? "")]]);
     for (const [k, v] of extra) rows.push([k, [v], true]);
     return rows;
@@ -92,13 +119,17 @@
   let range = $state("24h");
   const histKey = $derived(key(range, "tunnels", server));
   const data = $derived(history[histKey]?.data);
-  const points = $derived(data?.tunnels?.[name]?.points ? trimmed(data.tunnels[name].points, data.bucket_sec, range !== "30d") : []);
+  const points = $derived(own(data?.tunnels, name)?.points ? trimmed(own(data.tunnels, name).points, data.bucket_sec, range !== "30d") : []);
   const sum = $derived(points.length ? summary(points, data.bucket_sec, range === "30d") : null);
   $effect(() => {
     const r = range === "live" ? "24h" : range;
-    untrack(() => load(r, "tunnels", false, server));
+    const at = server;
+    untrack(() => load(r, "tunnels", false, at));
+    // Kept current while the page is open, like the other history pages.
+    const timer = setInterval(() => load(r, "tunnels", true, at), 60_000);
+    return () => clearInterval(timer);
   });
-  const liveSeries = $derived(remote ? fleetSeries[server]?.[name] ?? [] : live.history.map((p) => p.t?.[name]?.[0] ?? 0));
+  const liveSeries = $derived(remote ? own(fleetSeries[server], name) ?? [] : live.history.map((p) => own(p.t, name)?.[0] ?? 0));
 
   // Speed test: download and upload, one connection and four.
   const SIZES = [10, 50, 100];
@@ -219,7 +250,8 @@
     <section class="panel" aria-labelledby="tp-now">
       <h3 id="tp-now" class="sec-h">{t("figuresNow")}</h3>
       {#if status}
-        <dl class="facts">
+        {#if statusError}<p class="note warn small m0" role="status">{t("figuresOld", statusError)}</p>{/if}
+        <dl class="facts" class:stale={Boolean(statusError)}>
           {#each facts as [label, parts, ltr]}
             <div>
               <dt class:ltr class:mono={ltr}>{label}</dt>
@@ -281,7 +313,7 @@
             <div><b>{rate(sum.average)}</b><span>{t("avg")}</span></div>
             <div><b>{rate(sum.low)}</b><span>{t("low")}</span></div>
           {/if}
-          {#if data.tunnels?.[name]?.uptime_pct != null}<div><b>{pct(data.tunnels[name].uptime_pct)}</b><span>{t("uptimeRange")}</span></div>{/if}
+          {#if own(data.tunnels, name)?.uptime_pct != null}<div><b>{pct(own(data.tunnels, name).uptime_pct)}</b><span>{t("uptimeRange")}</span></div>{/if}
         </div>
       {/if}
     {/if}

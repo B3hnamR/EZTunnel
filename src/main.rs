@@ -254,11 +254,22 @@ enum CheckCommand {
         /// The other server's IP address.
         #[arg(long)]
         peer_ip: IpAddr,
+        /// find: every transport with its defaults. tune: the --transports with every option each
+        /// one has, in --rounds rounds.
+        #[arg(long, value_enum, default_value = "find")]
+        mode: ModeArg,
+        /// How deep each case measures.
         #[arg(long, value_enum, default_value = "standard")]
         preset: PresetArg,
-        /// Transports to check, comma separated (default: the preset's).
+        /// Transports to check, comma separated (default: the preset's; required to tune).
         #[arg(long, value_delimiter = ',')]
         transports: Vec<String>,
+        /// Rounds of every case, 1 to 3 (default: 1, or 2 to tune).
+        #[arg(long)]
+        rounds: Option<u8>,
+        /// Raw TUN packet types, comma separated (default: all of tcp,udp,icmp,gre,ipip,raw,dns).
+        #[arg(long, value_delimiter = ',')]
+        tun_types: Vec<String>,
         /// Which server opens the connections.
         #[arg(long, value_enum, default_value = "both")]
         directions: DirectionsArg,
@@ -278,6 +289,18 @@ enum CheckCommand {
         /// Leave out the UDP loss and delay measurement (it adds about 3 seconds per case).
         #[arg(long)]
         no_udp: bool,
+        /// Also check TLS transports again with a browser-like TLS ClientHello.
+        #[arg(long)]
+        also_browser_tls: bool,
+        /// Also check TLS transports again with the ClientHello split into fragments.
+        #[arg(long)]
+        also_tls_fragment: bool,
+        /// Check Parallax in stream mode only (by default packet mode is checked too).
+        #[arg(long)]
+        no_parallax_packet: bool,
+        /// Also check each non-raw transport with Game mode on.
+        #[arg(long)]
+        also_game: bool,
         /// Also check TCP-based transports again with tcp_congestion set to cubic.
         #[arg(long)]
         also_congestion: bool,
@@ -312,6 +335,12 @@ enum CheckCommand {
 enum RoleArg {
     Iran,
     Foreign,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ModeArg {
+    Find,
+    Tune,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -518,14 +547,21 @@ async fn run(cli: Cli) -> Result<()> {
                         role,
                         this_ip,
                         peer_ip,
+                        mode,
                         preset,
                         transports,
+                        rounds,
+                        tun_types,
                         directions,
                         tls_port,
                         port,
                         control_port,
                         priority,
                         no_udp,
+                        also_browser_tls,
+                        also_tls_fragment,
+                        no_parallax_packet,
+                        also_game,
                         also_congestion,
                         also_pacer,
                         also_fragment,
@@ -535,20 +571,44 @@ async fn run(cli: Cli) -> Result<()> {
                         if let Some(via) = control_via {
                             eztunnel::checker::control::set_control_via(Some(via));
                         }
-                        let mut options = Options::preset(match preset {
+                        let preset = match preset {
                             PresetArg::Quick => Preset::Quick,
                             PresetArg::Standard => Preset::Standard,
                             PresetArg::Thorough => Preset::Thorough,
-                        });
-                        if !transports.is_empty() {
-                            options.transports = transports
+                        };
+                        let chosen: Vec<eztunnel::config::Transport> = transports
+                            .iter()
+                            .map(|name| {
+                                serde_json::from_value(serde_json::json!(name.trim()))
+                                    .with_context(|| format!("unknown transport {name}"))
+                            })
+                            .collect::<Result<_>>()?;
+                        let mut options = match mode {
+                            ModeArg::Find => Options::preset(preset),
+                            ModeArg::Tune => {
+                                anyhow::ensure!(!chosen.is_empty(), "--mode tune needs --transports: the ones to tune");
+                                Options::tune(preset, chosen.clone())
+                            }
+                        };
+                        if !chosen.is_empty() {
+                            options.transports = chosen;
+                        }
+                        if let Some(rounds) = rounds {
+                            options.rounds = rounds;
+                        }
+                        if !tun_types.is_empty() {
+                            options.tun_profiles = tun_types
                                 .iter()
                                 .map(|name| {
                                     serde_json::from_value(serde_json::json!(name.trim()))
-                                        .with_context(|| format!("unknown transport {name}"))
+                                        .with_context(|| format!("unknown TUN packet type {name}"))
                                 })
                                 .collect::<Result<_>>()?;
                         }
+                        options.browser_tls = also_browser_tls;
+                        options.tls_fragment = also_tls_fragment;
+                        options.parallax_packet = !no_parallax_packet;
+                        options.also_game = also_game;
                         options.dialers = match directions {
                             DirectionsArg::Both => vec![Side::Foreign, Side::Iran],
                             DirectionsArg::Iran => vec![Side::Iran],

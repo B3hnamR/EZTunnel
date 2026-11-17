@@ -491,10 +491,14 @@ pub async fn connect_responder(
     let timeout = Duration::from_secs(dial_timeout_sec);
     let stream: BoxIo = tokio::time::timeout(timeout, async {
         let mut stream = client_carrier(&listener.dial_path(dial_timeout_sec)).await?;
-        if matches!(
+        // KCP-based carriers create the listening side's session only when a packet arrives, and
+        // the dialing responder would otherwise wait for the initiator's first message.
+        let kcp_based = matches!(
             listener.transport,
             crate::config::Transport::Kcp | crate::config::Transport::FecUdp
-        ) {
+        ) || (listener.transport == crate::config::Transport::Parallax
+            && listener.parallax.mode == crate::parallax_carrier::Mode::Packet);
+        if kcp_based {
             stream.write_u8(KCP_WAKE).await?;
             stream.flush().await?;
         }

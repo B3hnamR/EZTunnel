@@ -143,6 +143,10 @@ impl TunnelKey {
         self.derive("parallax carrier v1 authentication")
     }
 
+    pub(crate) fn parallax_lanes_key(&self) -> Zeroizing<[u8; 32]> {
+        self.derive("parallax packet lanes v2 authentication")
+    }
+
     pub(crate) fn packet_lane_key(&self) -> Zeroizing<[u8; 32]> {
         self.derive("packet fallback lane v1 authentication")
     }

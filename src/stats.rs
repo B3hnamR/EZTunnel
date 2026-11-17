@@ -208,6 +208,11 @@ pub struct Stats {
     pub udp_dropped: AtomicU64,
     /// The part of `udp_dropped` that was larger than one tunnel frame (16 KiB).
     pub udp_oversize: AtomicU64,
+    /// Game mode: an authenticated datagram path is usable right now (a validated channel that has
+    /// not expired). Kept current by the tunnel while Game mode is on.
+    pub gaming_ready: std::sync::atomic::AtomicBool,
+    /// Game mode: UDP datagrams this machine sent on the datagram path (not through the tunnel).
+    pub gaming_datagrams: AtomicU64,
     /// The live sessions, to tell the other server before this one stops.
     pub farewell: crate::farewell::Farewell,
     /// Heartbeat round trips in microseconds.

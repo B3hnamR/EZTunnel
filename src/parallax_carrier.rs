@@ -93,6 +93,36 @@ impl std::fmt::Debug for Key {
     }
 }
 
+/// How Parallax carries the tunnel. Both ends must use the same mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    /// Two directional TCP lanes; kernel TCP does the retransmission (Parallax v1).
+    #[default]
+    Stream,
+    /// The tunnel's KCP/FEC packets over several TCP lanes that are redialed on their own
+    /// (`parallax_lanes`).
+    Packet,
+}
+impl Mode {
+    fn is_stream(&self) -> bool {
+        *self == Self::Stream
+    }
+}
+
+const DEFAULT_LANES: usize = 2;
+const DEFAULT_WARMUP_MIN: usize = 32 * 1024;
+const DEFAULT_WARMUP_MAX: usize = 64 * 1024;
+fn is_default_lanes(value: &usize) -> bool {
+    *value == DEFAULT_LANES
+}
+fn is_default_warmup_min(value: &usize) -> bool {
+    *value == DEFAULT_WARMUP_MIN
+}
+fn is_default_warmup_max(value: &usize) -> bool {
+    *value == DEFAULT_WARMUP_MAX
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Options {
@@ -101,6 +131,19 @@ pub struct Options {
     pub max_pending: usize,
     pub max_pending_per_ip: usize,
     pub max_sessions: usize,
+    /// Left out of saved settings while it is the default, so stream-mode tunnels keep the exact
+    /// settings earlier versions read.
+    #[serde(skip_serializing_if = "Mode::is_stream")]
+    pub mode: Mode,
+    /// Packet mode: TCP lanes per tunnel connection.
+    #[serde(skip_serializing_if = "is_default_lanes")]
+    pub lanes: usize,
+    /// Packet mode: each lane starts with encrypted padding of a random size in this range
+    /// (bytes, each way); 0 and 0 turn it off.
+    #[serde(skip_serializing_if = "is_default_warmup_min")]
+    pub warmup_min: usize,
+    #[serde(skip_serializing_if = "is_default_warmup_max")]
+    pub warmup_max: usize,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -110,6 +153,10 @@ impl Default for Options {
             max_pending: 128,
             max_pending_per_ip: 16,
             max_sessions: 64,
+            mode: Mode::Stream,
+            lanes: DEFAULT_LANES,
+            warmup_min: DEFAULT_WARMUP_MIN,
+            warmup_max: DEFAULT_WARMUP_MAX,
         }
     }
 }
@@ -134,6 +181,15 @@ impl Options {
         ensure!(
             (1..=4096).contains(&self.max_sessions),
             "Parallax max_sessions must be 1..4096"
+        );
+        ensure!(
+            (1..=crate::parallax_lanes::MAX_LANES).contains(&self.lanes),
+            "Parallax lanes must be 1..{}",
+            crate::parallax_lanes::MAX_LANES
+        );
+        ensure!(
+            self.warmup_max <= 1024 * 1024 && self.warmup_min <= self.warmup_max,
+            "Parallax warm-up must be at most 1048576 bytes, with warmup_min <= warmup_max"
         );
         Ok(())
     }
@@ -231,6 +287,9 @@ async fn dial_lane(
 
 pub async fn connect(path: &ClientPath) -> Result<BoxIo> {
     path.parallax.validate()?;
+    if path.parallax.mode == Mode::Packet {
+        return crate::fec_carrier::connect(path).await;
+    }
     let key = path
         .parallax_key
         .as_ref()

@@ -814,6 +814,19 @@ pub(crate) async fn run_forwarding(config: Config, stats: Arc<Stats>) -> Result<
     let config = Arc::new(config);
     let gaming=if config.gaming.enabled(){Some(crate::gaming::Hub::start(&config).await?)}else{None};
     let mut tasks = JoinSet::new();
+    if let Some(hub) = &gaming {
+        // Whether the datagram path is usable now, for the status and the checker: a channel
+        // validated once may have expired since.
+        let (hub, stats) = (hub.clone(), stats.clone());
+        tasks.spawn(async move {
+            loop {
+                stats.gaming_ready.store(hub.usable().await, Ordering::Relaxed);
+                time::sleep(Duration::from_millis(500)).await;
+            }
+            #[allow(unreachable_code)]
+            Ok(())
+        });
+    }
     stats.start();
     let (budget_frames, automatic) = crate::stats::budget_frames(config.memory_budget_mb);
     stats.window_budget.set_limit(budget_frames);
@@ -2101,7 +2114,7 @@ async fn udp_map(
                                             // Once a direct flow is established, a missing
                                             // path drops UDP rather than recreating the
                                             // target socket under an unrelated mux flow.
-                                            if hub.send(flow,&target,&data).await.unwrap_or(false){stats.bytes_to_peer.fetch_add(data.len() as u64,Ordering::Relaxed);}
+                                            if hub.send(flow,&target,&data).await.unwrap_or(false){stats.bytes_to_peer.fetch_add(data.len() as u64,Ordering::Relaxed);stats.gaming_datagrams.fetch_add(1,Ordering::Relaxed);}
                                             else{stats.udp_dropped.fetch_add(1,Ordering::Relaxed);}
                                             heard=Instant::now();
                                         }

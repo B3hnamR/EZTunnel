@@ -156,7 +156,14 @@ impl Auth {
         }
         let generation = self.generation.load(Ordering::Acquire);
         let matches = {
+            // Lock order: a check slot is never held while waiting for `transition` (a password
+            // change holds `transition` while it waits for a slot). The lockout is looked at again
+            // once the slot is ours, and once more in `finish_login` before any session is made,
+            // so attempts that queued while the address got locked out cannot sign in.
             let _permit = self.checks.acquire().await?;
+            if let Some(seconds) = self.limiter.lock().unwrap().wait(ip, Instant::now()) {
+                return Ok(Login::Wait(seconds));
+            }
             let hash = self.hash.lock().unwrap().clone();
             tokio::task::spawn_blocking(move || password_matches(&hash, &password)).await?
         };
@@ -169,6 +176,10 @@ impl Auth {
             return Ok(Login::Wrong);
         }
         let mut limiter = self.limiter.lock().unwrap();
+        // Locked out while this attempt was checked (by the other slot): no session either way.
+        if let Some(seconds) = limiter.wait(ip, Instant::now()) {
+            return Ok(Login::Wait(seconds));
+        }
         if !matches {
             limiter.failed(ip, Instant::now());
             return Ok(Login::Wrong);
@@ -289,6 +300,67 @@ mod tests {
 
     fn ip(last: u8) -> IpAddr {
         IpAddr::from([198, 51, 100, last])
+    }
+
+    /// Attempts that queued for a password check while the address got locked out are refused
+    /// when their turn comes, a correct password included: no session after the lockout.
+    #[tokio::test]
+    async fn queued_attempts_respect_a_lockout_reached_while_they_waited() {
+        let auth = std::sync::Arc::new(Auth::new(hash_password("right one").unwrap()));
+        // Both check slots busy: the attempts below pass the first look and queue.
+        let held = auth.checks.acquire_many(2).await.unwrap();
+        let queued: Vec<_> = ["wrong", "right one"]
+            .into_iter()
+            .map(|password| {
+                let auth = auth.clone();
+                tokio::spawn(async move { auth.login(ip(7), password.into()).await.unwrap() })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        {
+            let mut limiter = auth.limiter.lock().unwrap();
+            for _ in 0..FAILURES_BEFORE_LOCK {
+                limiter.failed(ip(7), Instant::now());
+            }
+        }
+        drop(held);
+        for attempt in queued {
+            assert!(matches!(attempt.await.unwrap(), Login::Wait(_)));
+        }
+        assert!(auth.sessions.lock().unwrap().is_empty());
+        // The lockout also holds at the last step, for an attempt already checked.
+        assert!(matches!(auth.finish_login(ip(7), true, auth.generation.load(Ordering::Acquire)).await.unwrap(), Login::Wait(_)));
+        assert!(auth.sessions.lock().unwrap().is_empty());
+    }
+
+    /// Logins that hold both check slots and a password change that holds the change lock must
+    /// not wait on each other: everything finishes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn logins_and_a_password_change_at_once_never_deadlock() {
+        let auth = std::sync::Arc::new(Auth::new(hash_password("old password 1").unwrap()));
+        let Login::Ok(token) = auth.login(ip(1), "old password 1".into()).await.unwrap() else { panic!() };
+        for round in 0..5 {
+            let logins: Vec<_> = (0..2)
+                .map(|n| {
+                    let auth = auth.clone();
+                    tokio::spawn(async move { auth.login(ip(20 + n), "wrong".into()).await })
+                })
+                .collect();
+            // The change starts while the logins are checking (they hold both slots).
+            tokio::task::yield_now().await;
+            let change = {
+                let (auth, token) = (auth.clone(), token.clone());
+                let new = format!("new password {round:02}");
+                tokio::spawn(async move { auth.change_password(&token, "wrong guess".into(), new).await })
+            };
+            let all = async {
+                for login in logins {
+                    login.await.unwrap().unwrap();
+                }
+                let _ = change.await.unwrap();
+            };
+            tokio::time::timeout(Duration::from_secs(30), all).await.expect("logins and the change finished");
+        }
     }
 
     #[tokio::test]

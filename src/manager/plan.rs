@@ -268,7 +268,15 @@ pub struct Plan {
     /// Paces KCP/FEC-family writes by measured RTT instead of only the fixed send window
     /// (`fec.pacer`). Applies on both sides when set, since it is a symmetric setting.
     pub fec_pacer: bool,
+    /// The servers talk over IPv6 (the transport list's IPv6 entry): the dialing end connects
+    /// to the other server's IPv6 address and the listening end listens on IPv6 too.
+    pub ipv6: bool,
+    /// FEC-RAW tuned for low delay (`fec.profile: "gaming"`): what the gaming profile does on the
+    /// raw carriers, which cannot carry Game mode.
+    pub low_delay: bool,
     pub xhttp_mode: XhttpMode,
+    /// Parallax only: stream mode (v1) or packet mode. Both servers must use the same one.
+    pub parallax_mode: crate::parallax_carrier::Mode,
     pub cdn: Option<CdnPlan>,
     pub raw: Option<RawPlan>,
     pub tun: Option<TunPlan>,
@@ -278,6 +286,31 @@ pub struct Plan {
     pub speed: super::speed::SpeedMode,
     /// Wire format of the tunnel: 2 = probe resistance (new tunnels), 1 = 0.6.x and earlier.
     pub wire_version: u8,
+    /// Game mode: game UDP goes on the direct datagram path, in copies over several ports.
+    pub game: Option<GamePlan>,
+}
+
+/// Game mode: the users' UDP (port maps and SOCKS UDP) skips the tunnel's ordered stream and goes
+/// as authenticated datagrams, each sent `copies` times from different ports so the copies take
+/// different paths; the first copy to arrive is used. Both servers must have it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GamePlan {
+    /// TCP port of the authenticating control connection and UDP port of the datagrams (the Iran
+    /// server listens on it for both).
+    pub port: u16,
+    pub copies: u8,
+    /// How the foreign server reaches the Iran server for the control connection, when it does not
+    /// dial the tunnel itself (a direct tunnel).
+    pub iran_host: Option<String>,
+}
+
+/// Copies Game mode sends: in the live test 3 copies cut losses from up to 20% to 1-10% at the
+/// same ping, for three times the game's own (small) bandwidth.
+pub const GAME_COPIES: u8 = 3;
+
+/// The default Game mode port: the one after the tunnel port.
+pub fn game_port(tunnel_port: u16) -> u16 {
+    if tunnel_port == u16::MAX { tunnel_port - 1 } else { tunnel_port + 1 }
 }
 
 pub fn is_raw(transport: Transport) -> bool {
@@ -341,13 +374,17 @@ impl Plan {
             local_address: None,
             tcp_congestion: None,
             fec_pacer: false,
+            ipv6: false,
+            low_delay: false,
             xhttp_mode: XhttpMode::StreamUp,
+            parallax_mode: crate::parallax_carrier::Mode::Stream,
             cdn: None,
             raw: None,
             tun: None,
             tuned: Vec::new(),
             speed: super::speed::SpeedMode::Default,
             wire_version: crate::stealth::new_version(),
+            game: None,
         }
     }
 
@@ -363,6 +400,60 @@ impl Plan {
         match (self.side, self.direction) {
             (Side::Foreign, Direction::Reverse) | (Side::Iran, Direction::Direct) => true,
             (Side::Iran, Direction::Reverse) | (Side::Foreign, Direction::Direct) => false,
+        }
+    }
+
+    /// Whether users' UDP goes through this tunnel (what Game mode speeds up).
+    pub fn carries_udp(&self) -> bool {
+        match self.carry {
+            Carry::Socks => true,
+            // Only the Iran server knows which protocols its ports forward; the foreign server
+            // follows whatever arrives.
+            Carry::Ports => self.side == Side::Foreign || self.protocol != Protocol::Tcp,
+            _ => false,
+        }
+    }
+
+    /// Turns Game mode on with its defaults, or off. Also sets the fastest speed mode where the
+    /// carrier has one, since the game path's control and any game TCP still use the carrier.
+    /// Game mode, foreign end: the Iran server's IP for the control connection and the datagram
+    /// path. The carrier's address serves only when it is an IP (not a host name or, through a
+    /// CDN, the CDN's domain); otherwise `GamePlan::iran_host` must hold it.
+    pub fn game_iran_ip(&self) -> Option<String> {
+        let game = self.game.as_ref()?;
+        let carrier = (self.direction == Direction::Reverse && self.cdn.is_none())
+            .then(|| self.peer_host.clone())
+            .flatten();
+        [game.iran_host.clone(), carrier]
+            .into_iter()
+            .flatten()
+            .map(|host| host.trim_matches(['[', ']']).to_string())
+            .find(|host| host.parse::<std::net::IpAddr>().is_ok())
+    }
+
+    /// Game mode is on at the foreign end and the Iran server's IP is still missing.
+    pub fn game_needs_iran_ip(&self) -> bool {
+        self.game.is_some() && self.side == Side::Foreign && self.game_iran_ip().is_none()
+    }
+
+    /// The listening end of a new tunnel takes IPv4 and IPv6 on one socket (`[::]`), so either
+    /// family can reach it: a route that drops one may carry the other. Raw carriers and TUN
+    /// keep their own addressing.
+    pub fn listen_on_both_families(&mut self) {
+        if !self.dials() && self.listen_ip == "0.0.0.0" && !is_raw(self.transport) && self.tun.is_none() {
+            self.listen_ip = "::".into();
+        }
+    }
+
+    pub fn set_game(&mut self, on: bool) {
+        if on {
+            self.game = Some(GamePlan { port: game_port(self.tunnel_port), copies: GAME_COPIES, iran_host: None });
+            let packet = self.parallax_mode == crate::parallax_carrier::Mode::Packet;
+            if super::speed::applies(self.transport, packet) && self.speed == super::speed::SpeedMode::Default {
+                self.speed = super::speed::SpeedMode::Fast3;
+            }
+        } else {
+            self.game = None;
         }
     }
 
@@ -439,6 +530,7 @@ impl Plan {
         if dials && let Some(congestion) = &self.tcp_congestion {
             entry.insert("tcp_congestion".into(), json!(congestion));
         }
+        let mut fec = Map::new();
         if self.fec_pacer
             && matches!(
                 self.transport,
@@ -449,7 +541,18 @@ impl Plan {
                     | Transport::Mirage
             )
         {
-            entry.insert("fec".into(), json!({"pacer": true}));
+            fec.insert("pacer".into(), json!(true));
+        }
+        if self.low_delay && self.transport == Transport::FecRaw {
+            fec.insert("profile".into(), json!("gaming"));
+        }
+        if !fec.is_empty() {
+            entry.insert("fec".into(), Value::Object(fec));
+        }
+        if self.transport == Transport::Parallax
+            && self.parallax_mode == crate::parallax_carrier::Mode::Packet
+        {
+            entry.insert("parallax".into(), json!({"mode": "packet"}));
         }
         if is_xhttp(self.transport) {
             let mut xhttp = Map::new();
@@ -521,6 +624,32 @@ impl Plan {
             }
             root.insert("tun".into(), options);
         }
+        if let Some(game) = &self.game {
+            ensure!(self.carries_udp(), "Game mode needs UDP: forward UDP ports or use SOCKS5");
+            let (control, wildcard) = match mode {
+                Mode::Server => {
+                    // The foreign end sends to the Iran address it was given: when that is IPv6,
+                    // listen on IPv6 too, whatever family the carrier uses.
+                    let ipv6 = self.listen_ip.contains(':')
+                        || game.iran_host.as_deref().is_some_and(|host| host.trim_matches(['[', ']']).parse::<std::net::Ipv6Addr>().is_ok());
+                    let wildcard = if ipv6 { "[::]" } else { "0.0.0.0" };
+                    (format!("{wildcard}:{}", game.port), wildcard)
+                }
+                Mode::Client => {
+                    let host = self.game_iran_ip().context(
+                        "Game mode needs the Iran server's IP address (a host name or a CDN domain cannot carry its datagrams)",
+                    )?;
+                    // The game socket sends to the Iran server: the same address family.
+                    let wildcard = if host.contains(':') { "[::]" } else { "0.0.0.0" };
+                    (Self::host_port(&host, game.port), wildcard)
+                }
+            };
+            root.insert(
+                "gaming".into(),
+                json!({"control_address": control, "udp_bind": format!("{wildcard}:{}", game.port),
+                       "copies": game.copies}),
+            );
+        }
         let forwards = matches!(self.carry, Carry::Ports | Carry::Socks | Carry::TunPorts);
         match mode {
             Mode::Server => {
@@ -591,7 +720,7 @@ impl Profile {
         match self {
             Profile::General => "good speed for most links (recommended)",
             Profile::ManyUsers => "more connections and room for many users at once",
-            Profile::Gaming => "small queues and fast detection of a dead link",
+            Profile::Gaming => "Game mode: game UDP on its own fast path, in 3 copies; small queues (FEC-RAW: low-delay tuning)",
             Profile::Streaming => "the largest window for fast single downloads",
         }
     }
@@ -640,11 +769,27 @@ impl Plan {
     pub fn apply_profile(&mut self, profile: Profile) {
         let (pool, values) = profile.values();
         self.pool = pool;
-        let available = relevant_settings(
-            self.mode(),
-            self.transport,
-            self.direction == Direction::Direct,
+        // The gaming profile is the one-click choice for games: it also turns Game mode on.
+        // A foreign server of a direct tunnel does not know the Iran address the control connects
+        // to; there Customize offers Game mode and asks for it. Raw carriers keep their own path.
+        // The same goes for a foreign server that reaches the Iran server by a host name or a CDN.
+        let completes = self.side == Side::Iran
+            || (self.direction == Direction::Reverse
+                && self.cdn.is_none()
+                && self
+                    .peer_host
+                    .as_deref()
+                    .is_some_and(|host| host.trim_matches(['[', ']']).parse::<std::net::IpAddr>().is_ok()));
+        self.set_game(
+            profile == Profile::Gaming
+                && completes
+                && self.carries_udp()
+                && self.tun.is_none()
+                && !is_raw(self.transport),
         );
+        // On FEC-RAW the gaming profile is the low-delay KCP tuning instead.
+        self.low_delay = profile == Profile::Gaming && self.transport == Transport::FecRaw;
+        let available = super::scope::relevant(&super::scope::Scope::of_plan(self));
         for (name, value) in values {
             if let Some(setting) = available.iter().find(|s| s.name == *name) {
                 self.tuned.retain(|(s, _)| s.name != *name);
@@ -701,32 +846,6 @@ fn remove_dotted(target: &mut Value, dotted: &str) {
             None => return,
         }
     }
-}
-
-/// The tunables worth offering for one side and carrier.
-pub fn relevant_settings(mode: Mode, transport: Transport, server_dials: bool) -> Vec<Setting> {
-    let role = match mode {
-        Mode::Server => "server",
-        Mode::Client => "client",
-    };
-    crate::settings::all()
-        .into_iter()
-        .filter(|s| s.role == "both" || s.role == role)
-        .filter(|s| match s.name.split_once('.').map(|(group, _)| group) {
-            Some("kcp") => transport == Transport::Kcp,
-            Some("parallax") => transport == Transport::Parallax,
-            Some("fec") => matches!(
-                transport,
-                Transport::FecUdp | Transport::FecRaw | Transport::FecRawGaming | Transport::Mirage
-            ),
-            Some("xhttp") => is_xhttp(transport),
-            Some("tls_fragment") => transport.uses_tls(),
-            _ => true,
-        })
-        .filter(|s| s.name != "timeouts.server_dial_sec" || server_dials)
-        // The wizard asks for the pool directly.
-        .filter(|s| s.name != "connection_pool")
-        .collect()
 }
 
 /// Checks the produced configuration with the program's own validation.
@@ -867,8 +986,16 @@ pub fn check_name(name: &str) -> Result<()> {
             && !name.ends_with('-'),
         "use 1 to 32 lowercase letters, digits and dashes (not at the start or end)"
     );
+    // Tunnel services are `eztunnel-NAME.service`; these names belong to the management services.
+    ensure!(
+        !RESERVED_NAMES.contains(&name),
+        "{name} is the name of an EZTunnel management service; choose another name"
+    );
     Ok(())
 }
+
+/// Names a tunnel cannot have: `eztunnel-dashboard.service` and `eztunnel-agent.service` exist.
+pub const RESERVED_NAMES: [&str; 2] = ["dashboard", "agent"];
 
 /// Parses an IPv4 address that must belong to a real host.
 pub fn unicast_ipv4(text: &str) -> Result<Ipv4Addr> {
@@ -1016,7 +1143,7 @@ mod tests {
         ] {
             let mut plan = plan(Side::Iran, Direction::Reverse, Transport::Kcp, Carry::Ports);
             plan.speed = speed;
-            let setting = relevant_settings(Mode::Server, Transport::Kcp, false)
+            let setting = crate::manager::scope::relevant(&crate::manager::scope::Scope::new(Mode::Server, Transport::Kcp, false))
                 .into_iter()
                 .find(|s| s.name == "kcp.interval_ms")
                 .expect("kcp.interval_ms is a setting");
@@ -1049,7 +1176,7 @@ mod tests {
         }
         // Writing every offered setting explicitly at its default must always pass.
         let mut plan = plan(Side::Iran, Direction::Reverse, Transport::Kcp, Carry::Ports);
-        for setting in relevant_settings(Mode::Server, Transport::Kcp, false) {
+        for setting in crate::manager::scope::relevant(&crate::manager::scope::Scope::new(Mode::Server, Transport::Kcp, false)) {
             if let Some(value) = setting.default.as_u64() {
                 plan.tuned.push((setting, value));
             }
@@ -1130,6 +1257,18 @@ mod tests {
                         check(&plan.to_json().unwrap()).unwrap_or_else(|e| {
                             panic!("{profile:?} {transport:?} {side:?} {direction:?}: {e:#}")
                         });
+                        let expected = profile == Profile::Gaming
+                            && plan.carries_udp()
+                            && !is_raw(transport)
+                            && !(side == Side::Foreign && direction == Direction::Direct);
+                        assert_eq!(plan.to_json().unwrap().get("gaming").is_some(), expected,
+                            "Game mode for {profile:?} {transport:?} {side:?} {direction:?}");
+                        let config = plan.to_json().unwrap();
+                        let low_delay = ["listeners", "paths"].iter().any(|list| {
+                            config[*list][0]["fec"]["profile"].as_str() == Some("gaming")
+                        });
+                        assert_eq!(low_delay, profile == Profile::Gaming && transport == Transport::FecRaw,
+                            "low delay for {profile:?} {transport:?} {side:?} {direction:?}");
                     }
                 }
             }
@@ -1209,6 +1348,9 @@ mod tests {
     #[test]
     fn names_are_checked() {
         assert!(check_name("iran-1").is_ok());
+        for reserved in RESERVED_NAMES {
+            assert!(check_name(reserved).is_err(), "{reserved} is a management service");
+        }
         for bad in ["", "Iran", "a b", "-x", "x-", "a/b", &"x".repeat(33)] {
             assert!(check_name(bad).is_err(), "{bad}");
         }
@@ -1219,7 +1361,7 @@ mod tests {
         let mut json = plan(Side::Iran, Direction::Reverse, Transport::Kcp, Carry::Ports)
             .to_json()
             .unwrap();
-        let all = relevant_settings(Mode::Server, Transport::Kcp, false);
+        let all = crate::manager::scope::relevant(&crate::manager::scope::Scope::new(Mode::Server, Transport::Kcp, false));
         let mtu = all.iter().find(|s| s.name == "kcp.mtu").unwrap();
         assert_eq!(read_setting(&json, mtu), None);
         apply_setting(&mut json, mtu, Some(1200)).unwrap();
@@ -1228,7 +1370,7 @@ mod tests {
         apply_setting(&mut json, mtu, None).unwrap();
         assert_eq!(read_setting(&json, mtu), None);
         assert!(
-            relevant_settings(Mode::Server, Transport::Tcp, false)
+            crate::manager::scope::relevant(&crate::manager::scope::Scope::new(Mode::Server, Transport::Tcp, false))
                 .iter()
                 .all(|s| !s.name.starts_with("kcp."))
         );

@@ -70,13 +70,16 @@
     source = null;
   }
 
+  // Where the loaded lines end in the journal: following starts right after it.
+  let cursor = null;
   function start(target, place = server) {
     stop();
     if (destroyed || !following || !target) return;
-    const stream = new EventSource(followUrl(target, place));
+    const stream = new EventSource(followUrl(target, place, cursor));
     source = stream;
     stream.addEventListener("line", (event) => {
       if (source !== stream) return;
+      if (event.lastEventId) cursor = event.lastEventId;
       lines.push(event.data);
       if (lines.length > LIMIT) lines.splice(0, lines.length - LIMIT);
     });
@@ -97,6 +100,7 @@
       if (destroyed || signal.aborted || generation !== loadGeneration) return;
       if (status !== 200) throw new Error(String(status));
       lines = data.lines;
+      cursor = data.cursor ?? null;
       view = "ready";
       start(target, place);
     } catch {

@@ -77,6 +77,10 @@ pub struct Active {
     #[serde(flatten)]
     pub problem: Problem,
     pub since: u64,
+    /// The worst level it reached: its recovery is sent to whoever heard about that level, even
+    /// when it got better before it ended.
+    #[serde(default)]
+    pub worst: String,
 }
 
 /// What changed in one look.
@@ -99,6 +103,12 @@ pub struct Engine {
 impl Engine {
     /// Takes one look: `now` problems at time `at`.
     pub fn look(&mut self, now: Vec<Problem>, at: u64) -> Changes {
+        self.look_with(now, at, &[])
+    }
+
+    /// `look`, where the servers in `unseen` reported nothing this time (connected again, no
+    /// snapshot yet): their problems are unknown, not over.
+    pub fn look_with(&mut self, now: Vec<Problem>, at: u64, unseen: &[String]) -> Changes {
         let mut changes = Changes::default();
         let seen: HashMap<String, Problem> = now.into_iter().map(|p| (p.key.clone(), p)).collect();
         self.pending.retain(|key, _| seen.contains_key(key));
@@ -107,6 +117,9 @@ impl Engine {
                 // The level may change while it lasts (warn becomes bad); the alert stays one.
                 let escalated = active.problem.level != "bad" && problem.level == "bad";
                 active.problem.level = problem.level.clone();
+                if problem.level == "bad" {
+                    active.worst = "bad".into();
+                }
                 active.problem.value = problem.value;
                 if escalated {
                     changes.escalated.push(active.clone());
@@ -117,15 +130,31 @@ impl Engine {
             *looks += 1;
             if *looks >= CONFIRM_LOOKS {
                 self.pending.remove(key);
-                let active = Active { problem: problem.clone(), since: at };
+                let active = Active { problem: problem.clone(), since: at, worst: problem.level.clone() };
                 self.active.insert(key.clone(), active.clone());
                 changes.fired.push(active);
             }
         }
-        let gone: Vec<String> = self.active.keys().filter(|k| !seen.contains_key(*k)).cloned().collect();
+        // A server that is offline says nothing about its tunnels: their problems are not over,
+        // only unseen, and stay until the server reports again.
+        let unseen: std::collections::HashSet<&str> = seen
+            .values()
+            .filter(|p| p.kind == "offline")
+            .map(|p| p.server.as_str())
+            .chain(unseen.iter().map(String::as_str))
+            .collect();
+        let gone: Vec<String> = self
+            .active
+            .iter()
+            .filter(|(k, a)| !seen.contains_key(*k) && !(a.problem.kind != "offline" && unseen.contains(a.problem.server.as_str())))
+            .map(|(k, _)| k.clone())
+            .collect();
         for key in gone {
-            if let Some(active) = self.active.remove(&key) {
+            if let Some(mut active) = self.active.remove(&key) {
                 let lasted = at.saturating_sub(active.since);
+                if active.worst == "bad" {
+                    active.problem.level = "bad".into();
+                }
                 changes.cleared.push((active, lasted));
             }
         }
@@ -366,6 +395,51 @@ pub fn metrics(servers: &[(String, String, Value)], active: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An agent that disconnects does not resolve its tunnels' problems; they end only when the
+    /// server reports again without them.
+    #[test]
+    fn an_offline_server_keeps_its_tunnel_problems() {
+        let mut engine = Engine::default();
+        let failed = Problem::new("a1", "nl", "failed", "game", "bad", None);
+        for at in [0, 30, 60] {
+            engine.look(vec![failed.clone()], at);
+        }
+        assert_eq!(engine.active().len(), 1);
+        let offline = Problem::new("a1", "nl", "offline", "", "bad", None);
+        let changed = engine.look(vec![offline.clone()], 90);
+        assert!(changed.cleared.is_empty(), "nothing was resolved");
+        // Back online, still failed: no new alert either.
+        let changed = engine.look(vec![failed.clone()], 120);
+        assert!(changed.cleared.iter().all(|(a, _)| a.problem.kind == "offline") && changed.fired.is_empty());
+        // Connected again but no report yet: still not resolved.
+        engine.look(vec![offline.clone()], 125);
+        let changed = engine.look_with(vec![], 130, &["a1".to_string()]);
+        assert!(changed.cleared.iter().all(|(a, _)| a.problem.kind != "failed"), "unknown is not fixed");
+        // Back online and fixed: now it is resolved.
+        let changed = engine.look(vec![], 150);
+        assert!(changed.cleared.iter().any(|(a, _)| a.problem.kind == "failed"));
+    }
+
+    /// bad -> warn -> clear: the recovery of an alert that was bad is sent at the bad level.
+    #[test]
+    fn a_recovery_is_sent_to_whoever_heard_the_bad_level() {
+        let mut engine = Engine::default();
+        let bad = Problem::new("local", "server", "disk", "", "bad", Some(98.0));
+        for at in [0, 30, 60] {
+            engine.look(vec![bad.clone()], at);
+        }
+        let warn = Problem::new("local", "server", "disk", "", "warn", Some(94.0));
+        engine.look(vec![warn], 90);
+        let changed = engine.look(vec![], 120);
+        assert_eq!(changed.cleared.len(), 1);
+        assert_eq!(changed.cleared[0].0.problem.level, "bad");
+        let mut prefs = Prefs::default();
+        prefs.telegram.enabled = true;
+        prefs.telegram.level = "bad".into();
+        prefs.telegram.resolved = true;
+        assert!(wanted(&prefs, &changed.cleared[0].0.problem, true));
+    }
 
     #[test]
     fn an_active_warning_escalates_once_without_resetting_its_age() {

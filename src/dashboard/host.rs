@@ -6,6 +6,10 @@ use std::time::Instant;
 pub struct Host {
     pub hostname: String,
     pub address: Option<String>,
+    /// The server's stable global IPv6 address, when it has one: a second path to it (a route
+    /// that blocks IPv4 may carry IPv6). Read again with every sample (it can change).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address6: Option<String>,
     pub os: Option<String>,
     pub kernel: Option<String>,
     pub cores: usize,
@@ -41,6 +45,7 @@ fn read(path: &str) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
+
 impl HostSampler {
     pub fn sample(&mut self) -> Host {
         let facts = self
@@ -60,6 +65,7 @@ impl HostSampler {
         Host {
             hostname: hostname(),
             address: facts.address,
+            address6: crate::manager::local_ip6().map(|ip| ip.to_string()),
             os: facts.os,
             kernel: facts.kernel,
             cores: facts.cores,
@@ -199,6 +205,7 @@ fn disk() -> Option<(f64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
 
     #[test]
     fn cpu_counters_leave_out_idle_and_iowait() {

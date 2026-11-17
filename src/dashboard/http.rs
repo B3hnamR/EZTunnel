@@ -285,7 +285,8 @@ async fn login(State(state): State<Arc<AppState>>, request: Request) -> Response
             (StatusCode::UNAUTHORIZED, Json(json!({"error": "wrong_password"}))).into_response()
         }
         Ok(auth::Login::Wait(seconds)) => {
-            state.audit.record(Some(ip), "login_refused", &format!("locked for {seconds} s"));
+            // Refusals cost nothing to send; one line per address and minute is enough.
+            state.audit.record_repeated(Some(ip), "login_refused", &format!("locked for {seconds} s"));
             let mut response = (
                 StatusCode::TOO_MANY_REQUESTS,
                 Json(json!({"error": "locked", "retry_after": seconds})),
@@ -555,6 +556,22 @@ async fn activity(
     }
 }
 
+/// Where a followed log continues: the browser's `Last-Event-ID` after a reconnect, else the
+/// cursor the log's tail ended at (`?after=`).
+#[derive(Deserialize)]
+struct FollowQuery {
+    after: Option<String>,
+}
+
+fn resume_cursor(headers: &HeaderMap, query: FollowQuery) -> Option<String> {
+    headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or(query.after)
+        .filter(|c| ops::cursor_ok(c))
+}
+
 #[derive(Deserialize)]
 struct LogsQuery {
     #[serde(default = "default_lines")]
@@ -581,14 +598,19 @@ async fn logs(
     let ops = state.ops.clone();
     let lines = query.lines.min(ops::MAX_LINES);
     match tokio::task::spawn_blocking(move || ops.logs(&name, lines)).await {
-        Ok(Ok(lines)) => Json(json!({"lines": lines})).into_response(),
+        Ok(Ok(tail)) => Json(tail).into_response(),
         _ => error(StatusCode::INTERNAL_SERVER_ERROR, "failed"),
     }
 }
 
 /// A tunnel's log as it is written, one event per line. Ends when the browser goes away, the
 /// session ends or the log does.
-async fn follow(State(state): State<Arc<AppState>>, Path(name): Path<String>, headers: HeaderMap) -> Response {
+async fn follow(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<FollowQuery>,
+) -> Response {
     let Some(token) = state.token(&headers).filter(|t| state.auth.check(t)) else {
         return unauthorized();
     };
@@ -598,35 +620,10 @@ async fn follow(State(state): State<Arc<AppState>>, Path(name): Path<String>, he
     let Ok(permit) = state.followers.clone().try_acquire_owned() else {
         return error(StatusCode::TOO_MANY_REQUESTS, "too_many");
     };
-    let Ok(log) = state.ops.follow(&name) else {
+    let Ok(log) = state.ops.follow(&name, resume_cursor(&headers, query)) else {
         return error(StatusCode::INTERNAL_SERVER_ERROR, "failed");
     };
-    let stream = futures_util::stream::unfold(
-        (log, state, token, permit),
-        |(mut log, state, token, permit)| async move {
-            loop {
-                tokio::select! {
-                    line = log.next_line() => {
-                        let line = line?;
-                        if !state.auth.check(&token) {
-                            return None;
-                        }
-                        let event = Event::default().event("line").data(line.replace(['\r', '\n'], " "));
-                        return Some((Ok::<_, Infallible>(event), (log, state, token, permit)));
-                    }
-                    // A quiet log still ends with the session.
-                    _ = tokio::time::sleep(Duration::from_secs(15)) => {
-                        if !state.auth.check(&token) {
-                            return None;
-                        }
-                    }
-                }
-            }
-        },
-    );
-    Sse::new(stream)
-        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
-        .into_response()
+    sse_lines(state, token, permit, LineSource::Local(log))
 }
 
 /// The script a join command runs (not secret: the code is given to it on the command line).
@@ -648,9 +645,11 @@ fn join_command(public: &(String, u16), cert: Option<&super::tls::Swap>, code: &
     let pin = cert
         .and_then(|swap| swap.current().cert.first().cloned())
         .and_then(|leaf| super::tls::public_key_pin(&leaf).ok());
+    // The script runs only when it arrived whole: a failed download stops the command with
+    // curl's error instead of running nothing and reporting success.
     match pin {
-        Some(pin) => format!("bash <(curl -fsSLk --pinnedpubkey 'sha256//{pin}' https://{host}:{port}/join.sh) {code}"),
-        None => format!("bash <(curl -fsSL http://{host}:{port}/join.sh) {code}"),
+        Some(pin) => format!("s=$(curl -fsSLk --pinnedpubkey 'sha256//{pin}' https://{host}:{port}/join.sh) && bash -c \"$s\" join.sh {code}"),
+        None => format!("s=$(curl -fsSL http://{host}:{port}/join.sh) && bash -c \"$s\" join.sh {code}"),
     }
 }
 
@@ -1156,7 +1155,20 @@ fn current_problems(state: &AppState) -> Vec<super::alerts::Problem> {
 pub(super) async fn alert_look(state: &Arc<AppState>) {
     let now = super::now();
     let problems = current_problems(state);
-    let changes = state.alerts.lock().unwrap().look(problems, now);
+    // Connected, but no snapshot since: nothing is known about its tunnels yet.
+    let unseen: Vec<String> = state
+        .fleet
+        .as_ref()
+        .map(|fleet| {
+            fleet
+                .servers()
+                .into_iter()
+                .filter(|s| s["online"] == true && s["snapshot"].is_null())
+                .filter_map(|s| s["id"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let changes = state.alerts.lock().unwrap().look_with(problems, now, &unseen);
     if changes.fired.is_empty() && changes.escalated.is_empty() && changes.cleared.is_empty() {
         return;
     }
@@ -1515,13 +1527,14 @@ pub(super) async fn backup_all(state: &Arc<AppState>) -> Vec<Value> {
     if let Some(fleet) = &state.fleet {
         servers.extend(fleet.servers().iter().filter(|s| s["online"] == true).filter_map(|s| s["id"].as_str().map(str::to_string)));
     }
-    let mut results = Vec::new();
-    for server in servers {
+    // All at once: the whole backup takes as long as the slowest server, not the sum of all of
+    // them, and fits in the time the page waits.
+    futures_util::future::join_all(servers.into_iter().map(|server| async move {
         let answer = run_on(state, &server, json!({"op": "server", "tool": "export"}), ACTION_TIMEOUT).await;
         let result = answer.and_then(|answer| save_export(&backups_dir(state), &server, &answer));
-        results.push(result.unwrap_or_else(|failure| json!({"server": server, "error": format!("{failure:#}")})));
-    }
-    results
+        result.unwrap_or_else(|failure| json!({"server": server, "error": format!("{failure:#}")}))
+    }))
+    .await
 }
 
 fn save_export(dir: &std::path::Path, server: &str, answer: &Value) -> Result<Value> {
@@ -1636,11 +1649,22 @@ struct CheckRun {
     iran: String,
     foreign: String,
     started: u64,
+    /// The job on both servers; stops name it, so they never end another check.
+    id: String,
     /// The demo has no second server; only this one answers.
     pretend: bool,
 }
 
 static CHECK: std::sync::Mutex<Option<CheckRun>> = std::sync::Mutex::new(None);
+
+/// How long a check or test whose server stopped answering still counts as running: its
+/// servers end it by themselves well before that.
+const UNANSWERED_HOLD: u64 = 3 * 3600;
+
+/// After a failed start: whether every end that may have started was told to stop.
+fn stop_note(stopped: bool) -> &'static str {
+    if stopped { "" } else { " (it may have started anyway and could not be told to stop; use Stop)" }
+}
 static CHECK_START: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn check_on(state: &Arc<AppState>, server: &str, check: Value) -> Result<Value> {
@@ -1672,26 +1696,38 @@ async fn conntest_start_owned(State(state): State<Arc<AppState>>, request: Reque
     }
     let current = CHECK.lock().unwrap().clone();
     if let Some(run) = current {
-        // A check that ended on the starting server no longer blocks a new one.
-        if let Ok(answer) = check_on(&state, &run.iran, json!({"action": "status"})).await
-            && answer["state"] == "running"
-        {
-            return failed(StatusCode::CONFLICT, "a transport check is already running".into());
+        // A check that ended on the starting server no longer blocks a new one; one whose server
+        // does not answer may still be running and is not forgotten.
+        match check_on(&state, &run.iran, json!({"action": "status"})).await {
+            Ok(answer) if answer["state"] == "running" => {
+                return failed(StatusCode::CONFLICT, "a transport check is already running".into());
+            }
+            Err(_) if super::now().saturating_sub(run.started) < UNANSWERED_HOLD => {
+                return failed(StatusCode::CONFLICT, "the server of the last check does not answer, so it may still be running; try again once it answers".into());
+            }
+            _ => {}
         }
     }
     let code = match super::conntest::make_code(&form).and_then(|c| crate::checker::code::encode(&c)) {
         Ok(code) => code,
         Err(problem) => return failed(StatusCode::BAD_REQUEST, format!("{problem:#}")),
     };
+    let id = super::conntest::job_id(&code);
     state.audit.record(ip, "action", &format!("transport check between {iran} and {foreign}"));
+    // Recorded before anything is sent: a start whose answer is lost may still run, and must stay
+    // visible to the status and the Stop button.
+    *CHECK.lock().unwrap() = Some(CheckRun { iran: iran.clone(), foreign: foreign.clone(), started: super::now(), pretend, id: id.clone() });
+    // Stops name this check: one already running there (from before a restart) is left alone.
+    let stop = json!({"action": "stop", "id": id});
     if let Err(problem) = check_on(&state, &iran, json!({"action": "start", "code": code})).await {
-        return failed(StatusCode::BAD_GATEWAY, format!("Iran server: {problem:#}"));
+        let stopped = check_on(&state, &iran, stop.clone()).await.is_ok();
+        return failed(StatusCode::BAD_GATEWAY, format!("Iran server: {problem:#}{}", stop_note(stopped)));
     }
     if !pretend && let Err(problem) = check_on(&state, &foreign, json!({"action": "join", "code": code})).await {
-        let _ = check_on(&state, &iran, json!({"action": "stop"})).await;
-        return failed(StatusCode::BAD_GATEWAY, format!("foreign server: {problem:#}"));
+        let foreign_stopped = check_on(&state, &foreign, stop.clone()).await.is_ok();
+        let iran_stopped = check_on(&state, &iran, stop.clone()).await.is_ok();
+        return failed(StatusCode::BAD_GATEWAY, format!("foreign server: {problem:#}{}", stop_note(foreign_stopped && iran_stopped)));
     }
-    *CHECK.lock().unwrap() = Some(CheckRun { iran, foreign, started: super::now(), pretend });
     Json(json!({"ok": true})).into_response()
 }
 
@@ -1720,9 +1756,16 @@ async fn conntest_stop(State(state): State<Arc<AppState>>, request: Request) -> 
         return Json(json!({"ok": true})).into_response();
     };
     state.audit.record(ip, "action", "stop the transport check");
-    let _ = check_on(&state, &run.iran, json!({"action": "stop"})).await;
-    if !run.pretend {
-        let _ = check_on(&state, &run.foreign, json!({"action": "stop"})).await;
+    let stop = json!({"action": "stop", "id": run.id});
+    let mut unreached = Vec::new();
+    if let Err(problem) = check_on(&state, &run.iran, stop.clone()).await {
+        unreached.push(format!("Iran server: {problem:#}"));
+    }
+    if !run.pretend && let Err(problem) = check_on(&state, &run.foreign, stop).await {
+        unreached.push(format!("foreign server: {problem:#}"));
+    }
+    if !unreached.is_empty() {
+        return failed_with(StatusCode::BAD_GATEWAY, format!("the stop did not reach every server ({})", unreached.join("; ")));
     }
     Json(json!({"ok": true})).into_response()
 }
@@ -1758,25 +1801,34 @@ async fn mirage_start_owned(State(state): State<Arc<AppState>>, request: Request
         return failed_with(StatusCode::BAD_REQUEST, "the two ends must be on different servers");
     }
     let current = MIRAGE.lock().unwrap().clone();
-    if let Some(run) = current
-        && let Ok(answer) = spoof_on(&state, &run.iran, json!({"action": "status"})).await
-        && answer["state"] == "running"
-    {
-        return failed_with(StatusCode::CONFLICT, "a Mirage source test is already running");
+    if let Some(run) = current {
+        match spoof_on(&state, &run.iran, json!({"action": "status"})).await {
+            Ok(answer) if answer["state"] == "running" => {
+                return failed_with(StatusCode::CONFLICT, "a Mirage source test is already running");
+            }
+            Err(_) if super::now().saturating_sub(run.started) < UNANSWERED_HOLD => {
+                return failed_with(StatusCode::CONFLICT, "the server of the last test does not answer, so it may still be running; try again once it answers");
+            }
+            _ => {}
+        }
     }
-    let text = match super::spoofcheck::invitation(&form).and_then(|i| i.encode()) {
-        Ok(text) => text,
+    let (text, id) = match super::spoofcheck::invitation(&form).and_then(|i| Ok((i.encode()?, i.session.clone()))) {
+        Ok(made) => made,
         Err(problem) => return failed_with(StatusCode::BAD_REQUEST, format!("{problem:#}")),
     };
     state.audit.record(ip, "action", &format!("Mirage source test between {iran} and {foreign}"));
+    // Recorded before anything is sent, as for the transport check.
+    *MIRAGE.lock().unwrap() = Some(CheckRun { iran: iran.clone(), foreign: foreign.clone(), started: super::now(), pretend, id: id.clone() });
+    let stop = json!({"action": "stop", "id": id});
     if let Err(problem) = spoof_on(&state, &iran, json!({"action": "host", "invitation": text})).await {
-        return failed_with(StatusCode::BAD_GATEWAY, format!("Iran server: {problem:#}"));
+        let stopped = spoof_on(&state, &iran, stop.clone()).await.is_ok();
+        return failed_with(StatusCode::BAD_GATEWAY, format!("Iran server: {problem:#}{}", stop_note(stopped)));
     }
     if !pretend && let Err(problem) = spoof_on(&state, &foreign, json!({"action": "join", "invitation": text})).await {
-        let _ = spoof_on(&state, &iran, json!({"action": "stop"})).await;
-        return failed_with(StatusCode::BAD_GATEWAY, format!("foreign server: {problem:#}"));
+        let foreign_stopped = spoof_on(&state, &foreign, stop.clone()).await.is_ok();
+        let iran_stopped = spoof_on(&state, &iran, stop.clone()).await.is_ok();
+        return failed_with(StatusCode::BAD_GATEWAY, format!("foreign server: {problem:#}{}", stop_note(foreign_stopped && iran_stopped)));
     }
-    *MIRAGE.lock().unwrap() = Some(CheckRun { iran, foreign, started: super::now(), pretend });
     Json(json!({"ok": true})).into_response()
 }
 
@@ -1784,8 +1836,10 @@ async fn mirage_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -
     if !state.signed_in(&headers) {
         return unauthorized();
     }
+    // The packet types the test accepts, so the page never offers one it refuses.
+    let profiles = json!(crate::spoof_session::TEST_PROFILES);
     let Some(run) = MIRAGE.lock().unwrap().clone() else {
-        return Json(json!({"state": "idle"})).into_response();
+        return Json(json!({"state": "idle", "profiles": profiles})).into_response();
     };
     let mut answer = spoof_on(&state, &run.iran, json!({"action": "status"})).await.unwrap_or_else(|e| json!({"state": "unknown", "error": format!("{e:#}")}));
     // Rows toward the Iran server are measured there; rows toward the foreign one, abroad.
@@ -1804,6 +1858,7 @@ async fn mirage_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -
     answer["iran"] = json!(run.iran);
     answer["foreign"] = json!(run.foreign);
     answer["started"] = json!(run.started);
+    answer["profiles"] = profiles;
     Json(answer).into_response()
 }
 
@@ -1816,9 +1871,16 @@ async fn mirage_stop(State(state): State<Arc<AppState>>, request: Request) -> Re
         return Json(json!({"ok": true})).into_response();
     };
     state.audit.record(client_ip(&request), "action", "stop the Mirage source test");
-    let _ = spoof_on(&state, &run.iran, json!({"action": "stop"})).await;
-    if !run.pretend {
-        let _ = spoof_on(&state, &run.foreign, json!({"action": "stop"})).await;
+    let stop = json!({"action": "stop", "id": run.id});
+    let mut unreached = Vec::new();
+    if let Err(problem) = spoof_on(&state, &run.iran, stop.clone()).await {
+        unreached.push(format!("Iran server: {problem:#}"));
+    }
+    if !run.pretend && let Err(problem) = spoof_on(&state, &run.foreign, stop).await {
+        unreached.push(format!("foreign server: {problem:#}"));
+    }
+    if !unreached.is_empty() {
+        return failed_with(StatusCode::BAD_GATEWAY, format!("the stop did not reach every server ({})", unreached.join("; ")));
     }
     Json(json!({"ok": true})).into_response()
 }
@@ -1872,6 +1934,11 @@ async fn pathfinder(State(state): State<Arc<AppState>>, request: Request) -> Res
     let (Ok(iran_ip), Ok(foreign_ip)) = (parse("iran_ip"), parse("foreign_ip")) else {
         return failed_with(StatusCode::BAD_REQUEST, "both addresses must be IP addresses");
     };
+    // The IPv6 addresses, when both servers have one: the direct path is tried over IPv6 too.
+    let ipv6 = match (parse("iran_ip6"), parse("foreign_ip6")) {
+        (Ok(a), Ok(b)) if a.is_ipv6() && b.is_ipv6() && a != b => Some((a, b)),
+        _ => None,
+    };
     let online = online_servers(&state);
     let pretend = state.fleet.is_none();
     let foreign = if foreign_id.is_empty() { String::new() } else if pretend { "local".into() } else { server_of(&state, foreign_id.clone()) };
@@ -1902,6 +1969,12 @@ async fn pathfinder(State(state): State<Arc<AppState>>, request: Request) -> Res
         out.insert("from_foreign".into(), path(foreign.clone(), json!({"step": "probe", "host": iran_ip.to_string(), "ports": [BACK]})).await);
         path(iran.clone(), json!({"step": "echo", "port": BACK, "secs": 30})).await;
         out.insert("foreign_to_iran".into(), path(foreign.clone(), json!({"step": "echo_check", "target": SocketAddr::new(iran_ip, BACK).to_string()})).await);
+        // The same two directions over IPv6: a route that drops one family may carry the other.
+        // The echo listeners take both families.
+        if let Some((iran6, foreign6)) = ipv6 {
+            out.insert("iran_to_foreign_v6".into(), path(iran.clone(), json!({"step": "echo_check", "target": SocketAddr::new(foreign6, ECHO).to_string()})).await);
+            out.insert("foreign_to_iran_v6".into(), path(foreign.clone(), json!({"step": "echo_check", "target": SocketAddr::new(iran6, BACK).to_string()})).await);
+        }
     }
     // Every other server as a relay: Iran → relay → foreign.
     let check = if foreign_online { "echo_check" } else { "banner_check" };
@@ -1911,6 +1984,10 @@ async fn pathfinder(State(state): State<Arc<AppState>>, request: Request) -> Res
             relays.push(json!({"server": id, "name": name, "ok": false, "error": "its address is unknown"}));
             continue;
         };
+        // The destination's echo lives two minutes; a long scan renews it for every relay.
+        if foreign_online {
+            path(foreign.clone(), json!({"step": "echo", "port": ECHO, "secs": 110})).await;
+        }
         let forward = path(id.clone(), json!({"step": "forward", "port": RELAY, "target": target.to_string(), "secs": 30})).await;
         if forward.get("error").is_some() {
             relays.push(json!({"server": id, "name": name, "address": address, "ok": false, "error": forward["error"]}));
@@ -1918,6 +1995,13 @@ async fn pathfinder(State(state): State<Arc<AppState>>, request: Request) -> Res
         }
         let through = path(iran.clone(), json!({"step": check, "target": SocketAddr::new(relay_ip, RELAY).to_string()})).await;
         relays.push(json!({"server": id, "name": name, "address": address, "ok": through["ok"], "ms": through["ms"], "error": through["error"]}));
+        // This relay is done: its forwarder goes now, not when its time runs out.
+        path(id.clone(), json!({"step": "close", "port": RELAY})).await;
+    }
+    // Nothing of this scan stays open.
+    if foreign_online {
+        path(foreign.clone(), json!({"step": "close", "port": ECHO})).await;
+        path(iran.clone(), json!({"step": "close", "port": BACK})).await;
     }
     out.insert("relays".into(), json!(relays));
     out.insert("foreign_asked".into(), json!(foreign_online));
@@ -1971,7 +2055,18 @@ async fn ssh_add(State(state): State<Arc<AppState>>, request: Request) -> Respon
     let command = join_command(&state.public, state.cert.as_deref(), &code);
     let dir = state.state_dir.clone();
     match tokio::task::spawn_blocking(move || super::sshadd::run_join(&dir, &host, port, &user, &command)).await {
-        Ok(Ok(output)) => Json(json!({"ok": true, "output": output})).into_response(),
+        Ok(Ok(output)) => {
+            // The command finished; the server has joined only once it used the code here.
+            for _ in 0..40 {
+                if fleet.code_used(&code) {
+                    return Json(json!({"ok": true, "output": output})).into_response();
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            let failure = format!("the command finished but the server did not join this dashboard: {output}");
+            state.audit.record(ip, "action_failed", &format!("add server over SSH: {failure}"));
+            failed_with(StatusCode::BAD_GATEWAY, failure)
+        }
         Ok(Err(failure)) => {
             state.audit.record(ip, "action_failed", &format!("add server over SSH: {failure:#}"));
             failed_with(StatusCode::BAD_GATEWAY, format!("{failure:#}"))
@@ -1989,9 +2084,20 @@ async fn new_tunnel_options(State(state): State<Arc<AppState>>, headers: HeaderM
         .iter()
         .map(|word| {
             let transport: crate::config::Transport = serde_json::from_value(json!(word)).expect("listed transport");
-            json!({"name": word, "port": crate::manager::plan::default_tunnel_port(transport), "udp": crate::manager::plan::uses_udp(transport)})
+            json!({"name": word, "port": crate::manager::plan::default_tunnel_port(transport), "udp": crate::manager::plan::uses_udp(transport),
+                   "options": super::wizard::options_of(transport)})
         })
         .collect();
+    // GAME first among the special entries: FEC-UDP with Game mode switched on.
+    let mut transports = transports;
+    // IPv6: any of these transports between the servers' IPv6 addresses.
+    let mut over_ipv6: Vec<&str> = super::wizard::TRANSPORTS.to_vec();
+    over_ipv6.push("game");
+    transports.push(json!({"name": "ipv6", "ipv6": true, "transports": over_ipv6,
+        "port": crate::manager::plan::default_tunnel_port(crate::config::Transport::Tcp), "udp": false,
+        "options": super::wizard::options_of(crate::config::Transport::Tcp)}));
+    transports.push(json!({"name": "game", "port": crate::manager::plan::default_tunnel_port(crate::config::Transport::FecUdp),
+        "udp": true, "game": true, "options": super::wizard::options_of(crate::config::Transport::FecUdp)}));
     Json(json!({"transports": transports})).into_response()
 }
 
@@ -2056,7 +2162,7 @@ async fn new_tunnel_owned(State(state): State<Arc<AppState>>, request: Request) 
         crate::manager::plan::Side::Iran => ((&iran_at, &built.iran, "iran"), (&foreign_at, &built.foreign, "foreign")),
         crate::manager::plan::Side::Foreign => ((&foreign_at, &built.foreign, "foreign"), (&iran_at, &built.iran, "iran")),
     };
-    let mut created: Vec<&str> = Vec::new();
+    let mut created: Vec<(&str, &str)> = Vec::new();
     let mut report = serde_json::Map::new();
     let mut problem: Option<String> = None;
     for (at, config, side) in [first, second] {
@@ -2065,10 +2171,18 @@ async fn new_tunnel_owned(State(state): State<Arc<AppState>>, request: Request) 
             report.insert(side.into(), json!({"server": at, "came_up": true}));
             continue;
         }
+        // Counted before it is sent: a create whose answer is lost (a timeout) may still have
+        // happened on that server, and must be cleaned up like one that answered. A refusal
+        // before anything was written (a name taken meanwhile) leaves nothing of ours there.
+        created.push((at, side));
         let outcome = run_on_held(&state, at, json!({"op": "create", "name": name, "config": config}), ACTION_TIMEOUT, Some(busy.clone())).await;
+        if let Err(failure) = &outcome
+            && format!("{failure:#}").contains(ops::UNCHANGED)
+        {
+            created.pop();
+        }
         match outcome {
             Ok(outcome) => {
-                created.push(at);
                 report.insert(side.into(), json!({"server": at, "came_up": outcome["came_up"]}));
                 if outcome["came_up"] == false {
                     problem = Some(format!(
@@ -2085,9 +2199,40 @@ async fn new_tunnel_owned(State(state): State<Arc<AppState>>, request: Request) 
             }
         }
     }
-    if let Some(problem) = problem {
-        for at in created.iter().rev() {
-            let _ = run_on_held(&state, at, json!({"op": "delete", "name": name}), ACTION_TIMEOUT, Some(busy.clone())).await;
+    if let Some(mut problem) = problem {
+        let mut left = Vec::new();
+        for (at, side) in created.iter().rev() {
+            // Only the tunnel this create made (its key), never one of the same name made by
+            // someone else meanwhile.
+            let key = if *side == "iran" { &built.iran["tunnel_key"] } else { &built.foreign["tunnel_key"] };
+            match run_on_held(&state, at, json!({"op": "delete", "name": name, "expect_key": key}), ACTION_TIMEOUT, Some(busy.clone())).await {
+                Ok(_) => {}
+                // The create never got there, or the tunnel there is not ours: nothing to clean up.
+                Err(failure) if format!("{failure:#}").contains("no tunnel named") || format!("{failure:#}").contains(ops::UNCHANGED) => {}
+                Err(failure) => {
+                    left.push(format!("{at}: {failure:#}"));
+                    // A create whose answer was lost may still be running there (holding the
+                    // tunnel's lock) and finish later: keep trying to remove what it made.
+                    let (state, at, name, key) = (state.clone(), at.to_string(), name.clone(), key.clone());
+                    tokio::spawn(async move {
+                        for _ in 0..30 {
+                            tokio::time::sleep(Duration::from_secs(10)).await;
+                            match run_on(&state, &at, json!({"op": "delete", "name": name, "expect_key": key}), ACTION_TIMEOUT).await {
+                                Ok(_) => {
+                                    state.audit.record(None, "action", &format!("removed the half-made tunnel {name} on {at}"));
+                                    return;
+                                }
+                                Err(failure) if format!("{failure:#}").contains("no tunnel named") || format!("{failure:#}").contains(ops::UNCHANGED) => return,
+                                Err(_) => {}
+                            }
+                        }
+                        state.audit.record(None, "action_failed", &format!("the half-made tunnel {name} on {at} could not be removed; delete it by hand"));
+                    });
+                }
+            }
+        }
+        if !left.is_empty() {
+            problem = format!("{problem}. The half-made tunnel {name} could not be removed everywhere yet; the dashboard keeps trying for five minutes, then delete it by hand ({})", left.join("; "));
         }
         drop(busy);
         state.live.refresh();
@@ -2208,10 +2353,12 @@ async fn server_logs(
     let lines = query.lines.min(ops::MAX_LINES);
     let Some(fleet) = state.fleet.clone() else {
         let ops = ops::DemoOps::new(&[&name]);
-        return Json(json!({"lines": ops.logs(&name, lines).unwrap_or_default()})).into_response();
+        return Json(ops.logs(&name, lines).unwrap_or_default()).into_response();
     };
     match fleet.request(&id, json!({"op": "logs", "name": name, "lines": lines}), Duration::from_secs(20)).await {
-        Ok(lines) => Json(json!({"lines": lines})).into_response(),
+        // An agent from before the cursor sends the lines alone.
+        Ok(lines) if lines.is_array() => Json(json!({"lines": lines})).into_response(),
+        Ok(tail) => Json(tail).into_response(),
         Err(failure) => (StatusCode::BAD_GATEWAY, Json(json!({"error": "failed", "detail": format!("{failure:#}")}))).into_response(),
     }
 }
@@ -2221,7 +2368,9 @@ async fn server_follow(
     State(state): State<Arc<AppState>>,
     Path((id, name)): Path<(String, String)>,
     headers: HeaderMap,
+    Query(query): Query<FollowQuery>,
 ) -> Response {
+    let after = resume_cursor(&headers, query);
     let Some(token) = state.token(&headers).filter(|t| state.auth.check(t)) else {
         return unauthorized();
     };
@@ -2230,12 +2379,12 @@ async fn server_follow(
     };
     let Some(fleet) = state.fleet.clone() else {
         // The demo follows its own sample lines.
-        let Ok(log) = ops::DemoOps::new(&[&name]).follow(&name) else {
+        let Ok(log) = ops::DemoOps::new(&[&name]).follow(&name, None) else {
             return error(StatusCode::NOT_FOUND, "unknown_tunnel");
         };
         return sse_lines(state, token, permit, LineSource::Local(log));
     };
-    match fleet.follow(&id, &name).await {
+    match fleet.follow(&id, &name, after).await {
         Ok(follow) => sse_lines(state, token, permit, LineSource::Remote(follow)),
         Err(failure) => (StatusCode::BAD_GATEWAY, Json(json!({"error": "failed", "detail": format!("{failure:#}")}))).into_response(),
     }
@@ -2247,7 +2396,7 @@ enum LineSource {
 }
 
 impl LineSource {
-    async fn next_line(&mut self) -> Option<String> {
+    async fn next_line(&mut self) -> Option<(String, Option<String>)> {
         match self {
             LineSource::Local(log) => log.next_line().await,
             LineSource::Remote(follow) => follow.lines.recv().await,
@@ -2263,11 +2412,15 @@ fn sse_lines(state: Arc<AppState>, token: String, permit: tokio::sync::OwnedSema
             loop {
                 tokio::select! {
                     line = source.next_line() => {
-                        let line = line?;
+                        let (line, cursor) = line?;
                         if !state.auth.check(&token) {
                             return None;
                         }
-                        let event = Event::default().event("line").data(line.replace(['\r', '\n'], " "));
+                        let mut event = Event::default().event("line").data(line.replace(['\r', '\n'], " "));
+                        // The browser sends it back as Last-Event-ID when it reconnects.
+                        if let Some(cursor) = cursor {
+                            event = event.id(cursor);
+                        }
                         return Some((Ok::<_, Infallible>(event), (source, state, token, permit)));
                     }
                     _ = tokio::time::sleep(Duration::from_secs(15)) => {
@@ -2758,12 +2911,12 @@ mod tests {
         let script = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(script.starts_with("#!/usr/bin/env bash") && script.contains("agent join"));
         assert!(script.contains("--prefix"), "tries the release before installing it");
-        assert!(join_command(&state.public, None, "ezj1-x").starts_with("bash <(curl -fsSL http://203.0.113.10:38471/join.sh)"));
+        assert!(join_command(&state.public, None, "ezj1-x").starts_with("s=$(curl -fsSL http://203.0.113.10:38471/join.sh) && bash -c \"$s\" join.sh ezj1-x"));
         let dir = tempfile::tempdir().unwrap();
         let swap = super::super::tls::Swap::self_signed(dir.path(), "203.0.113.10").unwrap();
         let command = join_command(&("2001:db8::1".into(), 443), Some(&swap), "ezj1-x");
         assert!(command.contains("--pinnedpubkey 'sha256//"), "{command}");
-        assert!(command.contains("https://[2001:db8::1]:443/join.sh) ezj1-x"), "{command}");
+        assert!(command.contains("https://[2001:db8::1]:443/join.sh) && bash -c \"$s\" join.sh ezj1-x"), "{command}");
     }
 
     #[tokio::test]

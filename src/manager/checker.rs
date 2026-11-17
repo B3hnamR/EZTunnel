@@ -169,10 +169,33 @@ fn start(store: &Store) -> Result<()> {
             Side::Iran => (own, other),
             Side::Foreign => (other, own),
         };
-        let options = choose_options(iran_ip, foreign_ip)?.ok_or(ui::Back)?;
+        let options = choose_options(store, iran_ip, foreign_ip)?.ok_or(ui::Back)?;
         Ok((me, iran_ip, foreign_ip, options))
     })?;
-    let code = CheckCode::new(me, iran_ip, foreign_ip, options)?;
+    let mut code = CheckCode::new(me, iran_ip, foreign_ip, options)?;
+    // This server has IPv6: the check can also run every case over IPv6 (a route that drops one
+    // family may carry the other).
+    if let Some(own6) = super::local_ip6() {
+        ui::note(&format!("This server also has the IPv6 address {own6}."));
+        let other6 = ui::ask(
+            &format!("IPv6 address of the {} (empty: check IPv4 only)", side_label(me.other()).to_lowercase()),
+            Some(""),
+            |text: &String| {
+                if text.trim().is_empty() || text.trim().trim_matches(['[', ']']).parse::<std::net::Ipv6Addr>().is_ok() {
+                    Ok(())
+                } else {
+                    Err("enter an IPv6 address, or nothing".into())
+                }
+            },
+        )?;
+        if let Ok(other6) = other6.trim().trim_matches(['[', ']']).parse::<std::net::Ipv6Addr>() {
+            let (iran6, foreign6) = match me {
+                Side::Iran => (IpAddr::V6(own6), IpAddr::V6(other6)),
+                Side::Foreign => (IpAddr::V6(other6), IpAddr::V6(own6)),
+            };
+            code = code.with_ipv6(iran6, foreign6)?;
+        }
+    }
     if !bridge(code.ip(me), code.ip(me.other()), code.options.control_port)? {
         return Ok(());
     }
@@ -258,8 +281,119 @@ fn bridge(own: IpAddr, other: IpAddr, control: u16) -> Result<bool> {
     Ok(true)
 }
 
-/// Preset, priority and (for Custom) every option; then a summary to confirm.
-fn choose_options(iran_ip: IpAddr, foreign_ip: IpAddr) -> Result<Option<Options>> {
+/// Find or tune; then preset, priority and (for Custom) every option; then a summary to confirm.
+fn choose_options(store: &Store, iran_ip: IpAddr, foreign_ip: IpAddr) -> Result<Option<Options>> {
+    let modes = [checker::Mode::Find, checker::Mode::Tune];
+    let items: Vec<String> = modes
+        .iter()
+        .map(|mode| format!("{}  {}", ui::bold(&format!("{:<16}", mode.label())), ui::dim(mode.description())))
+        .collect();
+    let Some(mode) = choose_or_back("What do you want to do?", &items, 0)? else {
+        return Ok(None);
+    };
+    if modes[mode] == checker::Mode::Tune {
+        let suggested = last_best(store, iran_ip, foreign_ip);
+        return choose_tune(iran_ip, foreign_ip, suggested);
+    }
+    choose_find(iran_ip, foreign_ip)
+}
+
+/// The best transports of the newest find check between these two servers, if there is one.
+fn last_best(store: &Store, iran_ip: IpAddr, foreign_ip: IpAddr) -> Vec<Transport> {
+    for path in list_reports(&reports_dir(store)) {
+        let Some(report) = std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Report>(&bytes).ok())
+        else {
+            continue;
+        };
+        if report.options.mode == checker::Mode::Find
+            && report.iran_ip == iran_ip.to_string()
+            && report.foreign_ip == foreign_ip.to_string()
+        {
+            return checker::best_transports(&report.cases, report.options.priority, checker::TUNE_BEST);
+        }
+    }
+    Vec::new()
+}
+
+/// What tuning a transport tries, for the picker: "browser TLS, TLS fragment, congestion".
+fn tune_options_text(transport: Transport) -> String {
+    let probe = Options { mode: checker::Mode::Tune, ..Options::default() };
+    let labels: Vec<&str> = probe
+        .variants(transport)
+        .into_iter()
+        .filter(|v| *v != checker::Variant::Plain)
+        .map(checker::Variant::label)
+        .collect();
+    if labels.is_empty() {
+        "directions only".into()
+    } else {
+        format!("default, {}", labels.join(", "))
+    }
+}
+
+/// A tune check: which transports (the best ones of the last find check preselected), how deep and
+/// what matters most; then the summary.
+fn choose_tune(iran_ip: IpAddr, foreign_ip: IpAddr, suggested: Vec<Transport>) -> Result<Option<Options>> {
+    if suggested.is_empty() {
+        ui::note("Pick the transports that worked in a find check. Each one is checked with every option it has.");
+    } else {
+        ui::note("Preselected: the best transports of the last find check between these two servers.");
+    }
+    let listed: Vec<Transport> = CHECKABLE.to_vec();
+    let items: Vec<String> = listed
+        .iter()
+        .map(|t| {
+            let name = super::plan::transport_name(*t);
+            match unavailable(*t, iran_ip, foreign_ip) {
+                Some(reason) => format!("{name:<16}{}", ui::dim(&format!("not available: {reason}"))),
+                None => format!("{name:<16}{}", ui::dim(&tune_options_text(*t))),
+            }
+        })
+        .collect();
+    let defaults: Vec<bool> = listed.iter().map(|t| suggested.contains(t)).collect();
+    let transports = loop {
+        let Some(chosen) = multi("Transports to tune", &items, &defaults)? else {
+            return Ok(None);
+        };
+        let transports: Vec<Transport> = chosen
+            .into_iter()
+            .map(|i| listed[i])
+            .filter(|t| unavailable(*t, iran_ip, foreign_ip).is_none())
+            .collect();
+        if transports.is_empty() {
+            ui::warn("Choose at least one transport that can run here.");
+            continue;
+        }
+        break transports;
+    };
+    let presets = [Preset::Quick, Preset::Standard, Preset::Thorough];
+    let items: Vec<String> = presets
+        .iter()
+        .map(|preset| {
+            let options = Options::tune(*preset, transports.clone());
+            format!(
+                "{}  {}  {}",
+                ui::bold(&format!("{:<9}", preset.label())),
+                ui::dim(&format!("{:<52}", preset.description())),
+                ui::dim(&format!("{} cases · {}", options.cases().len(), about(options.estimate_seconds())))
+            )
+        })
+        .collect();
+    let Some(depth) = choose_or_back("How deep", &items, 1)? else {
+        return Ok(None);
+    };
+    let mut options = Options::tune(presets[depth], transports);
+    let Some(priority) = choose_priority()? else {
+        return Ok(None);
+    };
+    options.priority = priority;
+    confirm_options(options, iran_ip, foreign_ip)
+}
+
+/// A find check: preset, priority and (for Custom) every option; then the summary.
+fn choose_find(iran_ip: IpAddr, foreign_ip: IpAddr) -> Result<Option<Options>> {
     let presets = [Preset::Quick, Preset::Standard, Preset::Thorough];
     let mut items: Vec<String> = presets
         .iter()
@@ -280,7 +414,7 @@ fn choose_options(iran_ip: IpAddr, foreign_ip: IpAddr) -> Result<Option<Options>
     ));
     // This is a pure form: the caller can replay answers to reopen the previous
     // page without restarting listeners or losing draft answers.
-    let mut options = {
+    let options = {
         let Some(choice) = choose_or_back("What to check", &items, 1)? else {
             return Ok(None);
         };
@@ -298,6 +432,11 @@ fn choose_options(iran_ip: IpAddr, foreign_ip: IpAddr) -> Result<Option<Options>
         }
         options
     };
+    confirm_options(options, iran_ip, foreign_ip)
+}
+
+/// The summary, with a way into every option, until the check starts or the operator goes back.
+fn confirm_options(mut options: Options, iran_ip: IpAddr, foreign_ip: IpAddr) -> Result<Option<Options>> {
     loop {
         if let Err(error) = options.validate() {
             ui::fail(&format!("{error:#}"));
@@ -336,10 +475,10 @@ fn choose_priority() -> Result<Option<Priority>> {
     Ok(choose_or_back("What matters most in the results?", &items, 0)?.map(|i| Priority::ALL[i]))
 }
 
-/// The raw transports (fec-raw, fec-raw-gaming, raw TUN) are checked too when they can run here
+/// The raw transports (fec-raw, raw TUN) are checked too when they can run here
 /// (root and IPv4 addresses).
 fn with_raw(mut options: Options, iran_ip: IpAddr, foreign_ip: IpAddr) -> Options {
-    for transport in [Transport::FecRaw, Transport::FecRawGaming, Transport::Tun] {
+    for transport in [Transport::FecRaw, Transport::Tun] {
         if unavailable(transport, iran_ip, foreign_ip).is_none()
             && !options.transports.contains(&transport)
         {
@@ -555,79 +694,84 @@ fn custom_into(options: &mut Options, iran_ip: IpAddr, foreign_ip: IpAddr) -> Re
         .into_iter()
         .map(|i| if i == 0 { Side::Foreign } else { Side::Iran })
         .collect();
-    // Measurements
-    let items = vec![
-        format!(
-            "Ping              {}",
-            ui::dim("short requests through the tunnel")
-        ),
-        format!("Download speed    {}", ui::dim("foreign → Iran")),
-        format!("Upload speed      {}", ui::dim("Iran → foreign")),
-        format!("4 downloads       {}", ui::dim("four streams at once")),
-        format!(
-            "Stability hold    {}",
-            ui::dim("a ping every 2 s for a while")
-        ),
-        format!(
-            "Baseline and MTU  {}",
-            ui::dim("plain TCP/UDP and the largest packet, once")
-        ),
-        format!(
-            "Repeat failures   {}",
-            ui::dim("a failed case runs once more")
-        ),
-        format!(
-            "Browser TLS       {}",
-            ui::dim("also check TLS transports with a browser-like fingerprint")
-        ),
-        format!(
-            "TLS fragment      {}",
-            ui::dim("also check TLS transports with a split ClientHello")
-        ),
-        format!(
-            "UDP loss and delay {}",
-            ui::dim("small UDP packets through the tunnel, idle and during the download")
-        ),
-        format!(
-            "TCP congestion A/B {}",
-            ui::dim("also check TCP-based transports with tcp_congestion set to cubic")
-        ),
-        format!(
-            "Adaptive pacer     {}",
-            ui::dim("also check fec-udp/fec-raw(-gaming) with the delay-based pacer on")
-        ),
-        format!(
-            "TUN fragmentation  {}",
-            ui::dim("also check raw TUN with packet splitting on and a too-big MTU")
-        ),
+    // Measurements, then the extra variants that apply to the chosen transports only.
+    let chosen_has = |pick: fn(Transport) -> bool| options.transports.iter().any(|t| pick(*t));
+    let any_tls = chosen_has(|t| t.uses_tls());
+    let any_tcp = chosen_has(|t| {
+        !crate::manager::plan::is_raw(t) && !crate::manager::plan::uses_udp(t)
+    });
+    let any_fec = chosen_has(|t| {
+        matches!(t, Transport::FecUdp | Transport::FecRaw | Transport::FecRawGaming)
+    });
+    let any_tun = options.transports.contains(&Transport::Tun);
+    let any_parallax = options.transports.contains(&Transport::Parallax);
+    #[derive(Clone, Copy, PartialEq)]
+    enum Pick {
+        Ping,
+        Download,
+        Upload,
+        Parallel,
+        Hold,
+        Mtu,
+        Repeat,
+        Udp,
+        BrowserTls,
+        TlsFragment,
+        Congestion,
+        Pacer,
+        TunFragment,
+        ParallaxPacket,
+        Game,
+    }
+    let mut rows: Vec<(Pick, String, bool)> = vec![
+        (Pick::Ping, format!("Ping              {}", ui::dim("short requests through the tunnel")), options.pings > 0),
+        (Pick::Download, format!("Download speed    {}", ui::dim("foreign → Iran")), options.download),
+        (Pick::Upload, format!("Upload speed      {}", ui::dim("Iran → foreign")), options.upload),
+        (Pick::Parallel, format!("4 downloads       {}", ui::dim("four streams at once")), options.parallel),
+        (Pick::Hold, format!("Stability hold    {}", ui::dim("a ping every 2 s for a while")), options.hold_sec > 0),
+        (Pick::Mtu, format!("Baseline and MTU  {}", ui::dim("plain TCP/UDP and the largest packet, once")), options.mtu),
+        (Pick::Repeat, format!("Repeat failures   {}", ui::dim("a failed case runs once more")), options.repeat_failed),
+        (Pick::Udp, format!("UDP loss and delay {}", ui::dim("small UDP packets through the tunnel, idle and during the download")), options.udp),
     ];
-    let defaults = [
-        options.pings > 0,
-        options.download,
-        options.upload,
-        options.parallel,
-        options.hold_sec > 0,
-        options.mtu,
-        options.repeat_failed,
-        options.browser_tls,
-        options.tls_fragment,
-        options.udp,
-        options.also_congestion,
-        options.also_pacer,
-        options.also_fragment,
-    ];
+    let find = options.mode == checker::Mode::Find;
+    if find && any_tls {
+        rows.push((Pick::BrowserTls, format!("Browser TLS       {}", ui::dim("also check TLS transports with a browser-like fingerprint")), options.browser_tls));
+        rows.push((Pick::TlsFragment, format!("TLS fragment      {}", ui::dim("also check TLS transports with a split ClientHello")), options.tls_fragment));
+    }
+    if find && any_tcp {
+        rows.push((Pick::Congestion, format!("TCP congestion A/B {}", ui::dim("also check TCP-based transports with tcp_congestion set to cubic")), options.also_congestion));
+    }
+    if find && any_fec {
+        rows.push((Pick::Pacer, format!("Adaptive pacer     {}", ui::dim("also check fec-udp/fec-raw(-gaming) with the delay-based pacer on")), options.also_pacer));
+    }
+    if find && any_tun {
+        rows.push((Pick::TunFragment, format!("TUN fragmentation  {}", ui::dim("also check raw TUN with packet splitting on and a too-big MTU")), options.also_fragment));
+    }
+    let any_game = chosen_has(|t| !crate::manager::plan::is_raw(t));
+    if find && any_game {
+        rows.push((Pick::Game, format!("Game mode          {}", ui::dim("also check with Game mode: game UDP as datagram copies")), options.also_game));
+    }
+    if find && any_parallax {
+        rows.push((Pick::ParallaxPacket, format!("Parallax packet mode {}", ui::dim("also check Parallax with lanes and error correction")), options.parallax_packet));
+    }
+    let items: Vec<String> = rows.iter().map(|(_, label, _)| label.clone()).collect();
+    let defaults: Vec<bool> = rows.iter().map(|(_, _, on)| *on).collect();
     let Some(chosen) = multi("Measurements", &items, &defaults)? else {
         return Ok(false);
     };
-    let has = |i: usize| chosen.contains(&i);
-    options.pings = if has(0) {
+    let has = |pick: Pick| {
+        rows.iter()
+            .position(|(p, _, _)| *p == pick)
+            .is_some_and(|i| chosen.contains(&i))
+    };
+    options.pings = if has(Pick::Ping) {
         ask_number("Pings per case", u64::from(options.pings.max(1)), 1..=100)? as u32
     } else {
         0
     };
-    options.download = has(1);
-    options.upload = has(2);
-    options.parallel = has(3);
+    options.download = has(Pick::Download);
+    options.upload = has(Pick::Upload);
+    options.parallel = has(Pick::Parallel);
     if options.download || options.upload || options.parallel {
         options.speed_sec = ask_number(
             "Seconds per speed test",
@@ -635,7 +779,7 @@ fn custom_into(options: &mut Options, iran_ip: IpAddr, foreign_ip: IpAddr) -> Re
             1..=60,
         )? as u32;
     }
-    options.hold_sec = if has(4) {
+    options.hold_sec = if has(Pick::Hold) {
         ask_number(
             "Seconds of stability hold per case",
             u64::from(if options.hold_sec == 0 {
@@ -648,14 +792,22 @@ fn custom_into(options: &mut Options, iran_ip: IpAddr, foreign_ip: IpAddr) -> Re
     } else {
         0
     };
-    options.mtu = has(5);
-    options.repeat_failed = has(6);
-    options.browser_tls = has(7);
-    options.tls_fragment = has(8);
-    options.udp = has(9);
-    options.also_congestion = has(10);
-    options.also_pacer = has(11);
-    options.also_fragment = has(12);
+    options.mtu = has(Pick::Mtu);
+    options.repeat_failed = has(Pick::Repeat);
+    options.udp = has(Pick::Udp);
+    if find {
+        // A variant whose transports are not chosen is off, not silently kept.
+        options.browser_tls = has(Pick::BrowserTls);
+        options.tls_fragment = has(Pick::TlsFragment);
+        options.also_congestion = has(Pick::Congestion);
+        options.also_pacer = has(Pick::Pacer);
+        options.also_fragment = has(Pick::TunFragment);
+        options.parallax_packet = !any_parallax || has(Pick::ParallaxPacket);
+        options.also_game = has(Pick::Game);
+    } else {
+        ui::note("A tune check runs every option each transport has; rounds repeat every case so one noisy run does not decide.");
+        options.rounds = ask_number("Rounds of every case", u64::from(options.rounds), 1..=3)? as u8;
+    }
     // Ports and thresholds
     ui::note("Some filters block by port: enter the port you plan to use, or 0 for the default.");
     options.tls_port = ask_number(
@@ -740,6 +892,11 @@ fn summary(options: &Options) {
     ui::boxed(
         "Transport check",
         &[
+            format!(
+                "Check         {}{}",
+                options.mode.label(),
+                if options.rounds > 1 { format!(" · {} rounds of every case", options.rounds) } else { String::new() }
+            ),
             format!("Transports    {}", names.join(", ")),
             format!("Directions    {}", directions.join(", ")),
             format!("Measurements  {}", measures.join(", ")),
@@ -1193,6 +1350,9 @@ fn results(store: &Store, report: &Report, me: Side, saved: Option<&PathBuf>) ->
             eprintln!();
             ui::note(checker::REACHABLE_NOTE);
         }
+        if report.options.mode == checker::Mode::Tune {
+            return tune_results(store, report, me, saved);
+        }
         let ranked = checker::rank(&report.cases, report.options.priority);
         eprintln!();
         if ranked.is_empty() {
@@ -1275,6 +1435,16 @@ fn results(store: &Store, report: &Report, me: Side, saved: Option<&PathBuf>) ->
         if rerun {
             actions.push("Check the failed transports again (new code)".into());
         }
+        let best = checker::best_transports(&report.cases, report.options.priority, checker::TUNE_BEST);
+        let tune_row = (!best.is_empty()).then(|| {
+            let names: Vec<String> = best.iter().map(|t| super::plan::transport_name(*t)).collect();
+            actions.push(format!(
+                "Tune the best {}: {} with every option (new code)",
+                best.len(),
+                names.join(", ")
+            ));
+            actions.len() - 1
+        });
         actions.push(ui::dim("← Back"));
         let Some(choice) = ui::choose("Next", &actions, 0)? else {
             return Ok(());
@@ -1284,20 +1454,124 @@ fn results(store: &Store, report: &Report, me: Side, saved: Option<&PathBuf>) ->
             create_from(store, report, me, ranked[choice])?;
             return Ok(());
         }
+        if Some(choice) == tune_row {
+            let mut options = report.options.clone();
+            options.mode = checker::Mode::Tune;
+            options.rounds = checker::TUNE_ROUNDS;
+            options.transports = best;
+            options.repeat_failed = false;
+            return new_check(store, report, me, options);
+        }
         if rerun && choice == tunnels {
             let mut options = report.options.clone();
             options.transports.retain(|t| failed.contains(t));
             options.repeat_failed = true;
-            let iran_ip = report.iran_ip.parse()?;
-            let foreign_ip = report.foreign_ip.parse()?;
-            let code = CheckCode::new(me, iran_ip, foreign_ip, options)?;
-            summary(&code.options);
-            eprintln!();
-            eprintln!("{}", ui::accent(&code::encode(&code)?));
-            eprintln!();
-            ui::note("Join this new check on the other server.");
-            return watch(store, code, me);
+            return new_check(store, report, me, options);
         }
+    }
+    Ok(())
+}
+
+/// Starts a follow-up check between the same two servers and shows its code for the other one.
+fn new_check(store: &Store, report: &Report, me: Side, options: Options) -> Result<()> {
+    let iran_ip = report.iran_ip.parse()?;
+    let foreign_ip = report.foreign_ip.parse()?;
+    let code = CheckCode::new(me, iran_ip, foreign_ip, options)?;
+    summary(&code.options);
+    eprintln!();
+    eprintln!("{}", ui::accent(&code::encode(&code)?));
+    eprintln!();
+    ui::note("Join this new check on the other server.");
+    watch(store, code, me)
+}
+
+/// The end of a tune check: every transport with its options best first, averaged over the
+/// rounds, and a tunnel one step away for the best option of each.
+fn tune_results(store: &Store, report: &Report, me: Side, saved: Option<&PathBuf>) -> Result<()> {
+    let groups = checker::tune_summary(&report.cases, report.options.priority);
+    eprintln!();
+    if groups.iter().all(|g| g.rows[0].usable == 0) {
+        ui::warn("No option of these transports carried data between these servers.");
+    } else {
+        eprintln!(
+            "  {}",
+            style(format!(
+                "Best option per transport ({}, {} rounds each)",
+                report.options.priority.label().to_lowercase(),
+                report.options.rounds
+            ))
+            .bold()
+        );
+        eprintln!(
+            "   {}",
+            style(format!(
+                "  {:<16} {:<9} {:>7} {:>16} {:>9} {:>9}",
+                "option", "dials", "works", "↓ / ↑ Mbit/s", "ping ms", "UDP loss"
+            ))
+            .dim()
+        );
+        for group in &groups {
+            eprintln!("   {}", style(group.name()).cyan().bold());
+            for (index, row) in group.rows.iter().enumerate() {
+                let speed = row.speed_text();
+                let line = format!(
+                    "{} {:<16} {:<9} {:>7} {:>16} {:>9} {:>9}",
+                    if index == 0 && row.usable > 0 { "★" } else { " " },
+                    row.option_label(),
+                    row.dialer.map_or("both", Side::label),
+                    format!("{}/{}", row.usable, row.rounds),
+                    speed,
+                    checker::fmt_ms(row.ping_ms),
+                    row.udp_loss.map_or("-".into(), |v| format!("{v:.0} %"))
+                );
+                let styled = if row.usable == 0 {
+                    style(line).red().to_string()
+                } else if index == 0 {
+                    style(line).green().to_string()
+                } else {
+                    line
+                };
+                eprintln!("     {styled}");
+            }
+        }
+    }
+    if let Some(path) = saved {
+        eprintln!();
+        ui::note(&format!(
+            "Saved: {} (and .txt). Tools → Transport checker → Past checks.",
+            path.display()
+        ));
+    }
+    let winners: Vec<&CaseResult> = groups
+        .iter()
+        .filter_map(|g| g.rows.first())
+        .filter_map(|row| row.case_id)
+        .filter_map(|id| report.cases.iter().find(|c| c.spec.id == id))
+        .take(3)
+        .collect();
+    let mut actions: Vec<String> = winners
+        .iter()
+        .map(|c| {
+            let option = match c.spec.variant {
+                checker::Variant::Plain => "default settings".to_string(),
+                variant => variant.label().to_string(),
+            };
+            let mut name = c.spec;
+            name.variant = checker::Variant::Plain;
+            name.round = 0;
+            format!(
+                "Create a tunnel with {} · {option} · {} dials",
+                name.transport_name(),
+                c.spec.dialer_label()
+            )
+        })
+        .collect();
+    actions.push(ui::dim("← Back"));
+    let Some(choice) = ui::choose("Next", &actions, 0)? else {
+        return Ok(());
+    };
+    if let Some(case) = winners.get(choice) {
+        create_from(store, report, me, case)?;
     }
     Ok(())
 }
@@ -1311,9 +1585,12 @@ fn create_from(store: &Store, report: &Report, me: Side, case: &CaseResult) -> R
         Some(Side::Iran) => Direction::Direct,
         _ => Direction::Reverse,
     };
-    let other = match me {
-        Side::Iran => &report.foreign_ip,
-        Side::Foreign => &report.iran_ip,
+    // An IPv6 case makes an IPv6 tunnel, on the other server's IPv6 address.
+    let other = match (me, case.spec.ipv6) {
+        (Side::Iran, false) => &report.foreign_ip,
+        (Side::Foreign, false) => &report.iran_ip,
+        (Side::Iran, true) => report.foreign_ip6.as_ref().unwrap_or(&report.foreign_ip),
+        (Side::Foreign, true) => report.iran_ip6.as_ref().unwrap_or(&report.iran_ip),
     };
     ui::note("Create the tunnel here; the pairing code at the end sets up the other server.");
     wizard::new_tunnel_with(
@@ -1324,6 +1601,7 @@ fn create_from(store: &Store, report: &Report, me: Side, case: &CaseResult) -> R
             transport: case.spec.transport,
             port: case.port,
             peer_host: Some(other.clone()),
+            ipv6: case.spec.ipv6,
             tested:Some(case.spec),
         }),
     )?;

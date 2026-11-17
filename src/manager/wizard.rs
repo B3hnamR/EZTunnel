@@ -19,6 +19,32 @@ fn step(number: usize, title: &str) {
     );
 }
 
+/// The transport list's entry for games: FEC-UDP with Game mode on (see `plan::GamePlan`).
+const GAME_LABEL: &str =
+    "GAME       built for games: FEC-UDP plus Game mode, game UDP as datagram copies over several ports";
+
+/// Whether a row of the transport list is the GAME entry.
+fn is_game_row(label: &str) -> bool {
+    label == GAME_LABEL
+}
+
+/// The transport list's IPv6 entry: any transport between the servers' IPv6 addresses, for a
+/// route that blocks or filters IPv4. It asks which transport next.
+const IPV6_LABEL: &str =
+    "IPv6       any transport over IPv6; for routes that block IPv4 (both servers need IPv6)";
+
+fn is_ipv6_row(label: &str) -> bool {
+    label == IPV6_LABEL
+}
+
+/// What can run over IPv6: every transport of the list except the raw ones (IPv4 by design).
+fn ipv6_transports() -> Vec<(Transport, &'static str)> {
+    transports()
+        .into_iter()
+        .filter(|(transport, label)| !is_ipv6_row(label) && !is_raw(*transport) && *transport != Transport::Tun)
+        .collect()
+}
+
 /// Transports offered, with a short explanation of each.
 fn transports() -> Vec<(Transport, &'static str)> {
     vec![
@@ -55,18 +81,18 @@ fn transports() -> Vec<(Transport, &'static str)> {
             Transport::FecUdp,
             "FEC-UDP    UDP with error correction; very lossy links",
         ),
-        (Transport::Tcp6, "TCP6       TCP between IPv6 addresses"),
+        (Transport::Tcp, IPV6_LABEL),
         (
             Transport::FecRaw,
             "FEC-RAW    raw IP packets with error correction (advanced)",
         ),
         (
-            Transport::FecRawGaming,
-            "FEC-RAW-G  the same tuned for low delay (advanced)",
-        ),
-        (
             Transport::Tun,
             "RAW-TUN    raw IP packets for a TUN tunnel (advanced)",
+        ),
+        (
+            Transport::FecUdp,
+            GAME_LABEL,
         ),
         (
             Transport::Parallax,
@@ -80,6 +106,9 @@ fn transports() -> Vec<(Transport, &'static str)> {
 }
 
 fn transport_label(transport: Transport, label: &str) -> String {
+    if is_game_row(label) {
+        return console::style(label).for_stderr().green().bold().to_string();
+    }
     match transport {
         Transport::Parallax => ui::accent(label),
         Transport::Mirage => console::style(label)
@@ -89,6 +118,33 @@ fn transport_label(transport: Transport, label: &str) -> String {
             .to_string(),
         _ => label.to_string(),
     }
+}
+
+#[cfg(test)]
+#[test]
+fn ipv6_replaces_tcp6_and_offers_every_non_raw_transport() {
+    let list = transports();
+    assert_eq!(list.iter().filter(|(_, label)| is_ipv6_row(label)).count(), 1);
+    assert!(!list.iter().any(|(t, _)| *t == Transport::Tcp6), "TCP6 is not offered any more");
+    let over = ipv6_transports();
+    assert!(over.iter().all(|(t, label)| !is_raw(*t) && *t != Transport::Tun && !is_ipv6_row(label)));
+    for wanted in [Transport::Tcp, Transport::Wss, Transport::Kcp, Transport::FecUdp, Transport::Parallax] {
+        assert!(over.iter().any(|(t, _)| *t == wanted), "{wanted:?} over IPv6");
+    }
+    assert!(over.iter().any(|(_, label)| is_game_row(label)), "GAME over IPv6 too");
+}
+
+#[cfg(test)]
+#[test]
+fn the_game_entry_is_fec_udp_and_listed_once() {
+    let list = transports();
+    let games: Vec<_> = list.iter().filter(|(_, label)| is_game_row(label)).collect();
+    assert_eq!(games.len(), 1);
+    assert_eq!(games[0].0, Transport::FecUdp);
+    // The plain FEC-UDP entry is still there and is not the game one.
+    assert!(list.iter().any(|(t, label)| *t == Transport::FecUdp && !is_game_row(label)));
+    // FEC-RAW with the gaming profile replaces the old low-delay raw entry.
+    assert!(!list.iter().any(|(t, _)| *t == Transport::FecRawGaming));
 }
 
 #[cfg(test)]
@@ -115,6 +171,8 @@ pub struct Prefill {
     pub port: Option<u16>,
     /// The other server's address; offered as the default.
     pub peer_host: Option<String>,
+    /// The check's case ran over IPv6.
+    pub ipv6: bool,
     pub tested:Option<crate::checker::CaseSpec>,
 }
 
@@ -128,6 +186,9 @@ pub fn new_tunnel_with(store: &Store, prefill: Option<Prefill>) -> Result<Option
     let mut prefill = prefill;
     let mut previous = None;
     loop {
+        // The GAME entry of the transport list (a transport check's prefill is never it).
+        let mut chosen_game = false;
+        let mut chosen_ipv6 = prefill.as_ref().is_some_and(|p| p.ipv6);
         ui::banner("New tunnel");
         let (side, direction, transport) = match &prefill {
             Some(prefill) => {
@@ -143,7 +204,11 @@ pub fn new_tunnel_with(store: &Store, prefill: Option<Prefill>) -> Result<Option
                 (prefill.side, prefill.direction, prefill.transport)
             }
             None => match first_questions(store, previous)? {
-                First::Answers(side, direction, transport) => (side, direction, transport),
+                First::Answers(side, direction, transport, game, ipv6) => {
+                    chosen_game = game;
+                    chosen_ipv6 = ipv6;
+                    (side, direction, transport)
+                }
                 First::Pairing(result) => return Ok(result),
                 First::Cancelled => return Ok(None),
             },
@@ -151,7 +216,7 @@ pub fn new_tunnel_with(store: &Store, prefill: Option<Prefill>) -> Result<Option
         if prefill.is_some() && transport == Transport::Mirage && !super::mirage::consent()? {
             return Ok(None);
         }
-        match finish_wizard(store, side, direction, transport, prefill.clone()) {
+        match finish_wizard(store, side, direction, transport, prefill.clone(), chosen_game, chosen_ipv6) {
             Err(error) if ui::is_back(&error) => {
                 previous = Some((side, direction, transport));
                 prefill = None;
@@ -163,7 +228,8 @@ pub fn new_tunnel_with(store: &Store, prefill: Option<Prefill>) -> Result<Option
 }
 
 enum First {
-    Answers(Side, Direction, Transport),
+    /// The last values: the GAME entry was chosen; the servers talk over IPv6.
+    Answers(Side, Direction, Transport, bool, bool),
     Pairing(Option<String>),
     Cancelled,
 }
@@ -274,7 +340,25 @@ fn first_questions(store: &Store, previous: Option<(Side, Direction, Transport)>
             continue;
         };
         chosen_transport = choice;
+        if is_ipv6_row(list[choice].1) {
+            // Only where this server has IPv6; the other server needs it too.
+            let Some(own) = super::local_ip6() else {
+                ui::warn("This server has no IPv6 address (a stable global one), so it cannot use the IPv6 entry.");
+                ui::pause();
+                continue;
+            };
+            ui::ok(&format!("This server's IPv6 address · {own}"));
+            ui::note("The other server needs an IPv6 address too. Choose the transport to run over IPv6.");
+            let carriers = ipv6_transports();
+            let labels: Vec<String> = carriers.iter().map(|(transport, label)| transport_label(*transport, label)).collect();
+            let Some(pick) = ui::choose("Transport over IPv6", &labels, 0)? else {
+                continue;
+            };
+            let (transport, label) = carriers[pick];
+            return Ok(First::Answers(side, direction, transport, is_game_row(label), true));
+        }
         let transport = list[choice].0;
+        let game = is_game_row(list[choice].1);
         if transport == Transport::Mirage && !super::mirage::consent()? {
             continue;
         }
@@ -291,7 +375,7 @@ fn first_questions(store: &Store, previous: Option<(Side, Direction, Transport)>
             );
             ui::warn("They need root rights and the real IPv4 address of each server.");
         }
-        return Ok(First::Answers(side, direction, transport));
+        return Ok(First::Answers(side, direction, transport, game, false));
     }
 }
 
@@ -302,6 +386,8 @@ fn finish_wizard(
     direction: Direction,
     transport: Transport,
     prefill: Option<Prefill>,
+    game: bool,
+    ipv6: bool,
 ) -> Result<Option<String>> {
     // 4. Shared tunnel key, with pairing-code import available from the first page.
     let (key, created_key) = {
@@ -343,6 +429,10 @@ fn finish_wizard(
         (key, created_key)
     };
     let mut plan = Plan::new(key, side, direction, transport);
+    if ipv6 {
+        plan.ipv6 = true;
+        plan.listen_ip = "::".into();
+    }
     if let Some(prefill) = &prefill {
         if let Some(port) = prefill.port {
             plan.tunnel_port = port;
@@ -353,6 +443,11 @@ fn finish_wizard(
     let mut page = 0usize;
     let mut settings_choice = 0usize;
     let mut applied_choice = None;
+    if game {
+        // GAME: game UDP must reach the tunnel, and the gaming profile turns Game mode on.
+        plan.protocol = super::plan::Protocol::Both;
+        settings_choice = Profile::ALL.iter().position(|p| *p == Profile::Gaming).unwrap_or(0);
+    }
     loop {
         if page == 0 {
             // 5. Connection between the servers.
@@ -417,6 +512,19 @@ fn finish_wizard(
         };
         settings_choice = choice;
         select_settings(&mut plan,&mut applied_choice,choice,prefill.as_ref().and_then(|prefill|prefill.tested));
+        if game && plan.game.is_none() {
+            if plan.carries_udp() && !(plan.side == Side::Foreign && plan.direction == Direction::Direct) {
+                plan.set_game(true);
+                if plan.game_needs_iran_ip() {
+                    let ip = super::tune::ask_iran_host(None)?;
+                    if let Some(game) = &mut plan.game {
+                        game.iran_host = Some(ip);
+                    }
+                }
+            } else {
+                ui::warn("Game mode needs UDP in the tunnel (UDP or TCP and UDP ports, or SOCKS5); turn it on under Customize.");
+            }
+        }
         if choice == Profile::ALL.len() {
             if let Err(error) = tune::tune_plan(&mut plan) {
                 if ui::is_back(&error) {
@@ -460,6 +568,8 @@ fn apply_tested(plan:&mut Plan,spec:crate::checker::CaseSpec){
         crate::checker::Variant::TlsFragment=>plan.tls_fragment=true,
         crate::checker::Variant::Congestion=>plan.tcp_congestion=Some(crate::checker::CONGESTION_TEST_ALGORITHM.into()),
         crate::checker::Variant::Pacer=>plan.fec_pacer=true,
+        crate::checker::Variant::Packet=>plan.parallax_mode=crate::parallax_carrier::Mode::Packet,
+        crate::checker::Variant::Game=>plan.set_game(true),
         crate::checker::Variant::Plain|crate::checker::Variant::Fragment=>{},
     }
     if let(Some(profile),Some(raw))=(spec.profile,&mut plan.raw){raw.profile=crate::checker::profile_name(profile).into();}
@@ -539,6 +649,14 @@ fn import_pairing(store: &Store) -> Result<Option<String>> {
             );
             let prompt = "Tunnel port on this server (where the CDN forwards to)";
             plan.tunnel_port = ask_free_port(prompt, plan.tunnel_port, &["tcp"])?;
+        }
+        if plan.game_needs_iran_ip() {
+            ui::note("Game mode sends its datagrams to the Iran server's IP address; the code has only a host name or a CDN domain.");
+            let known = plan.game.as_ref().and_then(|g| g.iran_host.clone());
+            let ip = super::tune::ask_iran_host(known.as_deref())?;
+            if let Some(game) = &mut plan.game {
+                game.iran_host = Some(ip);
+            }
         }
         if plan.carry == Carry::Socks {
             match plan.side {
@@ -765,7 +883,9 @@ fn finish(
 /// server needs it.
 pub fn show_pairing_code(config: &serde_json::Value) -> Result<()> {
     let address = if super::pairing::needs_address(config) {
-        let detected = super::local_ip().unwrap_or_default();
+        // An IPv6 tunnel listens on IPv6 and dials IPv6: offer this server's IPv6 address.
+        let ipv6 = super::pairing::is_ipv6(config);
+        let detected = if ipv6 { super::local_ip6().map(|ip| ip.to_string()) } else { super::local_ip() }.unwrap_or_default();
         ui::note("The other server needs this server's address to reach it.");
         Some(ui::ask(
             "This server's public IP or domain",
@@ -828,6 +948,9 @@ fn connection(plan: &mut Plan) -> Result<()> {
         plan.raw = Some(raw);
         return Ok(());
     }
+    if plan.transport == Transport::Parallax {
+        plan.parallax_mode = ask_parallax_mode(plan.parallax_mode)?;
+    }
     if is_xhttp(plan.transport) {
         plan.cdn = None;
         let choices = vec![
@@ -871,12 +994,13 @@ fn connection(plan: &mut Plan) -> Result<()> {
     }
     if plan.dials() {
         let known = plan.peer_host.clone();
-        let transport = plan.transport;
-        let host = ui::ask(
-            &format!("Address of the {other} (IP or domain)"),
-            known.as_deref(),
-            |text: &String| check_host(text, transport),
-        )?;
+        // IPv6 tunnel: the other server's IPv6 address (the check below insists on one).
+        let (prompt, transport) = if plan.ipv6 {
+            (format!("IPv6 address of the {other}"), Transport::Tcp6)
+        } else {
+            (format!("Address of the {other} (IP or domain)"), plan.transport)
+        };
+        let host = ui::ask(&prompt, known.as_deref(), |text: &String| check_host(text, transport))?;
         plan.peer_host = Some(
             host.trim_start_matches('[')
                 .trim_end_matches(']')
@@ -894,6 +1018,28 @@ fn connection(plan: &mut Plan) -> Result<()> {
         plan.tunnel_port = ask_free_port(&port_prompt, plan.tunnel_port, &[protocol])?;
     }
     Ok(())
+}
+
+/// Stream mode is Parallax as it always was; packet mode carries the tunnel's packets over several
+/// TCP lanes that are redialed on their own, so a dropped lane does not end the tunnel.
+pub(super) fn ask_parallax_mode(
+    current: crate::parallax_carrier::Mode,
+) -> Result<crate::parallax_carrier::Mode> {
+    use crate::parallax_carrier::Mode;
+    let modes = [Mode::Stream, Mode::Packet];
+    let labels: Vec<String> = [
+        "Stream   two TCP lanes, one per direction (the classic Parallax)",
+        "Packet   the tunnel's packets over several TCP lanes; a dropped lane is dialed again and the tunnel keeps going; both servers must support it",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let index = modes.iter().position(|m| *m == current).unwrap_or(0);
+    Ok(modes[ui::choose_required(
+        "Parallax mode (use the same on both servers)",
+        &labels,
+        index,
+    )?])
 }
 
 fn raw_details(plan: &Plan) -> Result<Option<RawPlan>> {
@@ -1027,7 +1173,7 @@ fn carry(plan: &mut Plan) -> Result<bool> {
                 plan.ports = parse_ports(&text)?;
                 let protocols = [Protocol::Tcp, Protocol::Udp, Protocol::Both];
                 let labels: Vec<String> = protocols.iter().map(|p| p.label().to_string()).collect();
-                plan.protocol = protocols[ui::choose_required("Protocol", &labels, 0)?];
+                plan.protocol = protocols[ui::choose_required("Protocol", &labels, protocols.iter().position(|p| *p == plan.protocol).unwrap_or(0))?];
                 for rule in &plan.ports {
                     let busy = match plan.protocol {
                         Protocol::Udp => service::port_busy(rule.listen, "udp"),
@@ -1216,9 +1362,16 @@ pub fn summary_lines(plan: &Plan) -> Vec<String> {
             }
         ),
         format!(
-            "{}  {}",
+            "{}  {}{}",
             ui::dim("Transport    "),
-            transport_name(plan.transport)
+            transport_name(plan.transport),
+            if plan.transport == Transport::Parallax
+                && plan.parallax_mode == crate::parallax_carrier::Mode::Packet
+            {
+                " (packet mode)"
+            } else {
+                ""
+            }
         ),
     ];
     let link = if let Some(cdn) = plan.cdn.as_ref().filter(|_| plan.dials()) {
@@ -1465,7 +1618,7 @@ mod tests {
     }
 
     fn spec(transport:Transport,variant:crate::checker::Variant,profile:Option<RawProfile>)->crate::checker::CaseSpec{
-        crate::checker::CaseSpec{id:1,transport,dialer:None,variant,profile}
+        crate::checker::CaseSpec{id:1,transport,dialer:None,variant,profile,round:0,ipv6:false}
     }
 
     /// C18: the measured variant is the starting state of the chosen settings, and a manual

@@ -58,7 +58,8 @@ struct Connected {
     streams: Streams,
 }
 
-type Streams = Arc<Mutex<HashMap<u64, mpsc::Sender<String>>>>;
+/// A followed log's lines, with their journal cursors when the agent sends them.
+type Streams = Arc<Mutex<HashMap<u64, mpsc::Sender<(String, Option<String>)>>>>;
 type Hold = Arc<dyn Send + Sync>;
 type Request = (Value, oneshot::Sender<Value>, Option<Hold>);
 
@@ -72,7 +73,7 @@ impl Drop for LinkReadTask {
 
 /// A log followed on another server. Dropping it tells the agent to stop.
 pub struct RemoteFollow {
-    pub lines: mpsc::Receiver<String>,
+    pub lines: mpsc::Receiver<(String, Option<String>)>,
     stream: u64,
     streams: Streams,
     requests: mpsc::Sender<Request>,
@@ -183,6 +184,12 @@ impl Fleet {
         Ok((code.encode(), expires))
     }
 
+    /// Whether a join code from `join_code` admitted a server (it is no longer waiting).
+    pub fn code_used(&self, code: &str) -> bool {
+        let Ok(code) = super::link::JoinCode::decode(code) else { return false };
+        !self.tokens.lock().unwrap().contains_key(&code.token)
+    }
+
     fn take_token(&self, token: &[u8; 16]) -> bool {
         let now = super::now();
         let mut tokens = self.tokens.lock().unwrap();
@@ -244,7 +251,7 @@ impl Fleet {
         self.request_inner(id, request, timeout, Some(hold)).await
     }
 
-    async fn request_inner(&self, id: &str, mut request: Value, timeout: Duration, hold: Option<Hold>) -> Result<Value> {
+    async fn request_inner(&self, id: &str, request: Value, timeout: Duration, hold: Option<Hold>) -> Result<Value> {
         let sender = self
             .live
             .lock()
@@ -252,6 +259,11 @@ impl Fleet {
             .get(id)
             .map(|c| c.requests.clone())
             .context("that server is not connected")?;
+        self.request_on(&sender, request, timeout, hold).await
+    }
+
+    /// A request over one given link (not whichever link the server has by the time it is sent).
+    async fn request_on(&self, sender: &mpsc::Sender<Request>, mut request: Value, timeout: Duration, hold: Option<Hold>) -> Result<Value> {
         request["id"] = json!(self.next_request.fetch_add(1, Ordering::Relaxed));
         let (answer_tx, answer_rx) = oneshot::channel();
         let answer = tokio::time::timeout(timeout, async {
@@ -268,7 +280,7 @@ impl Fleet {
 
 
     /// Follows a tunnel's log on another server: its new lines arrive on `lines`.
-    pub async fn follow(&self, id: &str, name: &str) -> Result<RemoteFollow> {
+    pub async fn follow(&self, id: &str, name: &str, after: Option<String>) -> Result<RemoteFollow> {
         let (streams, requests) = {
             let live = self.live.lock().unwrap();
             let connected = live.get(id).context("that server is not connected")?;
@@ -277,8 +289,10 @@ impl Fleet {
         let stream = self.next_request.fetch_add(1, Ordering::Relaxed);
         let (tx, lines) = mpsc::channel(256);
         streams.lock().unwrap().insert(stream, tx);
-        let follow = RemoteFollow { lines, stream, streams, requests };
-        self.request(id, json!({"op": "follow", "name": name, "stream": stream}), Duration::from_secs(15)).await?;
+        let follow = RemoteFollow { lines, stream, streams, requests: requests.clone() };
+        // On the link whose stream map holds this follow: a reconnect in between ends the follow
+        // (its map is cleared with the old link) instead of leaving it on neither.
+        self.request_on(&requests, json!({"op": "follow", "name": name, "stream": stream, "after": after}), Duration::from_secs(15), None).await?;
         Ok(follow)
     }
 
@@ -370,14 +384,19 @@ impl Fleet {
                         Some("hello") => connected.hello = message,
                         Some("snapshot") => {
                             connected.snapshot = Some(message["snapshot"].clone());
+                            // History writes files: not while every other link waits on this lock.
+                            drop(live);
                             history.record_value(&message["snapshot"], super::now() * 1000);
                         }
                         Some("log_line") => {
                             let stream = message["stream"].as_u64().unwrap_or(0);
                             let line = message["line"].as_str().unwrap_or("").to_string();
+                            let cursor = message["cursor"].as_str().filter(|c| super::ops::cursor_ok(c)).map(str::to_string);
                             let mut streams = streams.lock().unwrap();
+                            // A reader too slow for the log: its follow ends rather than skipping
+                            // lines; the browser follows again from the last cursor it received.
                             if let Some(sender) = streams.get(&stream)
-                                && let Err(mpsc::error::TrySendError::Closed(_)) = sender.try_send(line)
+                                && sender.try_send((line, cursor)).is_err()
                             {
                                 streams.remove(&stream);
                             }
@@ -412,6 +431,9 @@ impl Fleet {
                 _ = &mut close_rx => break "removed".to_string(),
             }
         };
+        // Logs followed over this link end with it: their readers see the end and the browser
+        // follows again over the next link, instead of waiting on a link that is gone.
+        streams.lock().unwrap().clear();
         let mut live = self.live.lock().unwrap();
         if live.get(&id).is_some_and(|c| c.link == link) {
             live.remove(&id);
@@ -612,9 +634,9 @@ mod tests {
             assert_eq!(stop["op"], "unfollow");
             assert_eq!(stop["stream"], stream);
         });
-        let mut follow = fleet.follow(&id, "t").await.unwrap();
+        let mut follow = fleet.follow(&id, "t", None).await.unwrap();
         for n in 0..3 {
-            assert_eq!(follow.lines.recv().await.unwrap(), format!("line {n}"));
+            assert_eq!(follow.lines.recv().await.unwrap().0, format!("line {n}"));
         }
         drop(follow);
         tokio::time::timeout(Duration::from_secs(5), agent).await.unwrap().unwrap();

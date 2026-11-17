@@ -23,15 +23,92 @@ fn proc_text(path: &str) -> Option<String> {
     std::fs::read_to_string(path).ok().map(|t| t.trim().to_string())
 }
 
-/// Whether `ufw status` allows a port (for the protocol, or for both).
+/// What `ufw status` says about a port for traffic from any address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Firewall {
+    Open,
+    Closed,
+    /// Rules for some sources only: whether the tunnel's other server is let in cannot be told.
+    Unknown,
+}
+
+/// Whether a rule's "To" column covers `port`/`protocol`: `Some(true)` when it names it (a port, a
+/// list or a range, with or without the protocol), `Some(false)` when it names other ports only,
+/// `None` when it cannot be told here (every port, an application profile, an interface).
+fn rule_covers(to: &str, port: u16, protocol: &str) -> Option<bool> {
+    let (ports, proto) = match to.split_once('/') {
+        Some((ports, proto)) => (ports, Some(proto)),
+        None => (to, None),
+    };
+    if proto.is_some_and(|p| p != protocol) {
+        return Some(false);
+    }
+    let mut known = true;
+    let covers = ports.split(',').any(|part| match part.split_once(':') {
+        Some((low, high)) => match (low.parse::<u16>(), high.parse::<u16>()) {
+            (Ok(low), Ok(high)) => (low..=high).contains(&port),
+            _ => {
+                known = false;
+                false
+            }
+        },
+        None => match part.parse::<u16>() {
+            Ok(single) => single == port,
+            Err(_) => {
+                known = false;
+                false
+            }
+        },
+    });
+    if covers { Some(true) } else if known { Some(false) } else { None }
+}
+
+/// Reads the rules for `port` in order, as ufw applies them (the first match wins), for IPv4,
+/// the family tunnels listen on by default. A rule for the port and every source decides. Rules
+/// that may apply but cannot be told apart here (for some sources only, for every port, by an
+/// application name, or for IPv6 only) make the answer unknown, never open.
+pub fn ufw_port(status: &str, port: u16, protocol: &str) -> Firewall {
+    let (mut some_allowed, mut maybe_denied, mut v6_allowed) = (false, false, false);
+    for line in status.lines() {
+        let v6 = line.contains("(v6)");
+        let words: Vec<&str> = line.split_whitespace().filter(|w| *w != "(v6)").collect();
+        let Some(at) = words.iter().position(|w| matches!(*w, "ALLOW" | "DENY" | "REJECT" | "LIMIT")) else { continue };
+        if at == 0 || words.get(at + 1) == Some(&"OUT") {
+            continue;
+        }
+        let to = words[..at].join(" ");
+        let covers = if to == "Anywhere" { None } else { rule_covers(words[0], port, protocol).filter(|_| at == 1) };
+        if covers == Some(false) {
+            continue;
+        }
+        let from = words[at + 1..].iter().find(|w| **w != "IN").copied().unwrap_or("Anywhere");
+        let allow = matches!(words[at], "ALLOW" | "LIMIT");
+        if v6 {
+            v6_allowed |= allow;
+            continue;
+        }
+        match (covers, from == "Anywhere", allow) {
+            // This port, every source: decides, unless something before may have applied.
+            (Some(true), true, true) => {
+                return if maybe_denied { Firewall::Unknown } else { Firewall::Open };
+            }
+            (Some(true), true, false) => {
+                return if some_allowed { Firewall::Unknown } else { Firewall::Closed };
+            }
+            // Every port from every source.
+            (None, true, true) if to == "Anywhere" => {
+                return if maybe_denied { Firewall::Unknown } else { Firewall::Open };
+            }
+            (_, _, true) => some_allowed = true,
+            (_, _, false) => maybe_denied = true,
+        }
+    }
+    if some_allowed || v6_allowed { Firewall::Unknown } else { Firewall::Closed }
+}
+
+/// Whether `ufw status` lets in a port from every address.
 pub fn ufw_allows(status: &str, port: u16, protocol: &str) -> bool {
-    status.lines().any(|line| {
-        let mut words = line.split_whitespace();
-        let (Some(rule), Some(action)) = (words.next(), words.next()) else {
-            return false;
-        };
-        action == "ALLOW" && (rule == port.to_string() || rule == format!("{port}/{protocol}"))
-    })
+    ufw_port(status, port, protocol) == Firewall::Open
 }
 
 fn disk_used_pct(path: &str) -> Option<f64> {
@@ -130,8 +207,13 @@ fn tunnel_checks(store: &Store, name: &str, config: &Config, ufw: Option<&str>, 
     }
     if let Some(status) = ufw {
         for (port, protocol) in service::listening_ports(config) {
-            let open = ufw_allows(status, port, protocol);
-            found.push(finding("firewall", name, if open { "ok" } else { "bad" }, format!("{port}/{protocol}"), (!open).then(|| format!("ufw:{port}/{protocol}"))));
+            let (level, fix) = match ufw_port(status, port, protocol) {
+                Firewall::Open => ("ok", None),
+                // Rules for some sources only: shown, not "fixed" by opening it to everyone.
+                Firewall::Unknown => ("warn", None),
+                Firewall::Closed => ("bad", Some(format!("ufw:{port}/{protocol}"))),
+            };
+            found.push(finding("firewall", name, level, format!("{port}/{protocol}"), fix));
         }
     }
 }
@@ -243,6 +325,29 @@ mod tests {
         assert!(ufw_allows(status, 7000, "udp"), "a rule without a protocol covers both");
         assert!(!ufw_allows(status, 9392, "udp"), "a deny is not an allow");
         assert!(!ufw_allows(status, 443, "tcp"));
+        // A rule for one source only is not "open" for the tunnel's other server.
+        let scoped = "To Action From\n7000/tcp ALLOW IN 203.0.113.5\n";
+        assert_eq!(ufw_port(scoped, 7000, "tcp"), Firewall::Unknown);
+        // The first match wins: a deny for everyone before an allow closes it.
+        let order = "To Action From\n7000 DENY IN Anywhere\n7000 ALLOW IN Anywhere\n";
+        assert_eq!(ufw_port(order, 7000, "tcp"), Firewall::Closed);
+        // A source deny before an allow for everyone: that source may be the other server.
+        let mixed = "To Action From\n7000 DENY 198.51.100.0/24\n7000 ALLOW Anywhere\n";
+        assert_eq!(ufw_port(mixed, 7000, "tcp"), Firewall::Unknown);
+        // An IPv6-only allow says nothing about IPv4.
+        let v6 = "To Action From\n7000/tcp (v6) ALLOW IN Anywhere (v6)\n";
+        assert_eq!(ufw_port(v6, 7000, "tcp"), Firewall::Unknown);
+        let both = "To Action From\n7000/tcp ALLOW IN Anywhere\n7000/tcp (v6) ALLOW IN Anywhere (v6)\n";
+        assert_eq!(ufw_port(both, 7000, "tcp"), Firewall::Open);
+        // Ranges and lists cover the port.
+        assert_eq!(ufw_port("7000:7100/tcp ALLOW IN Anywhere\n", 7004, "tcp"), Firewall::Open);
+        assert_eq!(ufw_port("80,443,7004/tcp ALLOW IN Anywhere\n", 7004, "tcp"), Firewall::Open);
+        assert_eq!(ufw_port("7000:7100/udp ALLOW IN Anywhere\n", 7004, "tcp"), Firewall::Closed);
+        // A deny for every port from one source, before the allow: that source may be the peer.
+        let earlier = "Anywhere DENY IN 203.0.113.0/24\n7000/tcp ALLOW IN Anywhere\n";
+        assert_eq!(ufw_port(earlier, 7000, "tcp"), Firewall::Unknown);
+        // An application profile cannot be read here.
+        assert_eq!(ufw_port("OpenSSH DENY IN Anywhere\n7000/tcp ALLOW IN Anywhere\n", 7000, "tcp"), Firewall::Unknown);
     }
 
     #[test]

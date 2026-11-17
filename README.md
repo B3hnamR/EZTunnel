@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/B3hnamR/EZTunnel/releases/latest"><img src="https://img.shields.io/badge/release-v0.10.0-00afff?style=for-the-badge" alt="Release v0.10.0"></a>
+  <a href="https://github.com/B3hnamR/EZTunnel/releases/latest"><img src="https://img.shields.io/badge/release-v0.11.0-00afff?style=for-the-badge" alt="Release v0.11.0"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-875fff?style=for-the-badge" alt="License: AGPL-3.0"></a>
   <img src="https://img.shields.io/badge/built_with-Rust-dea584?style=for-the-badge&logo=rust&logoColor=white" alt="Built with Rust">
   <img src="https://img.shields.io/badge/Linux-x86__64%20%7C%20ARM64-0087ff?style=for-the-badge&logo=linux&logoColor=white" alt="Linux x86_64 and ARM64">
@@ -34,6 +34,19 @@ config files to write.
   loss-resistant FEC and raw IPv4 carriers.
 - **Yours:** open source and self-hosted, with no telemetry. It only talks to the
   servers you configure.
+
+## What's new in 0.11.0
+
+- **Game mode** sends authenticated copies of game UDP packets over multiple ports and uses the
+  first copy to arrive. Pick **GAME** for FEC-UDP. FEC-RAW has its own **Gaming / low delay**
+  profile. [Game mode guide](docs/game-mode.md)
+- **Parallax packet mode** adds error correction across multiple TCP lanes. A broken lane can
+  reconnect while the other lanes carry traffic. [Parallax guide](docs/parallax.md)
+- **IPv6** is available in tunnel setup and the dashboard Path Finder. Dashboard **Find** and
+  **Tune** checks can run over IPv4, IPv6, or both. [Transport checker guide](docs/checker.md#ipv4-and-ipv6)
+- **Find and Tune** compare transports and their settings, then let you create a tunnel from a
+  result using the settings that worked. Per-tunnel carrier settings are available in the
+  terminal and dashboard. [Dashboard guide](docs/dashboard.md)
 
 ## How it works
 
@@ -73,7 +86,7 @@ never starts, stops or changes existing tunnels.
 curl -fsSLo install-eztunnel.sh https://raw.githubusercontent.com/B3hnamR/EZTunnel/main/scripts/install-latest.sh
 less install-eztunnel.sh
 sudo bash install-eztunnel.sh                      # latest release
-sudo bash install-eztunnel.sh --version v0.10.0    # a specific release
+sudo bash install-eztunnel.sh --version v0.11.0    # a specific release
 ```
 
 **Requirements:** Linux, Bash, `curl`, `tar`, coreutils and `flock` (from
@@ -167,7 +180,8 @@ use the same transport.
 | You want to go through a CDN or HTTP proxy | **XHTTPS** (or **XHTTP**) |
 | The link loses many packets | **FEC-UDP** |
 | UDP and TCP are both filtered, and you control both servers fully | **FEC-RAW** |
-| Games or real-time traffic on a lossy raw path | **FEC-RAW-GAMING** |
+| Games or real-time traffic | **GAME** (on a raw path: **FEC-RAW** with the Gaming profile) |
+| The route between the servers blocks IPv4, and both servers have IPv6 | **IPv6** (with any transport above) |
 | You need a full IP network (TUN) over raw packets | **RAW-TUN** |
 | Your provider allows source-address spoofing and you have tested it | **Mirage** |
 
@@ -193,14 +207,18 @@ Open the tunnel port on the server that listens.
 </details>
 
 <details>
-<summary><b>TCP6</b>: TCP between IPv6 addresses</summary>
+<summary><b>IPv6</b>: any transport over IPv6</summary>
 
-**What it is:** the same as TCP, but the two servers talk over IPv6.
+**What it is:** the servers talk over their IPv6 addresses, with the transport you choose next
+(TCP, WSS, KCP, FEC-UDP, Parallax, GAME and the others; the raw ones stay IPv4).
 
-**Use it when:** both servers have working IPv6 and you prefer it over IPv4.
+**Use it when:** the route between the servers blocks or filters IPv4 but carries IPv6 (the
+transport check tests both and says which works), and both servers have an IPv6 address.
 
-**Set up:** pick **TCP6** and enter literal IPv6 addresses, written as
-`[2001:db8::1]:443` on both ends. In JSON: `"transport": "tcp6"`.
+**Set up:** pick **IPv6**. It checks that this server has an IPv6 address, then asks for the
+transport and the other server's IPv6 address; the listening server listens on IPv6. In the
+dashboard, IPv6 is in the transport list and the address is filled in. In JSON: the dialing side's
+`addr` is `[IPv6]:port` and the listening side's is `[::]:port`.
 
 </details>
 
@@ -330,14 +348,19 @@ kernel does not reset the fake connection. In JSON: `"transport": "fec-raw"` wit
 </details>
 
 <details>
-<summary><b>FEC-RAW-GAMING</b>: the same, tuned for low delay (advanced)</summary>
+<summary><b>GAME</b>: built for games (FEC-UDP plus Game mode)</summary>
 
-**What it is:** FEC-RAW with a preset that favors low delay over throughput.
+**What it is:** FEC-UDP with [Game mode](docs/game-mode.md): game UDP skips the
+reliable stream and goes as authenticated datagrams, each sent as several copies over
+different ports; the first copy to arrive is used.
 
-**Use it when:** you carry games or real-time traffic over a raw path. It is not a
-promise of lower game latency on every route; compare with the transport checker.
+**Use it when:** you carry games or other real-time UDP. It is not a promise of lower
+game latency on every route; compare with the transport checker.
 
-**Set up:** like FEC-RAW, pick **FEC-RAW-G**. In JSON: `"transport": "fec-raw-gaming"`.
+**Set up:** pick **GAME**. It forwards TCP and UDP and uses the Gaming profile. Open the
+tunnel port and the next one (TCP and UDP) on both servers. On a raw path, pick
+**FEC-RAW** and the Gaming profile instead: it applies the low-delay tuning
+(`"fec": {"profile": "gaming"}`).
 
 </details>
 
@@ -359,13 +382,18 @@ root, raw settings and matching TUN addresses on both servers. In JSON:
 <details>
 <summary><b>Parallax</b>: authenticated directional TCP lanes</summary>
 
-**What it is:** a pair of separate TCP lanes, one per direction, with bounded
-packet batching.
+**What it is:** the tunnel over several real TCP connections ("lanes"). In the default
+**stream mode** there are two lanes, one per direction, with bounded packet batching. In
+**packet mode** the tunnel's packets, with error correction, travel over several lanes at
+once; a lane that breaks is dialed again and the tunnel keeps going, so open connections
+survive it.
 
-**Use it when:** a single two-way TCP connection performs badly on your route, and
-both servers run an EZTunnel version with Parallax support.
+**Use it when:** a single two-way TCP connection performs badly on your route, or long TCP
+connections get cut (packet mode). Both servers need the same mode.
 
-**Set up:** pick **Parallax** on both servers. In JSON: `"transport": "parallax"`.
+**Set up:** pick **Parallax** on both servers, then the mode. In JSON:
+`"transport": "parallax"`, plus `"parallax": {"mode": "packet"}` for packet mode. See
+[Parallax](docs/parallax.md).
 
 </details>
 
@@ -600,18 +628,20 @@ namespaces or VMs. Full details: [build from source](docs/build-from-source.md) 
 | [FEC tuning](docs/fec-tuning.md) | [Raw TUN](docs/raw-tun.md) |
 | [Two-server validation](docs/two-server-test.md) | [Architecture](docs/architecture.md) |
 | [Transport extensions](docs/transport-upgrade.md) | [Build from source](docs/build-from-source.md) |
-| [Web dashboard](docs/dashboard.md) | |
+| [Web dashboard](docs/dashboard.md) | [Parallax](docs/parallax.md) |
+| [Game mode](docs/game-mode.md) | |
 
 ## Release quality
 
-**v0.10.0** is a full dual-CPU release: the full test suite passes on x86_64 and natively on
-ARM64, plus the kernel runtime matrix and the Mirage runtime matrix on each CPU. Both binaries are
-static musl builds from the same source.
+**v0.11.0** passed 757 tests on each architecture (x86_64 and native ARM64), along with the kernel
+and Mirage runtime checks on both. Live IPv6-only checks held TCP and FEC-UDP for 60 seconds in
+both directions without a failed ping or reconnect. Both release binaries are static musl
+builds from the same source.
 
-From v0.10.0 the release programs are signed with the official update key, so **Tools → Update**,
-`eztunnel update` and the dashboard's **Update** and **Install** accept them. The updater replaces
-only a program that is itself a signed release, so servers on v0.9.14 or older move to v0.10.0 once
-with the installer; after that, updates install from inside EZTunnel.
+Release binaries are signed with the official update key. Use **Tools → Update**, `eztunnel update`,
+or the dashboard's **Update** or **Install** to update a signed installation. If your installed binary
+is unsigned, use the installer first. Signed upgrade from 0.10.0 to 0.11.0 and rollback were verified
+on x86_64, and a fresh signed install was verified on ARM64.
 
 ## License
 

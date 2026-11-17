@@ -66,9 +66,10 @@ pub trait Ops: Send + Sync {
     /// Blocking: runs the action and, after a start, watches the tunnel come up.
     fn act(&self, name: &str, action: Action) -> Result<Outcome>;
     /// Blocking: the last `lines` lines of the tunnel's log.
-    fn logs(&self, name: &str, lines: usize) -> Result<Vec<String>>;
-    /// New log lines as they are written, until the returned value is dropped.
-    fn follow(&self, name: &str) -> Result<Follow>;
+    fn logs(&self, name: &str, lines: usize) -> Result<LogTail>;
+    /// New log lines as they are written, until the returned value is dropped: those after
+    /// `after` (a journal cursor from `logs` or an earlier line), else only new ones.
+    fn follow(&self, name: &str, after: Option<String>) -> Result<Follow>;
     /// Blocking: what the edit screen shows (see `edit::editable`), and whether there is a
     /// previous version to go back to.
     fn editable(&self, name: &str) -> Result<serde_json::Value>;
@@ -83,6 +84,12 @@ pub trait Ops: Send + Sync {
     /// Blocking: saves a new tunnel (one `wizard::creatable` accepts), installs its service and
     /// watches it come up. A name that is taken is refused.
     fn create(&self, name: &str, config: &serde_json::Value) -> Result<Outcome>;
+    /// Blocking: deletes the tunnel only when it is the one with `tunnel_key`, i.e. the one a
+    /// create of the dashboard made, never a tunnel of the same name someone else made meanwhile.
+    fn delete_own(&self, name: &str, tunnel_key: &str) -> Result<()> {
+        let _ = tunnel_key;
+        self.delete(name)
+    }
     /// Blocking: the running tunnel's own figures (its control socket's status answer).
     fn status(&self, name: &str) -> Result<serde_json::Value>;
     /// Blocking: a speed test through the tunnel, run from its Iran end.
@@ -130,13 +137,16 @@ pub fn answer(ops: &dyn Ops, request: &serde_json::Value) -> Result<serde_json::
         }
         Some("logs") => {
             let lines = request["lines"].as_u64().unwrap_or(200) as usize;
-            Ok(json!(ops.logs(name, lines)?))
+            Ok(serde_json::to_value(ops.logs(name, lines)?)?)
         }
         Some("editable") => ops.editable(name),
         Some("edit") => Ok(serde_json::to_value(ops.edit(name, &request["changes"])?)?),
         Some("undo") => Ok(serde_json::to_value(ops.undo(name)?)?),
         Some("delete") => {
-            ops.delete(name)?;
+            match request["expect_key"].as_str() {
+                Some(key) => ops.delete_own(name, key)?,
+                None => ops.delete(name)?,
+            }
             Ok(json!({"deleted": true}))
         }
         Some("create") => Ok(serde_json::to_value(ops.create(name, &request["config"])?)?),
@@ -171,6 +181,24 @@ fn clip(line: &str) -> String {
 }
 
 /// A live log: the journal of a tunnel, or sample lines in the demo.
+/// The end of a log, and the journal cursor of its last line: following from there misses nothing
+/// written in between.
+#[derive(serde::Serialize, Debug, Default)]
+pub struct LogTail {
+    pub lines: Vec<String>,
+    /// Where the tail ends: a journal cursor, or `@<unix seconds>` when the log had nothing yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+/// A journal cursor as journalctl prints it (`s=...;i=...;...`); anything else is not passed on.
+pub fn cursor_ok(cursor: &str) -> bool {
+    if let Some(seconds) = cursor.strip_prefix('@') {
+        return (1..=20).contains(&seconds.len()) && seconds.bytes().all(|b| b.is_ascii_digit());
+    }
+    (1..=512).contains(&cursor.len()) && cursor.bytes().all(|b| b.is_ascii_alphanumeric() || b"=;-_".contains(&b))
+}
+
 pub enum Follow {
     Journal {
         _child: tokio::process::Child,
@@ -184,14 +212,29 @@ pub enum Follow {
 }
 
 impl Follow {
-    /// The next line, or `None` when the log ended.
-    pub async fn next_line(&mut self) -> Option<String> {
+    /// The next line and its journal cursor, or `None` when the log ended.
+    pub async fn next_line(&mut self) -> Option<(String, Option<String>)> {
         match self {
-            Follow::Journal { lines, .. } => lines.next_line().await.ok().flatten().map(|l| clip(&l)),
+            Follow::Journal { lines, .. } => loop {
+                let line = lines.next_line().await.ok().flatten()?;
+                // journalctl -o json: one object per entry; MESSAGE is text, or bytes when it
+                // is not valid UTF-8.
+                let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+                let message = match &entry["MESSAGE"] {
+                    serde_json::Value::String(text) => text.clone(),
+                    serde_json::Value::Array(bytes) => String::from_utf8_lossy(
+                        &bytes.iter().filter_map(|b| b.as_u64().map(|b| b as u8)).collect::<Vec<u8>>(),
+                    )
+                    .into_owned(),
+                    _ => continue,
+                };
+                let cursor = entry["__CURSOR"].as_str().filter(|c| cursor_ok(c)).map(str::to_string);
+                return Some((clip(&message), cursor));
+            },
             Follow::Demo { name, tick, count } => {
                 tick.tick().await;
                 *count += 1;
-                Some(demo_line(name, *count))
+                Some((demo_line(name, *count), None))
             }
         }
     }
@@ -215,6 +258,10 @@ fn program_for(installed: &std::path::Path) -> std::path::PathBuf {
         .and_then(|p| p.canonicalize())
         .unwrap_or_else(|_| installed.to_path_buf())
 }
+
+/// Starts an error that was raised before anything was changed: whoever asked has nothing to
+/// clean up on this server.
+pub const UNCHANGED: &str = "nothing was changed";
 
 /// The tunnels of this server, through the terminal manager's own functions.
 pub struct LocalOps;
@@ -302,11 +349,28 @@ impl Ops for LocalOps {
         Ok(Outcome { changed: true, came_up })
     }
 
-    fn logs(&self, name: &str, lines: usize) -> Result<Vec<String>> {
+    fn logs(&self, name: &str, lines: usize) -> Result<LogTail> {
         let store = Self::store()?;
         Self::known(&store, name)?;
-        let text = service::recent_logs(name, lines.clamp(1, MAX_LINES));
-        Ok(text.lines().map(clip).collect())
+        let output = std::process::Command::new("journalctl")
+            .args(["-u", &service::unit_name(name), "-n", &lines.clamp(1, MAX_LINES).to_string(), "-o", "cat", "--show-cursor", "--no-pager"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        // Taken before the tail: lines written while it is read are followed, not lost.
+        let read_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let mut tail = LogTail::default();
+        for line in output.lines() {
+            match line.strip_prefix("-- cursor: ") {
+                Some(cursor) if cursor_ok(cursor.trim()) => tail.cursor = Some(cursor.trim().to_string()),
+                _ => tail.lines.push(clip(line)),
+            }
+        }
+        if tail.cursor.is_none() {
+            tail.cursor = Some(format!("@{read_at}"));
+        }
+        Ok(tail)
     }
 
     fn editable(&self, name: &str) -> Result<serde_json::Value> {
@@ -354,12 +418,15 @@ impl Ops for LocalOps {
     }
 
     fn create(&self, name: &str, config: &serde_json::Value) -> Result<Outcome> {
-        crate::manager::plan::check_name(name)?;
-        super::wizard::creatable(config)?;
-        let store = Self::store()?;
-        let _lock = store.lock(name, false)?;
+        let store = (|| {
+            crate::manager::plan::check_name(name)?;
+            super::wizard::creatable(config)?;
+            Self::store()
+        })()
+        .map_err(|error| anyhow::anyhow!("{UNCHANGED}: {error:#}"))?;
+        let _lock = store.lock(name, false).map_err(|error| anyhow::anyhow!("{UNCHANGED}: {error:#}"))?;
         if store.names()?.iter().any(|n| n == name) {
-            bail!("a tunnel named {name} already exists on this server");
+            bail!("{UNCHANGED}: a tunnel named {name} already exists on this server");
         }
         store.save(name, config)?;
         if !store.system {
@@ -400,7 +467,40 @@ impl Ops for LocalOps {
             Some("export") => super::maintain::export(&store),
             Some("import") => {
                 let text = request["text"].as_str().context("the backup is missing")?;
-                super::maintain::import(&store, text, request["replace"] == true)
+                // What ran before: a replaced tunnel that was running restarts on its restored
+                // settings; one that was stopped stays stopped. Added tunnels are started.
+                let before: HashMap<String, State> = store
+                    .names()?
+                    .into_iter()
+                    .map(|name| { let state = service::state(&store, &name); (name, state) })
+                    .collect();
+                let mut report = super::maintain::import(&store, text, request["replace"] == true)?;
+                let imported: Vec<String> = report["imported"].as_array().into_iter().flatten()
+                    .filter_map(|n| n.as_str().map(str::to_string)).collect();
+                let mut started = Vec::new();
+                if store.system {
+                    for name in &imported {
+                        let _lock = store.lock(name, false)?;
+                        match before.get(name) {
+                            // Added, or replaced while it ran: on its restored settings now.
+                            None | Some(State::Running) => {
+                                let (up, problem) = Self::restart_saved(&store, name);
+                                started.push(serde_json::json!({"name": name, "came_up": up, "problem": problem}));
+                            }
+                            // Saved only, no service: as it was.
+                            Some(State::NoService) => {}
+                            // Stopped: its unit follows the restored file, so a later Start runs
+                            // what the file needs (a privileged port, for example); still stopped.
+                            Some(_) => {
+                                if let Err(error) = service::rewrite(&store, name, &installed_program()) {
+                                    started.push(serde_json::json!({"name": name, "came_up": false, "problem": format!("{error:#}")}));
+                                }
+                            }
+                        }
+                    }
+                }
+                report["started"] = serde_json::json!(started);
+                Ok(report)
             }
             _ => bail!("unknown tool"),
         }
@@ -457,11 +557,31 @@ impl Ops for LocalOps {
         store.remove_locked(name)
     }
 
-    fn follow(&self, name: &str) -> Result<Follow> {
+    fn delete_own(&self, name: &str, tunnel_key: &str) -> Result<()> {
         let store = Self::store()?;
         Self::known(&store, name)?;
+        let _lock = store.lock(name, false)?;
+        // Same name, other key: someone else's tunnel; it stays.
+        if store.read(name)?["tunnel_key"].as_str() != Some(tunnel_key) {
+            bail!("{UNCHANGED}: {name} here is another tunnel, not the one being created");
+        }
+        if store.system {
+            service::remove(name)?;
+        }
+        store.remove_locked(name)
+    }
+
+    fn follow(&self, name: &str, after: Option<String>) -> Result<Follow> {
+        let store = Self::store()?;
+        Self::known(&store, name)?;
+        // From the cursor the reader already has (nothing lost in between), else only new lines.
+        let start = match after.filter(|c| cursor_ok(c)) {
+            Some(seconds) if seconds.starts_with('@') => format!("--since={seconds}"),
+            Some(cursor) => format!("--after-cursor={cursor}"),
+            None => "--lines=0".to_string(),
+        };
         let mut child = tokio::process::Command::new("journalctl")
-            .args(["-u", &service::unit_name(name), "-f", "-n", "0", "-o", "cat", "--no-pager"])
+            .args(["-u", &service::unit_name(name), "-f", &start, "-o", "json", "--no-pager"])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
@@ -488,6 +608,8 @@ pub struct DemoOps {
     pub delay: Duration,
     /// When the demo's transport check started, and whether the optimization is "applied".
     pub check_started: Arc<Mutex<Option<u64>>>,
+    /// The options of the sample check, from its code (a find or a tune check).
+    pub check_options: Arc<Mutex<Option<crate::checker::Options>>>,
     pub spoof_started: Arc<Mutex<Option<u64>>>,
     pub optimized: Arc<Mutex<bool>>,
 }
@@ -500,6 +622,7 @@ impl DemoOps {
             removed: Arc::default(),
             added: Arc::default(),
             check_started: Arc::default(),
+            check_options: Arc::default(),
             spoof_started: Arc::default(),
             optimized: Arc::default(),
             delay: Duration::from_millis(900),
@@ -539,7 +662,7 @@ impl Ops for DemoOps {
         crate::manager::plan::check_name(name)?;
         super::wizard::creatable(config)?;
         if self.names().iter().any(|n| n == name) {
-            bail!("a tunnel named {name} already exists on this server");
+            bail!("{UNCHANGED}: a tunnel named {name} already exists on this server");
         }
         std::thread::sleep(self.delay * 2);
         self.removed.lock().unwrap().remove(name);
@@ -629,6 +752,10 @@ impl Ops for DemoOps {
                 match check["action"].as_str() {
                     Some("start") | Some("join") => {
                         *started = Some(now);
+                        *self.check_options.lock().unwrap() = check["code"]
+                            .as_str()
+                            .and_then(|text| crate::checker::code::decode(text).ok())
+                            .map(|code| code.options);
                         Ok(json!({"started": true}))
                     }
                     Some("stop") => {
@@ -636,7 +763,7 @@ impl Ops for DemoOps {
                         Ok(json!({"stopping": true}))
                     }
                     _ => Ok(match *started {
-                        Some(at) => super::conntest::demo_status(at, now),
+                        Some(at) => super::conntest::demo_status(self.check_options.lock().unwrap().as_ref(), at, now),
                         None => json!({"state": "idle"}),
                     }),
                 }
@@ -682,7 +809,7 @@ impl Ops for DemoOps {
                 "skipped": []})),
             Some("import") => {
                 std::thread::sleep(self.delay);
-                Ok(json!({"imported": [], "skipped": self.names(), "failed": []}))
+                Ok(json!({"imported": [], "skipped": self.names(), "failed": [], "started": []}))
             }
             _ => bail!("unknown tool"),
         }
@@ -697,8 +824,9 @@ impl Ops for DemoOps {
             "ok": true, "version": env!("CARGO_PKG_VERSION"), "role": "server", "uptime_sec": 532_800,
             "sessions": 4, "connects": 9, "streams": 23, "streams_total": 48_210, "refused": 0, "rejected": 2,
             "udp_dropped": 0, "udp_oversize": 0, "bytes_to_peer": 4_512_000_000u64, "bytes_from_peer": 51_520_000_000u64,
-            "pings": 106_560, "pongs": 106_541, "lost": 19, "rtt_ms": [81.2, 83.0, 84.9, 82.4, 90.1, 82.7],
-            "window_bytes": 6_291_456, "transport": {"kind": "fec-udp", "data_shards": 10, "parity_shards": 3, "recovered": 1_942, "unrecoverable": 3},
+            "pings": 106_560, "pongs": 106_541, "pings_lost": 19, "rtt_ms": [81.2, 83.0, 84.9, 82.4, 90.1, 82.7],
+            "window_frames_used": 384, "window_frames_limit": 16_384,
+            "transport_extensions": {"fec_recovered": 1_942, "fec_unrecoverable": 3},
         }))
     }
 
@@ -749,10 +877,10 @@ impl Ops for DemoOps {
         Ok(Outcome { changed: true, came_up: now_running.then_some(true) })
     }
 
-    fn logs(&self, name: &str, lines: usize) -> Result<Vec<String>> {
+    fn logs(&self, name: &str, lines: usize) -> Result<LogTail> {
         self.known(name)?;
         let lines = lines.clamp(1, MAX_LINES).min(60) as u64;
-        Ok((1..=lines).map(|n| demo_line(name, n)).collect())
+        Ok(LogTail { lines: (1..=lines).map(|n| demo_line(name, n)).collect(), cursor: None })
     }
 
     fn editable(&self, name: &str) -> Result<serde_json::Value> {
@@ -787,7 +915,7 @@ impl Ops for DemoOps {
         Ok(EditOutcome { changed: true, restarted: true, came_up: Some(true), ..EditOutcome::default() })
     }
 
-    fn follow(&self, name: &str) -> Result<Follow> {
+    fn follow(&self, name: &str, _after: Option<String>) -> Result<Follow> {
         self.known(name)?;
         let mut tick = tokio::time::interval(Duration::from_secs(3));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -839,7 +967,12 @@ mod tests {
         assert!(ops.act("backup-tcp", Action::Start).unwrap().changed);
         assert!(ops.act("nothing", Action::Start).is_err());
         assert!(ops.logs("../etc", 10).is_err());
-        assert!(ops.follow("nothing").is_err());
+        assert!(cursor_ok("s=739ad463348b4ceca5a9e69c95a3c93f;i=4ece7;b=6c7c6013a8914b6b;m=95fe5ac;t=4f45f6a3a1b5f;x=f48c8dc8d0c0d24"));
+        assert!(cursor_ok("@1763390000"), "the time of an empty tail");
+        for bad in ["", "a b", "--since=yesterday x", "s=1\n", "x;$(id)", "@", "@12a", "@-1"] {
+            assert!(!cursor_ok(bad), "{bad}");
+        }
+        assert!(ops.follow("nothing", None).is_err());
     }
 
     #[test]
@@ -866,8 +999,8 @@ mod tests {
     #[test]
     fn logs_are_limited_and_long_lines_cut() {
         let ops = DemoOps::new(&["game-fec"]);
-        assert_eq!(ops.logs("game-fec", 0).unwrap().len(), 1);
-        assert!(ops.logs("game-fec", 50_000).unwrap().len() <= MAX_LINES);
+        assert_eq!(ops.logs("game-fec", 0).unwrap().lines.len(), 1);
+        assert!(ops.logs("game-fec", 50_000).unwrap().lines.len() <= MAX_LINES);
         let long = "x".repeat(MAX_LINE + 50);
         let cut = clip(&long);
         assert_eq!(cut.chars().count(), MAX_LINE + 1);
@@ -881,9 +1014,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_demo_log_follows_with_new_lines() {
         let ops = DemoOps::new(&["game-fec"]);
-        let mut follow = ops.follow("game-fec").unwrap();
-        let first = follow.next_line().await.unwrap();
-        let second = follow.next_line().await.unwrap();
+        let mut follow = ops.follow("game-fec", None).unwrap();
+        let (first, _) = follow.next_line().await.unwrap();
+        let (second, _) = follow.next_line().await.unwrap();
         assert_ne!(first, second);
         assert!(first.contains("eztunnel::"));
     }

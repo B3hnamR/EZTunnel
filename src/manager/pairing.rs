@@ -5,8 +5,9 @@
 //! secret as the key. A version prefix and a checksum catch damaged or partly copied codes.
 use super::plan::{
     Carry, CdnPlan, Direction, IpMode, Plan, Protocol, RawPlan, Side, TunPlan, format_ports,
-    parse_ports, read_setting, relevant_settings, unicast_ipv4,
+    parse_ports, read_setting, unicast_ipv4,
 };
+use super::scope::{Scope, relevant};
 use crate::config::{Mode, Transport, XhttpMode};
 use crate::tunnel_key::TunnelKey;
 use anyhow::{Context, Result, bail, ensure};
@@ -48,6 +49,9 @@ pub struct Pairing {
     pub sni: Option<String>,
     #[serde(rename = "x", default, skip_serializing_if = "Option::is_none")]
     pub xhttp_mode: Option<XhttpMode>,
+    /// Parallax packet mode; absent means stream mode.
+    #[serde(rename = "m", default, skip_serializing_if = "Option::is_none")]
+    pub parallax_mode: Option<crate::parallax_carrier::Mode>,
     /// TLS ClientHello fragmentation on the dialing side.
     #[serde(rename = "g", default, skip_serializing_if = "std::ops::Not::not")]
     pub tls_fragment: bool,
@@ -80,6 +84,15 @@ pub struct Pairing {
     )]
     pub wire_version: u8,
     /// Tunables, by name.
+    /// Game mode: (port, copies).
+    #[serde(rename = "q", default, skip_serializing_if = "Option::is_none")]
+    pub game: Option<(u16, u8)>,
+    /// The servers talk over IPv6 (the transport list's IPv6 entry).
+    #[serde(rename = "i", default, skip_serializing_if = "std::ops::Not::not")]
+    pub ipv6: bool,
+    /// FEC-RAW tuned for low delay (`fec.profile: "gaming"`).
+    #[serde(rename = "y", default, skip_serializing_if = "std::ops::Not::not")]
+    pub low_delay: bool,
     #[serde(rename = "z", default, skip_serializing_if = "BTreeMap::is_empty")]
     pub settings: BTreeMap<String, u64>,
 }
@@ -213,6 +226,15 @@ pub fn ports_from_config(config: &Value) -> (Vec<super::plan::PortRule>, Protoco
     (rules, protocol, public_ip)
 }
 
+/// Whether a saved tunnel runs over IPv6: it dials an IPv6 address or listens on `[::]`.
+pub fn is_ipv6(config: &Value) -> bool {
+    let entry = if config["mode"] == "server" { &config["listeners"][0] } else { &config["paths"][0] };
+    entry["addr"]
+        .as_str()
+        .and_then(|addr| addr.rsplit_once(':'))
+        .is_some_and(|(host, _)| host.trim_matches(['[', ']']).parse::<std::net::Ipv6Addr>().is_ok())
+}
+
 /// Whether the other server will need this server's address to reach it.
 pub fn needs_address(config: &Value) -> bool {
     let server = config["mode"] == "server";
@@ -224,9 +246,29 @@ pub fn needs_address(config: &Value) -> bool {
         &config["paths"][0]
     };
     let raw = entry.get("raw").is_some_and(|raw| !raw.is_null());
+    // In Game mode the foreign server always connects to the Iran server's control port, also in
+    // a direct tunnel, where it would otherwise not need the Iran server's address.
+    let game = server && server_dials && game_of(config).is_some();
     // This server listens when it is the server of a reverse tunnel or the client of a direct
     // one; raw carriers always need the peer's real address.
-    raw || server != server_dials
+    raw || game || server != server_dials
+}
+
+/// The Game mode of a saved tunnel as (port, copies), when its `gaming` block is the one Game mode
+/// writes. Other `gaming` setups (an explicit advertise, migration settings) are endpoint-local.
+pub fn game_of(config: &Value) -> Option<(u16, u8)> {
+    let gaming = config.get("gaming")?.as_object()?;
+    let control = gaming.get("control_address")?.as_str()?.parse::<std::net::SocketAddr>().ok()?;
+    if gaming.keys().any(|key| !matches!(key.as_str(), "control_address" | "udp_bind" | "copies")) {
+        return None;
+    }
+    let port = gaming.get("udp_bind")?.as_str()?.parse::<std::net::SocketAddr>().ok()?.port();
+    // Game mode uses one port for both; separate control and UDP ports are a custom setup.
+    if control.port() != port {
+        return None;
+    }
+    let copies = gaming.get("copies").and_then(Value::as_u64).unwrap_or(1).clamp(1, 4) as u8;
+    Some((port, copies))
 }
 
 /// Builds the code for a saved tunnel. `address` is how the other server reaches this one
@@ -240,7 +282,7 @@ pub fn from_config(
     ensure!(directional.is_null(),"Mirage v2 has endpoint-local transmit sources and expected receive-source sets; configure both endpoints explicitly rather than export an incomplete pairing code. See docs/mirage.md");
     let key=if config["mode"]=="server"{"listeners"}else{"paths"};
     let entry=&config[key][0];
-    ensure!(config["gaming"]["control_address"].is_null() && entry["fec"]["tcp_fallback"]["address"].is_null() && !entry["raw"]["hopping"]["enabled"].as_bool().unwrap_or(false),
+    ensure!((config["gaming"]["control_address"].is_null() || game_of(config).is_some()) && entry["fec"]["tcp_fallback"]["address"].is_null() && !entry["raw"]["hopping"]["enabled"].as_bool().unwrap_or(false),
         "this tunnel uses endpoint-local gaming/fallback/hopping settings; configure the other endpoint explicitly using docs/transport-upgrade.md instead of exporting an incomplete pairing code");
     let mode: Mode = serde_json::from_value(config["mode"].clone()).context("mode")?;
     let server = mode == Mode::Server;
@@ -312,7 +354,7 @@ pub fn from_config(
     // A dialing creator already knows the CDN domain from its own settings.
     let cdn = cdn.or_else(|| entry["xhttp"]["host"].as_str().map(str::to_string));
     let mut settings = BTreeMap::new();
-    for setting in relevant_settings(mode, transport, direct) {
+    for setting in relevant(&Scope::of_config(config)?) {
         if is_local_only(setting.name) {
             continue;
         }
@@ -337,6 +379,13 @@ pub fn from_config(
         xhttp_mode: entry["xhttp"]
             .get("mode")
             .and_then(|m| serde_json::from_value(m.clone()).ok()),
+        parallax_mode: entry["parallax"]
+            .get("mode")
+            .and_then(|m| serde_json::from_value(m.clone()).ok())
+            .filter(|mode| *mode == crate::parallax_carrier::Mode::Packet),
+        game: game_of(config),
+        ipv6: is_ipv6(config),
+        low_delay: entry["fec"]["profile"].as_str() == Some("gaming"),
         // Both only mean something on the side that dials; on a listener they are not in effect,
         // and sending them would switch them on at the other end without anyone asking.
         tls_fragment: creator_dials && entry["tls_fragment"]["enabled"].as_bool().unwrap_or(false),
@@ -466,6 +515,23 @@ pub fn to_plan(pairing: &Pairing) -> Result<(Plan, Missing)> {
     if let Some(mode) = pairing.xhttp_mode {
         plan.xhttp_mode = mode;
     }
+    if let Some(mode) = pairing.parallax_mode {
+        plan.parallax_mode = mode;
+    }
+    if let Some((port, copies)) = pairing.game {
+        ensure!((1..=4).contains(&copies) && port != 0, "the code's Game mode settings are not valid");
+        // A foreign server reaches the Iran server's control port by the address the Iran server
+        // put in the code: in a direct tunnel, and through a CDN (where it dials the CDN).
+        let iran_host = (side == Side::Foreign && (pairing.direct || plan.cdn.is_some()))
+            .then(|| pairing.address.clone())
+            .flatten();
+        plan.game = Some(super::plan::GamePlan { port, copies, iran_host });
+    }
+    plan.low_delay = pairing.low_delay && plan.transport == Transport::FecRaw;
+    if pairing.ipv6 {
+        plan.ipv6 = true;
+        plan.listen_on_both_families();
+    }
     plan.tls_fragment = pairing.tls_fragment;
     if pairing.tls_profile.as_deref() == Some("chrome") && cfg!(feature = "browser-tls") {
         plan.tls_profile = crate::config::TlsProfile::Chrome;
@@ -536,7 +602,7 @@ pub fn to_plan(pairing: &Pairing) -> Result<(Plan, Missing)> {
     {
         plan.pool = pool;
     }
-    for setting in relevant_settings(plan.mode(), plan.transport, pairing.direct) {
+    for setting in relevant(&Scope::of_plan(&plan)) {
         if is_local_only(setting.name) {
             continue;
         }
@@ -780,12 +846,12 @@ mod tests {
     #[test]
     fn iran_ports_and_tuned_settings_travel_in_the_code() {
         let mut creator = plan(Side::Iran, Direction::Reverse, Transport::Kcp);
-        let mtu = relevant_settings(Mode::Server, Transport::Kcp, false)
+        let mtu = relevant(&Scope::new(Mode::Server, Transport::Kcp, false))
             .into_iter()
             .find(|s| s.name == "kcp.mtu")
             .unwrap();
         creator.tuned.push((mtu, 1200));
-        let window = relevant_settings(Mode::Server, Transport::Kcp, false)
+        let window = relevant(&Scope::new(Mode::Server, Transport::Kcp, false))
             .into_iter()
             .find(|s| s.name == "stream_window")
             .unwrap();
@@ -794,6 +860,149 @@ mod tests {
         let names: Vec<(&str, u64)> = foreign.tuned.iter().map(|(s, v)| (s.name, *v)).collect();
         assert!(names.contains(&("kcp.mtu", 1200)), "{names:?}");
         assert!(names.contains(&("stream_window", 512)), "{names:?}");
+    }
+
+    #[test]
+    fn game_mode_with_split_ports_is_not_exported_as_one_port() {
+        let mut config = plan(Side::Iran, Direction::Reverse, Transport::Tcp).to_json().unwrap();
+        config["gaming"] = serde_json::json!({"control_address": "0.0.0.0:7011", "udp_bind": "0.0.0.0:7012", "copies": 3});
+        assert!(game_of(&config).is_none(), "separate control and UDP ports are a custom setup");
+        assert!(from_config(&config, Some("198.51.100.1".into()), None).is_err());
+        config["gaming"]["udp_bind"] = serde_json::json!("0.0.0.0:7011");
+        assert_eq!(game_of(&config), Some((7011, 3)));
+    }
+
+    /// The foreign end of a reverse tunnel through a CDN dials the CDN's domain; Game mode takes
+    /// the Iran server's real address from the code.
+    #[test]
+    fn game_mode_through_a_cdn_uses_the_iran_address_from_the_code() {
+        let mut iran = plan(Side::Iran, Direction::Reverse, Transport::Xhttps);
+        iran.protocol = Protocol::Both;
+        iran.cdn = Some(CdnPlan { domain: String::new() });
+        iran.set_game(true);
+        let config = iran.to_json().unwrap();
+        check(&config).unwrap();
+        let code = encode(&from_config(&config, Some("198.51.100.7".into()), Some("cdn.example.com".into())).unwrap()).unwrap();
+        let (foreign, _) = to_plan(&decode(&code).unwrap()).unwrap();
+        assert!(foreign.cdn.is_some() && foreign.peer_host.is_none());
+        let saved = foreign.to_json().unwrap();
+        check(&saved).unwrap();
+        assert_eq!(saved["gaming"]["control_address"], format!("198.51.100.7:{}", iran.tunnel_port + 1));
+        // A host name in the code is not enough for the datagram path: the IP must be asked for.
+        let code = encode(&from_config(&config, Some("iran.example.com".into()), Some("cdn.example.com".into())).unwrap()).unwrap();
+        let (mut foreign, _) = to_plan(&decode(&code).unwrap()).unwrap();
+        assert!(foreign.game_needs_iran_ip());
+        assert!(foreign.to_json().is_err());
+        foreign.game.as_mut().unwrap().iran_host = Some("198.51.100.7".into());
+        assert!(!foreign.game_needs_iran_ip());
+        check(&foreign.to_json().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn game_mode_needs_an_ip_and_the_matching_address_family() {
+        // Reverse, the Iran server known by a host name: Game mode needs its IP separately.
+        let mut foreign = plan(Side::Foreign, Direction::Reverse, Transport::Tcp);
+        foreign.peer_host = Some("iran.example.com".into());
+        foreign.set_game(true);
+        assert!(foreign.game_needs_iran_ip());
+        assert!(foreign.to_json().is_err());
+        // The gaming profile does not switch on what it cannot finish.
+        let mut profiled = plan(Side::Foreign, Direction::Reverse, Transport::Tcp);
+        profiled.peer_host = Some("iran.example.com".into());
+        profiled.apply_profile(super::super::plan::Profile::Gaming);
+        assert!(profiled.game.is_none());
+        // An IPv6 Iran address: the game socket is IPv6 too, though the carrier is IPv4.
+        let mut direct = plan(Side::Foreign, Direction::Direct, Transport::Tcp);
+        direct.set_game(true);
+        direct.game.as_mut().unwrap().iran_host = Some("2001:db8::7".into());
+        let saved = direct.to_json().unwrap();
+        check(&saved).unwrap();
+        assert_eq!(saved["gaming"]["control_address"], format!("[2001:db8::7]:{}", direct.tunnel_port + 1));
+        assert!(saved["gaming"]["udp_bind"].as_str().unwrap().starts_with("[::]:"));
+        // The Iran end of the same tunnel listens on IPv6 too, though its carrier is IPv4.
+        let mut iran = plan(Side::Iran, Direction::Direct, Transport::Tcp);
+        iran.protocol = Protocol::Both;
+        iran.set_game(true);
+        iran.game.as_mut().unwrap().iran_host = Some("2001:db8::7".into());
+        let iran_saved = iran.to_json().unwrap();
+        check(&iran_saved).unwrap();
+        assert!(iran_saved["gaming"]["udp_bind"].as_str().unwrap().starts_with("[::]:"), "{}", iran_saved["gaming"]);
+        assert!(iran_saved["gaming"]["control_address"].as_str().unwrap().starts_with("[::]:"));
+        // A hand-made mismatch is refused.
+        let mut mixed = saved.clone();
+        mixed["gaming"]["udp_bind"] = serde_json::json!(format!("0.0.0.0:{}", direct.tunnel_port + 1));
+        assert!(check(&mixed).is_err());
+        // Editing a saved tunnel: a host-name carrier needs the IP; an IP carrier serves as is.
+        let mut by_name = plan(Side::Foreign, Direction::Reverse, Transport::Tcp);
+        by_name.peer_host = Some("iran.example.com".into());
+        let mut by_name = by_name.to_json().unwrap();
+        assert!(crate::manager::tune::game_asks_iran_ip(&by_name));
+        assert!(crate::manager::tune::set_game_config(&mut by_name, Some((7001, 3, None))).is_err());
+        crate::manager::tune::set_game_config(&mut by_name, Some((7001, 3, Some("198.51.100.7".into())))).unwrap();
+        assert_eq!(by_name["gaming"]["control_address"], "198.51.100.7:7001");
+        check(&by_name).unwrap();
+        let mut by_ip = plan(Side::Foreign, Direction::Reverse, Transport::Tcp).to_json().unwrap();
+        assert!(!crate::manager::tune::game_asks_iran_ip(&by_ip));
+        crate::manager::tune::set_game_config(&mut by_ip, Some((7001, 3, None))).unwrap();
+        assert_eq!(by_ip["gaming"]["control_address"], "203.0.113.7:7001");
+    }
+
+    /// An IPv6 tunnel stays IPv6 at the other end: a dialing creator's IPv6 address makes the
+    /// other server listen on IPv6; a listening creator gives its IPv6 address to dial.
+    #[test]
+    fn the_ipv6_choice_travels_in_the_code() {
+        // The Iran server dials (direct) the foreign server's IPv6 address.
+        let mut iran = plan(Side::Iran, Direction::Direct, Transport::Wss);
+        iran.ipv6 = true;
+        iran.peer_host = Some("2001:db8::20".into());
+        let config = iran.to_json().unwrap();
+        assert!(is_ipv6(&config));
+        let foreign = round_trip(iran, None);
+        assert!(foreign.ipv6);
+        let saved = foreign.to_json().unwrap();
+        assert!(saved["paths"][0]["addr"].as_str().unwrap().starts_with("[::]:"), "{}", saved["paths"][0]["addr"]);
+        // The Iran server listens on IPv6 (reverse); the foreign server dials its IPv6 address.
+        let mut iran = plan(Side::Iran, Direction::Reverse, Transport::Kcp);
+        iran.ipv6 = true;
+        iran.listen_on_both_families();
+        let config = iran.to_json().unwrap();
+        assert!(is_ipv6(&config));
+        let foreign = round_trip(iran, Some("2001:db8::10"));
+        assert!(foreign.ipv6);
+        assert!(foreign.to_json().unwrap()["paths"][0]["addr"].as_str().unwrap().starts_with("[2001:db8::10]:"));
+        // An IPv4 tunnel says nothing of IPv6.
+        let plain = plan(Side::Iran, Direction::Reverse, Transport::Tcp).to_json().unwrap();
+        assert!(!is_ipv6(&plain));
+    }
+
+    #[test]
+    fn the_low_delay_raw_tuning_travels() {
+        let mut creator = plan(Side::Iran, Direction::Reverse, Transport::FecRaw);
+        creator.raw = Some(RawPlan {
+            profile: "tcp".into(),
+            peer_ip: "203.0.113.7".parse().unwrap(),
+            ip_mode: IpMode::Normal,
+            interface: None,
+            local_ip: None,
+            mirage: None,
+        });
+        creator.apply_profile(super::super::plan::Profile::Gaming);
+        assert!(creator.low_delay);
+        let low_delay = |config: &serde_json::Value| {
+            ["listeners", "paths"].iter().any(|list| config[*list][0]["fec"]["profile"] == "gaming")
+        };
+        let config = creator.to_json().unwrap();
+        check(&config).unwrap();
+        assert!(low_delay(&config));
+        let code = encode(&from_config(&config, Some("198.51.100.1".into()), None).unwrap()).unwrap();
+        let (mut other, missing) = to_plan(&decode(&code).unwrap()).unwrap();
+        if missing.ports {
+            other.ports = parse_ports("443").unwrap();
+        }
+        assert!(other.low_delay);
+        let config = other.to_json().unwrap();
+        check(&config).unwrap_or_else(|e| panic!("{e:#}"));
+        assert!(low_delay(&config));
     }
 
     #[test]
@@ -896,6 +1105,40 @@ mod tests {
         assert!(decode("hello").is_err());
         assert!(decode(&creator.key).is_err());
         assert!(code.len() < 400, "code is {} characters", code.len());
+    }
+
+    #[test]
+    fn game_mode_travels_and_each_end_gets_its_part() {
+        // Reverse: the foreign server dials, and connects the control to the Iran server it dials.
+        let mut iran = plan(Side::Iran, Direction::Reverse, Transport::FecUdp);
+        iran.protocol = Protocol::Both;
+        iran.set_game(true);
+        assert_eq!(iran.speed, crate::manager::speed::SpeedMode::Fast3);
+        let config = iran.to_json().unwrap();
+        assert_eq!(config["gaming"]["control_address"], format!("0.0.0.0:{}", iran.tunnel_port + 1));
+        assert_eq!(config["gaming"]["copies"], 3);
+        let foreign = round_trip(iran.clone(), Some("198.51.100.9"));
+        assert_eq!(foreign.game.as_ref().map(|g| (g.port, g.copies)), Some((iran.tunnel_port + 1, 3)));
+        let config = foreign.to_json().unwrap();
+        assert_eq!(config["gaming"]["control_address"], format!("198.51.100.9:{}", iran.tunnel_port + 1));
+        check(&config).unwrap();
+        // Direct: the Iran server dials, so the code must carry its address for the control.
+        let mut iran = plan(Side::Iran, Direction::Direct, Transport::Tcp);
+        iran.protocol = Protocol::Udp;
+        iran.set_game(true);
+        let saved = iran.to_json().unwrap();
+        assert!(needs_address(&saved), "a direct Game mode tunnel needs the Iran address");
+        let foreign = round_trip(iran.clone(), Some("203.0.113.44"));
+        assert_eq!(foreign.to_json().unwrap()["gaming"]["control_address"], format!("203.0.113.44:{}", iran.tunnel_port + 1));
+        // Without UDP there is nothing to speed up; other gaming setups stay endpoint-local.
+        let mut tcp_only = plan(Side::Iran, Direction::Reverse, Transport::Tcp);
+        tcp_only.protocol = Protocol::Tcp;
+        tcp_only.game = Some(super::super::plan::GamePlan { port: 7001, copies: 3, iran_host: None });
+        assert!(tcp_only.to_json().is_err());
+        let mut custom = plan(Side::Iran, Direction::Reverse, Transport::Tcp).to_json().unwrap();
+        custom["gaming"] = serde_json::json!({"control_address": "0.0.0.0:7001", "udp_bind": "0.0.0.0:7001", "advertise": "203.0.113.1:7001"});
+        assert!(game_of(&custom).is_none());
+        assert!(from_config(&custom, None, None).is_err());
     }
 
     #[test]

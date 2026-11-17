@@ -22,14 +22,23 @@ pub struct Options {
     pub mtu:usize,
     pub renewal_sec:u64,
     pub max_flows:usize,
+    /// Copies of every datagram, each sent from its own UDP port (1 to 4). The route treats each
+    /// port pair as a separate flow, so the copies take different paths through it; the receiver
+    /// keeps whichever arrives first and drops the rest (they share one sequence number). This
+    /// beats both packet loss and a slow path at the cost of `copies` times the game's bandwidth.
+    #[serde(default="one_copy")]
+    pub copies:u8,
 }
-impl Default for Options {fn default()->Self {Self {control_address:None,udp_bind:None,advertise:None,migrate:true,mtu:1200,renewal_sec:300,max_flows:1024}}}
+fn one_copy()->u8 {1}
+fn is_one_copy(value:&u8)->bool {*value==1}
+impl Default for Options {fn default()->Self {Self {control_address:None,udp_bind:None,advertise:None,migrate:true,mtu:1200,renewal_sec:300,max_flows:1024,copies:1}}}
 impl Options {
     pub fn enabled(&self)->bool {self.control_address.is_some()}
     pub fn validate(&self)->Result<()> {
         ensure!((256..=MAX_PACKET).contains(&self.mtu),"gaming mtu must be256..1400");
         ensure!((5..=300).contains(&self.renewal_sec),"gaming renewal_sec must be5..300");
         ensure!((1..=4096).contains(&self.max_flows),"gaming max_flows must be1..4096");
+        ensure!((1..=4).contains(&self.copies),"gaming copies must be 1..4");
         if let Some(address)=&self.control_address {let addr:SocketAddr=address.parse().context("gaming control_address requires IP:port")?;ensure!(addr.port()!=0,"gaming control port must be nonzero");ensure!(self.udp_bind.is_some(),"gaming needs explicit udp_bind");}
         if let Some(addr)=self.advertise {ensure!(addr.port()!=0 && !addr.ip().is_unspecified(),"gaming advertise must be a reachable IP:port");}
         Ok(())
@@ -121,17 +130,20 @@ fn random<const N:usize>()->Result<[u8;N]>{let mut bytes=[0;N];rustls::crypto::r
 
 #[derive(Debug,Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Hello {version:u8,direct:bool,migration:bool,mtu:usize,address:SocketAddr}
+struct Hello {version:u8,direct:bool,migration:bool,mtu:usize,address:SocketAddr,
+    /// Copies the sender sends from extra ports; left out when 1 so older versions still agree.
+    #[serde(default="one_copy",skip_serializing_if="is_one_copy")]
+    copies:u8}
 
 async fn write_handshake(stream:&mut TcpStream,bytes:&[u8])->Result<()> {ensure!(bytes.len()<=2048,"gaming handshake size");stream.write_u16(bytes.len() as u16).await?;stream.write_all(bytes).await?;Ok(())}
 async fn read_handshake(stream:&mut TcpStream)->Result<Vec<u8>> {let size=stream.read_u16().await? as usize;ensure!((1..=2048).contains(&size),"gaming handshake length");let mut bytes=vec![0;size];stream.read_exact(&mut bytes).await?;Ok(bytes)}
 
-async fn handshake(mut stream:TcpStream,private:&[u8;32],peer:Option<[u8;32]>,allowed:&[[u8;32]],options:&Options,advertise:SocketAddr)->Result<(Codec,SocketAddr,[u8;32],bool,TcpStream)> {
+async fn handshake(mut stream:TcpStream,private:&[u8;32],peer:Option<[u8;32]>,allowed:&[[u8;32]],options:&Options,advertise:SocketAddr)->Result<(Codec,SocketAddr,[u8;32],bool,u8,TcpStream)> {
     stream.set_nodelay(true)?;
     let mut builder=Builder::new(crate::transport::NOISE_PATTERN.parse()?).local_private_key(private)?.prologue(DOMAIN)?;
     if let Some(peer)=&peer{builder=builder.remote_public_key(peer)?;}
     let mut state=if peer.is_some(){builder.build_initiator()?}else{builder.build_responder()?};
-    let local=serde_json::to_vec(&Hello{version:1,direct:true,migration:options.migrate,mtu:options.mtu,address:advertise})?;
+    let local=serde_json::to_vec(&Hello{version:1,direct:true,migration:options.migrate,mtu:options.mtu,address:advertise,copies:options.copies})?;
     let mut wire=[0;2048];let mut plain=[0;2048];
     let remote=if peer.is_some(){
         let size=state.write_message(&local,&mut wire)?;write_handshake(&mut stream,&wire[..size]).await?;
@@ -143,15 +155,17 @@ async fn handshake(mut stream:TcpStream,private:&[u8;32],peer:Option<[u8;32]>,al
         ensure!(allowed.iter().any(|key|key.as_slice()==identity),"gaming peer identity not allowed");
         let size=state.write_message(&local,&mut wire)?;write_handshake(&mut stream,&wire[..size]).await?;hello
     };
-    ensure!(remote.version==1 && remote.direct && (256..=MAX_PACKET).contains(&remote.mtu),"unsupported gaming capabilities");
+    ensure!(remote.version==1 && remote.direct && (256..=MAX_PACKET).contains(&remote.mtu) && (1..=4).contains(&remote.copies),"unsupported gaming capabilities");
     ensure!(remote.address.port()!=0 && !remote.address.ip().is_unspecified() && remote.address.ip()==stream.peer_addr()?.ip(),"gaming address must match authenticated control peer IP");
     let identity=state.get_remote_static().context("gaming peer key")?.try_into().unwrap();
     let codec=Codec::new(state,options.mtu.min(remote.mtu))?;
-    Ok((codec,remote.address,identity,options.migrate&&remote.migration,stream))
+    Ok((codec,remote.address,identity,options.migrate&&remote.migration,remote.copies,stream))
 }
 
 struct Channel {
     codec:Mutex<Codec>, address:SocketAddr, peer:[u8;32], migrate:bool,
+    /// The peer sends copies from other ports of the same (authenticated) IP address.
+    any_port:bool,
     generation:u64,challenge:[u8;16],ready:std::sync::atomic::AtomicBool,created:Instant,
     fragments:Mutex<HashMap<u64,Fragments>>,
 }
@@ -180,6 +194,8 @@ struct Queued{bytes:Vec<u8>,_permit:OwnedSemaphorePermit}
 struct Origin {sender:mpsc::Sender<Queued>,touched:Instant,replay:Replay,peer:Option<[u8;32]>,generation:u64,address:Option<SocketAddr>}
 pub struct Hub {
     socket:tokio::sync::watch::Sender<Arc<UdpSocket>>,options:Options,
+    /// Send-only sockets for the extra copies, each on its own port (`copies - 1` of them).
+    extra:Vec<Arc<UdpSocket>>,
     rebind:Arc<tokio::sync::Notify>,
     advertised:std::sync::RwLock<SocketAddr>,
     channels:Mutex<HashMap<[u8;16],Arc<Channel>>>,
@@ -199,7 +215,14 @@ impl Hub {
         let options=config.gaming.clone();options.validate()?;
         let socket=Arc::new(UdpSocket::bind(options.udp_bind.context("gaming udp_bind")?).await?);
         let advertise=options.advertise.unwrap_or(socket.local_addr()?);
-        ensure!(!advertise.ip().is_unspecified(),"gaming needs explicit advertise when udp_bind is unspecified");
+        let mut extra=Vec::new();
+        for _ in 1..options.copies {
+            let bind=SocketAddr::new(socket.local_addr()?.ip(),0);
+            extra.push(Arc::new(UdpSocket::bind(bind).await.context("gaming copy socket")?));
+        }
+        // Without an explicit advertise on a wildcard bind, each handshake advertises the address
+        // the peer reached this server at (the control connection's local address), which is the
+        // address the peer checks it against.
         let private=config.private_key()?;
         let allowed=config.peer_public_keys.iter().map(|key|crate::config::decode_key(key)).collect::<Result<Vec<_>>>()?;
         let peer=if config.mode==Mode::Client {
@@ -210,17 +233,21 @@ impl Hub {
         let idle=Duration::from_secs(config.timeouts.udp_idle_sec);
         let listener=if config.mode==Mode::Server {Some(TcpListener::bind(options.control_address.as_ref().context("gaming control address")?).await?)}else{None};
         let(socket,_)=tokio::sync::watch::channel(socket);
-        let hub=Arc::new(Self{socket,options:options.clone(),rebind:Arc::new(tokio::sync::Notify::new()),advertised:std::sync::RwLock::new(advertise),channels:Mutex::new(HashMap::new()),flows:Mutex::new(HashMap::new()),origins:Mutex::new(HashMap::new()),tombstones:Mutex::new(HashMap::new()),queued_bytes:Arc::new(Semaphore::new(16*1024*1024)),sequence:0.into(),generation:1.into(),tasks:std::sync::Mutex::new(Vec::new())});
+        let hub=Arc::new(Self{socket,extra,options:options.clone(),rebind:Arc::new(tokio::sync::Notify::new()),advertised:std::sync::RwLock::new(advertise),channels:Mutex::new(HashMap::new()),flows:Mutex::new(HashMap::new()),origins:Mutex::new(HashMap::new()),tombstones:Mutex::new(HashMap::new()),queued_bytes:Arc::new(Semaphore::new(16*1024*1024)),sequence:0.into(),generation:1.into(),tasks:std::sync::Mutex::new(Vec::new())});
         let weak=Arc::downgrade(&hub);
         let control=tokio::spawn(async move {
             loop {
                 let stream=if let Some(listener)=&listener {listener.accept().await.map(|(s,_)|s)}else{TcpStream::connect(options.control_address.as_ref().unwrap()).await};
                 let Ok(stream)=stream else {tokio::time::sleep(Duration::from_secs(1)).await;continue;};
-                let Some(hub)=weak.upgrade()else{break;};let advertise=*hub.advertised.read().unwrap_or_else(|e|e.into_inner());drop(hub);
+                let Some(hub)=weak.upgrade()else{break;};let mut advertise=*hub.advertised.read().unwrap_or_else(|e|e.into_inner());drop(hub);
+                if advertise.ip().is_unspecified(){
+                    let Ok(local)=stream.local_addr()else{continue;};
+                    advertise=SocketAddr::new(local.ip(),advertise.port());
+                }
                 match timeout(Duration::from_secs(5),handshake(stream,&private,peer,&allowed,&options,advertise)).await {
-                    Ok(Ok((codec,address,identity,migrate,mut control)))=>{
+                    Ok(Ok((codec,address,identity,migrate,copies,mut control)))=>{
                         let Some(hub)=weak.upgrade()else{break;};
-                        let channel=Arc::new(Channel {codec:Mutex::new(codec),address,peer:identity,migrate,
+                        let channel=Arc::new(Channel {codec:Mutex::new(codec),address,peer:identity,migrate,any_port:copies>1,
                             generation:hub.generation.fetch_add(1,std::sync::atomic::Ordering::Relaxed),challenge:match random(){Ok(v)=>v,Err(_)=>break},ready:false.into(),created:Instant::now(),fragments:Mutex::new(HashMap::new())});
                         let id=channel.codec.lock().await.id;
                         {let mut channels=hub.channels.lock().await;channels.retain(|_,c|c.created.elapsed()<Duration::from_secs(360));
@@ -274,8 +301,18 @@ impl Hub {
                 let Some(hub)=weak.upgrade()else{break;};
                 let id:[u8;16]=bytes[4..20].try_into().unwrap();
                 let channel=hub.channels.lock().await.get(&id).cloned();let Some(channel)=channel else{continue;};
-                if source!=channel.address{continue;}
-                let decoded=channel.codec.lock().await.decode(&bytes[..length]);
+                // Copies come from the peer's other ports; replies still go only to its address.
+                if source!=channel.address && !(channel.any_port && source.ip()==channel.address.ip()){continue;}
+                let decoded={
+                    let mut codec=channel.codec.lock().await;
+                    let counter=u64::from_be_bytes(bytes[20..28].try_into().unwrap());
+                    if codec.replay.seen(counter){
+                        // A later copy of a datagram already delivered: the race was won.
+                        crate::transport_metrics::GAMING_COPIES_ABSORBED.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+                        continue;
+                    }
+                    codec.decode(&bytes[..length])
+                };
                 let Ok(mut message)=decoded else{crate::transport_metrics::GAMING_REJECTED.fetch_add(1,std::sync::atomic::Ordering::Relaxed);continue;};
                 crate::transport_metrics::GAMING_RX.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
                 if let Message::Fragment{id,index,count,bytes:part}=message {
@@ -326,8 +363,11 @@ impl Hub {
         let mut codec=channel.codec.lock().await;
         let plain=message.encode()?;
         ensure!(plain.len()<=17_500,"gaming message exceeds bounded datagram size");
+        // Data races over every copy socket; probes and closes need only one.
+        let copies:&[Arc<UdpSocket>]=if matches!(message,Message::Data{..}){&self.extra}else{&[]};
         if HEADER+TAG+plain.len()<=codec.mtu {
             let bytes=codec.encode(message)?;socket.send_to(&bytes,channel.address).await?;
+            for copy in copies {let _=copy.send_to(&bytes,channel.address).await;}
             crate::transport_metrics::GAMING_TX.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
         }else {
             ensure!(!matches!(message,Message::Fragment{..}),"nested gaming fragment");
@@ -335,6 +375,7 @@ impl Hub {
             let count=plain.len().div_ceil(size);ensure!(count<=128,"gaming fragment count exceeded");
             let id=codec.counter;
             for(index,part)in plain.chunks(size).enumerate(){let bytes=codec.encode(&Message::Fragment{id,index:index as u8,count:count as u8,bytes:part.to_vec()})?;socket.send_to(&bytes,channel.address).await?;
+                for copy in copies {let _=copy.send_to(&bytes,channel.address).await;}
                 crate::transport_metrics::GAMING_TX.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
                 // Releasing the executor after a small batch lets the peer drain
                 // its UDP receive queue under the same CPU budget; no ACK/retry.
@@ -495,8 +536,8 @@ mod tests {
         let listener=TcpListener::bind("127.0.0.1:0").await?;let addr=listener.local_addr()?;
         let options=Options::default();let allowed=[client.public.try_into().unwrap()];
         let task=tokio::spawn(async move{let(s,_)=listener.accept().await?;handshake(s,&server.private.try_into().unwrap(),None,&allowed,&options,"127.0.0.1:34567".parse()?).await});
-        let (mut a,_,_,_,_)=handshake(TcpStream::connect(addr).await?,&client.private.try_into().unwrap(),Some(server.public.try_into().unwrap()),&[],&Options::default(),"127.0.0.1:34568".parse()?).await?;
-        let (mut b,_,_,_,_)=task.await??;
+        let (mut a,_,_,_,_,_)=handshake(TcpStream::connect(addr).await?,&client.private.try_into().unwrap(),Some(server.public.try_into().unwrap()),&[],&Options::default(),"127.0.0.1:34568".parse()?).await?;
+        let (mut b,_,_,_,_,_)=task.await??;
         let message=Message::Probe([7;16]);let packet=a.encode(&message)?;let mut forged=packet.clone();*forged.last_mut().unwrap()^=1;
         assert!(b.decode(&forged).is_err());assert_eq!(b.decode(&packet)?,message);assert!(b.decode(&packet).is_err());
         let reply=b.encode(&Message::ProbeAck([7;16]))?;assert_eq!(a.decode(&reply)?,Message::ProbeAck([7;16]));Ok(())
@@ -533,7 +574,7 @@ mod tests {
         let codecs=task.await??;
         let peer:[u8;32]=client.public.clone().try_into().unwrap();
         let mut generation=0;
-        let mut channel=|codec:Codec,ready:bool|{generation+=1;Arc::new(Channel{codec:Mutex::new(codec),address:"127.0.0.1:34572".parse().unwrap(),peer,migrate:false,generation,challenge:[0;16],
+        let mut channel=|codec:Codec,ready:bool|{generation+=1;Arc::new(Channel{codec:Mutex::new(codec),address:"127.0.0.1:34572".parse().unwrap(),peer,migrate:false,any_port:false,generation,challenge:[0;16],
             ready:std::sync::atomic::AtomicBool::new(ready),created:Instant::now(),fragments:Mutex::new(HashMap::new())})};
         let mut codecs=codecs.into_iter();
         let mut channels:HashMap<[u8;16],Arc<Channel>>=HashMap::new();
@@ -563,9 +604,9 @@ mod tests {
         let allowed=[client.public.clone().try_into().unwrap()];
         let task=tokio::spawn(async move{let(s,_)=listener.accept().await?;handshake(s,&server.private.try_into().unwrap(),None,&allowed,&Options::default(),"127.0.0.1:34569".parse()?).await});
         let _client_side=handshake(TcpStream::connect(addr).await?,&client.private.try_into().unwrap(),Some(server.public.try_into().unwrap()),&[],&Options::default(),"127.0.0.1:34570".parse()?).await?;
-        let (codec,_,_,_,_)=task.await??;
+        let (codec,_,_,_,_,_)=task.await??;
         let peer:[u8;32]=client.public.try_into().unwrap();
-        let channel=Arc::new(Channel{codec:Mutex::new(codec),address:"127.0.0.1:34570".parse()?,peer,migrate:false,generation:1,challenge:[0;16],
+        let channel=Arc::new(Channel{codec:Mutex::new(codec),address:"127.0.0.1:34570".parse()?,peer,migrate:false,any_port:false,generation:1,challenge:[0;16],
             ready:std::sync::atomic::AtomicBool::new(true),created:Instant::now(),fragments:Mutex::new(HashMap::new())});
         let allowed_targets=["127.0.0.1:*".to_string()];
         // Absent flow: Close first, then the earlier Data.

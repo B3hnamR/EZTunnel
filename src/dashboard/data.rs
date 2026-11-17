@@ -62,6 +62,20 @@ pub struct Quota {
     pub limit: u64,
 }
 
+/// Game mode of a tunnel and what its datagram path did (since the tunnel started).
+#[derive(Serialize, Clone, Debug, Default, PartialEq)]
+pub struct Game {
+    pub copies: u8,
+    pub port: u16,
+    /// The authenticated datagram path is up (at least one channel answered its challenge).
+    /// None: a tunnel from before this figure existed, which cannot say whether it is up now.
+    pub ready: Option<bool>,
+    pub packets_out: u64,
+    pub packets_in: u64,
+    /// Later copies dropped because an earlier copy of the same packet had arrived.
+    pub copies_absorbed: u64,
+}
+
 #[derive(Serialize, Clone, Debug, Default)]
 pub struct Tunnel {
     pub name: String,
@@ -95,6 +109,8 @@ pub struct Tunnel {
     /// UDP datagrams the tunnel dropped since it started, and in the last minute.
     pub udp_dropped: Option<u64>,
     pub udp_dropped_recent: Option<u64>,
+    /// Game mode, when the tunnel has it.
+    pub game: Option<Game>,
     /// The configuration could not be read.
     pub error: Option<String>,
     /// The same for both ends of one tunnel (from their shared key, which it does not reveal),
@@ -308,6 +324,8 @@ impl LocalSource {
             }
         };
         describe(&mut view, &config);
+        view.game = crate::manager::pairing::game_of(&config)
+            .map(|(port, copies)| Game { copies, port, ..Game::default() });
         let state = service::state(&self.store, name);
         view.state = state_word(state);
         let memory = self.memory.entry(name.to_string()).or_default();
@@ -477,7 +495,10 @@ fn read_status(view: &mut Tunnel, status: &Value, server: bool, memory: &mut Mem
     if memory
         .heartbeats
         .back()
-        .is_some_and(|(_, p, l)| pongs < *p || lost < *l)
+        // Answers only ever grow while the tunnel runs: fewer means it restarted. The lost count
+        // can fall a little on its own (a late answer takes a lost heartbeat back), which is a
+        // correction, not a restart, and keeps the window.
+        .is_some_and(|(_, p, _)| pongs < *p)
     {
         memory.heartbeats.clear();
     }
@@ -491,7 +512,16 @@ fn read_status(view: &mut Tunnel, status: &Value, server: bool, memory: &mut Mem
         memory.heartbeats.pop_front();
     }
     if let Some((_, pongs0, lost0)) = memory.heartbeats.front() {
-        view.loss_pct = loss_percent(lost - lost0, pongs - pongs0);
+        view.loss_pct = loss_percent(lost.saturating_sub(*lost0), pongs - pongs0);
+    }
+    if let Some(game) = &mut view.game {
+        let extension = |key: &str| status["transport_extensions"][key].as_u64().unwrap_or(0);
+        // Whether the path is usable now (a validated channel can expire); a tunnel from before
+        // that figure existed only says whether it was ever validated.
+        game.ready = status["gaming_ready"].as_bool();
+        game.packets_out = extension("gaming_packets_sent");
+        game.packets_in = extension("gaming_packets_received");
+        game.copies_absorbed = extension("gaming_copies_absorbed");
     }
     if let Some(dropped) = counter("udp_dropped") {
         view.udp_dropped = Some(dropped);
@@ -635,6 +665,11 @@ impl Source for DemoSource {
                 tunnel.sessions = Some(if unstable { 2 } else { 4 });
                 tunnel.streams = Some(8 + (self.noise() * 20.0) as u64);
                 tunnel.reconnects = Some(if unstable { 7 } else { 0 });
+                if name == "game-fec" {
+                    let packets = (elapsed as u64 + 600) * 128;
+                    tunnel.game = Some(Game { copies: 3, port: 7001, ready: Some(true), packets_out: packets,
+                        packets_in: packets - packets / 90, copies_absorbed: packets * 19 / 10 });
+                }
                 tunnel.uptime_sec = Some(
                     [6 * 86_400 + 4 * 3600, 12 * 86_400 + 7 * 3600, 3 * 3600, 0][index]
                         + elapsed as u64,
@@ -672,6 +707,7 @@ impl Source for DemoSource {
             host: Host {
                 hostname: "tehran-1".into(),
                 address: Some("203.0.113.10".into()),
+                address6: Some("2001:db8:10::1".into()),
                 os: Some("Ubuntu 24.04 LTS".into()),
                 kernel: Some("6.8.0".into()),
                 cores: 4,
@@ -694,6 +730,27 @@ impl Source for DemoSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn game_mode_figures_come_from_the_status() {
+        let mut view = Tunnel { game: Some(Game { copies: 3, port: 7001, ..Game::default() }), ..Tunnel::default() };
+        let mut status = json!({"sessions": 4, "gaming_ready": true, "transport_extensions": {"gaming_channels_validated": 2,
+            "gaming_packets_sent": 500, "gaming_packets_received": 480, "gaming_copies_absorbed": 900}});
+        read_status(&mut view, &status, true, &mut Memory::default(), Instant::now());
+        assert_eq!(view.game, Some(Game { copies: 3, port: 7001, ready: Some(true), packets_out: 500, packets_in: 480, copies_absorbed: 900 }));
+        // Every channel expired: validated once, but not up now.
+        status["gaming_ready"] = json!(false);
+        read_status(&mut view, &status, true, &mut Memory::default(), Instant::now());
+        assert_eq!(view.game.as_ref().unwrap().ready, Some(false));
+        // An older tunnel without the live figure: unknown, not "up" from a validation long ago.
+        status.as_object_mut().unwrap().remove("gaming_ready");
+        read_status(&mut view, &status, true, &mut Memory::default(), Instant::now());
+        assert_eq!(view.game.as_ref().unwrap().ready, None);
+        // A tunnel without Game mode shows none, whatever the counters say.
+        let mut plain = Tunnel::default();
+        read_status(&mut plain, &status, true, &mut Memory::default(), Instant::now());
+        assert!(plain.game.is_none());
+    }
 
     #[test]
     fn both_ends_of_a_tunnel_share_a_pair_that_does_not_show_the_key() {
@@ -800,6 +857,11 @@ mod tests {
         read_status(&mut view, &status(5_000, 19, 1), true, &mut memory, start + Duration::from_secs(2));
         assert_eq!(view.down_bps, Some(2_000.0));
         assert_eq!(view.loss_pct, Some(10.0));
+        // A late answer takes one lost heartbeat back: the window and the other loss stay.
+        read_status(&mut view, &status(6_000, 29, 0), true, &mut memory, start + Duration::from_secs(3));
+        assert_eq!(view.loss_pct, Some(0.0));
+        read_status(&mut view, &status(7_000, 30, 2), true, &mut memory, start + Duration::from_millis(3500));
+        assert!(view.loss_pct.is_some_and(|l| l > 0.0), "the window was kept: {:?}", view.loss_pct);
         // A restart resets the counters: no negative rate, loss starts over.
         read_status(&mut view, &status(100, 1, 0), true, &mut memory, start + Duration::from_secs(4));
         assert_eq!(view.down_bps, Some(0.0));

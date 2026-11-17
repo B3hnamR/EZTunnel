@@ -1,5 +1,22 @@
 // Small helpers shared by the screens.
 
+/**
+ * `obj[key]` only when `obj` has it itself. Tunnel names are keys of plain objects, and a name
+ * such as `constructor` or `toString` would otherwise find what every object inherits.
+ */
+export function own(obj, key) {
+  return obj != null && Object.hasOwn(obj, key) ? obj[key] : undefined;
+}
+
+/** Text typed on a Persian or Arabic keyboard with plain digits and separators. */
+export function plainDigits(text) {
+  return String(text ?? "")
+    .replace(/[۰-۹]/g, (d) => d.charCodeAt(0) - 0x06f0)
+    .replace(/[٠-٩]/g, (d) => d.charCodeAt(0) - 0x0660)
+    .replace(/[،؛]/g, ",")
+    .replace(/\u2212/g, "-");
+}
+
 /** The status mark class and label key for a tunnel. */
 export function tunnelState(x) {
   if (x.state === "failed") return ["bad", "failed"];

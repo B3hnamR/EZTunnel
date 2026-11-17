@@ -119,7 +119,7 @@
       <div class="hd">
         <div class="grow">
           <div class="title"><h2 id="srv-local" class="ltr">{live.snapshot.host?.hostname}</h2><span class="code-chip">{t("thisServer")}</span></div>
-          <div class="meta"><span class="ltr mono">{live.snapshot.host?.address ?? ""}</span><span aria-hidden="true">·</span><span class="ltr">{live.snapshot.version}</span></div>
+          <div class="meta"><span class="ltr mono">{live.snapshot.host?.address ?? ""}</span>{#if live.snapshot.host?.address6}<span aria-hidden="true">·</span><span class="ltr mono">{live.snapshot.host.address6}</span>{/if}<span aria-hidden="true">·</span><span class="ltr">{live.snapshot.version}</span></div>
         </div>
         <span class="pill ok">{t("online")}</span>
       </div>
@@ -136,6 +136,7 @@
           <div class="title"><h2 id="srv-{i}" class="ltr">{server.name}</h2>{#if server.hello?.arch}<span class="code-chip">{server.hello.arch}</span>{/if}</div>
           <div class="meta">
             {#if server.snapshot?.host?.address}<span class="ltr mono">{server.snapshot.host.address}</span>{/if}
+            {#if server.snapshot?.host?.address6}<span aria-hidden="true">·</span><span class="ltr mono">{server.snapshot.host.address6}</span>{/if}
             {#if server.hello?.version}{#if server.snapshot?.host?.address}<span aria-hidden="true">·</span>{/if}<span class="ltr">{server.hello.version}</span>{/if}
           </div>
         </div>

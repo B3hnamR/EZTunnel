@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
     net::IpAddr,
@@ -17,11 +17,21 @@ pub const MAX_EVENTS: usize = 1000;
 const TAIL_BYTES: u64 = 512 * 1024;
 /// Events the in-memory log (demo, tests) keeps.
 const MEMORY_EVENTS: usize = 500;
+/// The file is moved to `<name>.1` (replacing the one before) when it grows past this, so the log
+/// on disk stays under twice this size whatever is sent to the dashboard.
+const MAX_FILE: u64 = 8 * 1024 * 1024;
+/// A repeated event (the same kind from the same address) is written at most once per this many
+/// seconds; the ones in between are counted into the next line.
+const REPEAT_SEC: u64 = 60;
+/// Repeated-event keys remembered at once.
+const MAX_REPEAT_KEYS: usize = 1024;
 
 pub struct Audit {
     file: Option<(Mutex<File>, PathBuf)>,
     /// Without a file: the events of this run, oldest first.
     memory: Mutex<VecDeque<Value>>,
+    /// `record_repeated`: (address, event) -> (last written, left out since).
+    repeats: Mutex<HashMap<(Option<IpAddr>, String), (u64, u64)>>,
 }
 
 impl Audit {
@@ -39,6 +49,7 @@ impl Audit {
         Ok(Self {
             file: Some((Mutex::new(file), path.to_path_buf())),
             memory: Mutex::default(),
+            repeats: Mutex::default(),
         })
     }
 
@@ -47,11 +58,46 @@ impl Audit {
         Self {
             file: None,
             memory: Mutex::default(),
+            repeats: Mutex::default(),
         }
     }
 
     pub fn record(&self, ip: Option<IpAddr>, event: &str, detail: &str) {
         self.record_at(super::now(), ip, event, detail);
+    }
+
+    /// For events that can arrive without end (sign-ins refused during a lockout): one line per
+    /// address and event per `REPEAT_SEC`, saying how many were left out since the last one.
+    pub fn record_repeated(&self, ip: Option<IpAddr>, event: &str, detail: &str) {
+        self.record_repeated_at(super::now(), ip, event, detail);
+    }
+
+    fn record_repeated_at(&self, now: u64, ip: Option<IpAddr>, event: &str, detail: &str) {
+        let left_out = {
+            let mut repeats = self.repeats.lock().unwrap_or_else(|p| p.into_inner());
+            if repeats.len() >= MAX_REPEAT_KEYS {
+                repeats.retain(|_, (last, _)| now.saturating_sub(*last) < REPEAT_SEC);
+            }
+            let key = (ip, event.to_string());
+            let full = repeats.len() >= MAX_REPEAT_KEYS;
+            match repeats.get_mut(&key) {
+                Some((last, skipped)) if now.saturating_sub(*last) < REPEAT_SEC => {
+                    *skipped += 1;
+                    return;
+                }
+                Some(entry) => std::mem::replace(entry, (now, 0)).1,
+                None if full => return,
+                None => {
+                    repeats.insert(key, (now, 0));
+                    0
+                }
+            }
+        };
+        if left_out == 0 {
+            self.record_at(now, ip, event, detail);
+        } else {
+            self.record_at(now, ip, event, &format!("{detail} ({left_out} more like it before this)"));
+        }
     }
 
     fn record_at(&self, time: u64, ip: Option<IpAddr>, event: &str, detail: &str) {
@@ -62,10 +108,18 @@ impl Audit {
             "detail": detail,
         });
         match &self.file {
-            Some((file, _)) => {
+            Some((file, path)) => {
                 if let Ok(mut file) = file.lock() {
                     // A full disk must not stop the dashboard; the event is then only lost.
                     let _ = writeln!(file, "{line}");
+                    if file.metadata().is_ok_and(|m| m.len() > MAX_FILE) {
+                        let _ = std::fs::rename(path, previous(path));
+                        if let Ok(fresh) = Self::open(path) {
+                            if let Some((fresh, _)) = fresh.file {
+                                *file = fresh.into_inner().unwrap_or_else(|p| p.into_inner());
+                            }
+                        }
+                    }
                 }
             }
             None => {
@@ -100,7 +154,8 @@ impl Audit {
     pub fn recent(&self, limit: usize) -> Vec<Value> {
         let limit = limit.clamp(1, MAX_EVENTS);
         match &self.file {
-            Some((_, path)) => read_tail(path)
+            Some((_, path)) => [read_tail(&previous(path)), read_tail(path)]
+                .concat()
                 .lines()
                 .rev()
                 .filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -117,6 +172,13 @@ impl Audit {
                 .collect(),
         }
     }
+}
+
+/// Where the file goes when it is full.
+fn previous(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".1");
+    PathBuf::from(name)
 }
 
 /// The last part of the file, starting at a whole line.
@@ -192,6 +254,30 @@ mod tests {
         assert!(events[0]["detail"].as_str().unwrap().starts_with("3999 "));
         // Every event read is whole: the cut first line was dropped.
         assert!(events.iter().all(|e| e["event"] == "action"));
+    }
+
+    #[test]
+    fn repeated_refusals_are_coalesced_and_the_file_is_rotated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let audit = Audit::open(&path).unwrap();
+        let ip = Some("198.51.100.9".parse().unwrap());
+        for second in 0..1000 {
+            audit.record_repeated_at(10_000 + second / 10, ip, "login_refused", "locked");
+        }
+        let lines = std::fs::read_to_string(&path).unwrap().lines().count();
+        // 100 seconds of refusals: one line per minute, not a thousand.
+        assert_eq!(lines, 2);
+        assert!(audit.recent(5)[0]["detail"].as_str().unwrap().contains("more like it"));
+        // However much is written, the log stays bounded: it moves aside past MAX_FILE.
+        let filler = "x".repeat(4000);
+        for n in 0..((2 * MAX_FILE) / 4000 + 10) {
+            audit.record(None, "action", &format!("{n} {filler}"));
+        }
+        let size = |p: &Path| std::fs::metadata(p).map_or(0, |m| m.len());
+        assert!(size(&path) <= MAX_FILE + 8192);
+        assert!(size(&previous(&path)) <= MAX_FILE + 8192);
+        assert!(!audit.recent(10).is_empty());
     }
 
     #[test]

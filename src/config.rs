@@ -1244,7 +1244,10 @@ impl Config {
                            tls_profile: TlsProfile,
                            xhttp: &XhttpOptions,
                            fec: &crate::fec_carrier::FecOptions,
-                           kcp: &KcpOptions| {
+                           kcp: &KcpOptions,
+                           parallax: &crate::parallax_carrier::Options| {
+            let packet = transport == Transport::Parallax
+                && parallax.mode == crate::parallax_carrier::Mode::Packet;
             if !transport.uses_tls() {
                 if !is_default(tls_fragment) {
                     found.push(format!(
@@ -1264,10 +1267,13 @@ impl Config {
                     "{label}: the xhttp settings do nothing on {transport:?}"
                 ));
             }
-            if !matches!(
-                transport,
-                Transport::FecUdp | Transport::FecRaw | Transport::FecRawGaming | Transport::Mirage
-            ) && !is_default(fec)
+            // Parallax packet mode runs the FEC session above its lanes.
+            if !packet
+                && !matches!(
+                    transport,
+                    Transport::FecUdp | Transport::FecRaw | Transport::FecRawGaming | Transport::Mirage
+                )
+                && !is_default(fec)
             {
                 found.push(format!(
                     "{label}: the fec settings do nothing on {transport:?}"
@@ -1276,6 +1282,26 @@ impl Config {
             if transport != Transport::Kcp && !is_default(kcp) {
                 found.push(format!(
                     "{label}: the kcp settings do nothing on {transport:?}"
+                ));
+            }
+            let defaults = crate::parallax_carrier::Options::default();
+            if transport != Transport::Parallax && !is_default(parallax) {
+                found.push(format!(
+                    "{label}: the parallax settings do nothing on {transport:?}"
+                ));
+            } else if transport == Transport::Parallax && packet {
+                if parallax.buffer_bytes != defaults.buffer_bytes {
+                    found.push(format!(
+                        "{label}: parallax.buffer_bytes does nothing in packet mode (stream mode only)"
+                    ));
+                }
+            } else if transport == Transport::Parallax
+                && (parallax.lanes != defaults.lanes
+                    || parallax.warmup_min != defaults.warmup_min
+                    || parallax.warmup_max != defaults.warmup_max)
+            {
+                found.push(format!(
+                    "{label}: parallax lanes and warm-up do nothing in stream mode (packet mode only)"
                 ));
             }
         };
@@ -1288,6 +1314,7 @@ impl Config {
                 &listener.xhttp,
                 &listener.fec,
                 &listener.kcp,
+                &listener.parallax,
             );
         }
         for path in &self.paths {
@@ -1299,6 +1326,7 @@ impl Config {
                 &path.xhttp,
                 &path.fec,
                 &path.kcp,
+                &path.parallax,
             );
         }
         let wanted = self.stream_window + 4;
@@ -1543,6 +1571,8 @@ impl Config {
                 .access_token
                 .get_or_insert_with(|| token.clone());
             listener.parallax_key = Some(crate::parallax_carrier::Key::new(key.parallax_key()));
+            listener.fec.parallax_lanes_key = Some(crate::parallax_lanes::Key::new(key.parallax_lanes_key()));
+            listener.fec.lane_silence = Some(crate::parallax_lanes::silence_for(self.timeouts.probe_sec));
             listener.fec.packet_lane_key = Some(crate::packet_lane::Key::new(key.packet_lane_key()));
             if let Some(raw)=&mut listener.raw {raw.hopping.key=Some(crate::port_hop::Key::new(key.port_hop_key()));if let Some(spec)=&mut raw.mirage{spec.admission_key=Some(crate::spoof::AdmissionKey::new(key.mirage_key()));}}
         }
@@ -1552,6 +1582,8 @@ impl Config {
             }
             path.xhttp.access_token.get_or_insert_with(|| token.clone());
             path.parallax_key = Some(crate::parallax_carrier::Key::new(key.parallax_key()));
+            path.fec.parallax_lanes_key = Some(crate::parallax_lanes::Key::new(key.parallax_lanes_key()));
+            path.fec.lane_silence = Some(crate::parallax_lanes::silence_for(self.timeouts.probe_sec));
             path.fec.packet_lane_key = Some(crate::packet_lane::Key::new(key.packet_lane_key()));
             if let Some(raw)=&mut path.raw {raw.hopping.key=Some(crate::port_hop::Key::new(key.port_hop_key()));if let Some(spec)=&mut raw.mirage{spec.admission_key=Some(crate::spoof::AdmissionKey::new(key.mirage_key()));}}
         }
@@ -1608,6 +1640,15 @@ impl Config {
         let shared_key=self.tunnel_key.is_some()||self.tunnel_key_file.is_some();
         ensure!(!self.gaming.enabled()||shared_key,"direct gaming requires tunnel_key or tunnel_key_file for the configured peer identity set");
         ensure!(!self.gaming.enabled() || self.tun.is_none(),"direct gaming currently requires forwarding mode, not TUN");
+        if self.mode == Mode::Client
+            && let (Some(control), Some(bind)) = (self.gaming.control_address.as_deref(), self.gaming.udp_bind)
+            && let Ok(control) = control.parse::<std::net::SocketAddr>()
+        {
+            ensure!(
+                control.is_ipv6() == bind.is_ipv6(),
+                "gaming udp_bind ({bind}) must use the same address family as control_address ({control}): its datagrams go to that server"
+            );
+        }
         for (transport,fec,raw) in self.listeners.iter().map(|entry|(entry.transport,&entry.fec,entry.raw.as_ref())).chain(self.paths.iter().map(|entry|(entry.transport,&entry.fec,entry.raw.as_ref()))) {
             let raw_fec=matches!(transport,Transport::FecRaw|Transport::FecRawGaming|Transport::Mirage);
             ensure!(fec.tcp_fallback.address.is_none()||raw_fec,"TCP packet fallback requires a raw FEC carrier");
@@ -1674,6 +1715,26 @@ impl Config {
                     fec_idle > self.heartbeat_sec,
                     "fec.peer_idle_sec ({fec_idle}) must exceed heartbeat_sec ({})",
                     self.heartbeat_sec
+                );
+            }
+        }
+        // Parallax packet mode runs KCP like the FEC carriers: an idle session lives on the
+        // tunnel's heartbeats there (lane keepalives keep its peer entry, not KCP's own timer). A
+        // heartbeat as long as the session expiry may let an idle session close; said, not refused.
+        for (transport, parallax, fec) in self
+            .listeners
+            .iter()
+            .map(|l| (l.transport, &l.parallax, &l.fec))
+            .chain(self.paths.iter().map(|p| (p.transport, &p.parallax, &p.fec)))
+        {
+            if transport == Transport::Parallax
+                && parallax.mode == crate::parallax_carrier::Mode::Packet
+                && self.heartbeat_sec >= fec.session_expire_sec
+            {
+                tracing::warn!(
+                    heartbeat_sec = self.heartbeat_sec,
+                    session_expire_sec = fec.session_expire_sec,
+                    "Parallax packet mode: heartbeat_sec should be below fec.session_expire_sec, or an idle tunnel connection can close and reconnect"
                 );
             }
         }
@@ -2812,6 +2873,26 @@ mod tests {
         ] {
             assert!(warnings.contains(what), "{what}: {warnings}");
         }
+        // Parallax packet mode uses the fec object; each Parallax mode warns about the other's.
+        let packet: Config = serde_json::from_value(server_with(serde_json::json!([{
+            "addr": "0.0.0.0:4000", "transport": "parallax",
+            "parallax": {"mode": "packet", "buffer_bytes": 131072}, "fec": {"sndwnd": 2048}
+        }])))?;
+        let warnings = packet.warnings().join("
+");
+        assert!(!warnings.contains("fec settings"), "{warnings}");
+        assert!(warnings.contains("buffer_bytes does nothing in packet mode"), "{warnings}");
+        let stream: Config = serde_json::from_value(server_with(serde_json::json!([{
+            "addr": "0.0.0.0:4000", "transport": "parallax", "parallax": {"lanes": 4}, "fec": {"sndwnd": 2048}
+        }])))?;
+        let warnings = stream.warnings().join("
+");
+        assert!(warnings.contains("fec settings") && warnings.contains("packet mode only"), "{warnings}");
+        let tcp: Config = serde_json::from_value(server_with(serde_json::json!([{
+            "addr": "0.0.0.0:4000", "transport": "tcp", "parallax": {"lanes": 4}
+        }])))?;
+        assert!(tcp.warnings().join("
+").contains("parallax settings do nothing"));
         // The same settings on the carriers they belong to are fine.
         let right: Config = serde_json::from_value(server_with(serde_json::json!([
             {"addr": "0.0.0.0:4000", "transport": "kcp", "kcp": {"mtu": 1300}},

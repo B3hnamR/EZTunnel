@@ -7,6 +7,12 @@ use std::{net::{Ipv4Addr, SocketAddr}, path::{Path, PathBuf}, time::Duration};
 use tokio::{net::TcpListener, time::{Instant, timeout}};
 use crate::{config::Mode, raw_packet::{RawOptions, RawProfile}, spoof_test::{Row, Settings}, transport::{SecureReader, SecureWriter}, tunnel_key::TunnelKey, wire::Frame};
 
+/// The packet types a Mirage source test can use (the dashboard offers exactly these).
+pub const TEST_PROFILES: [RawProfile; 7] = [
+    RawProfile::Udp, RawProfile::Icmp, RawProfile::Tcp, RawProfile::Icmpv6,
+    RawProfile::Gre, RawProfile::Ipip, RawProfile::Bip,
+];
+
 const DOMAIN:&[u8]=b"eztunnel/mirage/guided-test/v1";
 const PREFIX:&str="ezm-test1-";
 const CONTROL:u32=u32::MAX-1;
@@ -64,7 +70,7 @@ impl Invitation {
         for sources in [&self.foreign_sources,&self.iran_sources]{let mut seen=std::collections::HashSet::new();for ip in sources{ensure!(unicast(*ip)&&seen.insert(*ip),"invalid or repeated invitation source IP");}}
         ensure!(!self.profiles.is_empty()&&self.profiles.len()<=7,"choose 1..7 profiles");
         let mut seen=std::collections::HashSet::new();
-        for profile in &self.profiles{ensure!(matches!(profile,RawProfile::Tcp|RawProfile::Udp|RawProfile::Icmp|RawProfile::Icmpv6|RawProfile::Gre|RawProfile::Ipip|RawProfile::Bip)&&seen.insert(format!("{profile:?}")),"invalid or repeated test profile");}
+        for profile in &self.profiles{ensure!(TEST_PROFILES.contains(profile)&&seen.insert(format!("{profile:?}")),"invalid or repeated test profile");}
         // Both phases together fit the bounded overall run deadline even at
         // maximum candidates/profiles/extended sample size.
         Ok(())
