@@ -66,6 +66,7 @@ impl FleetError {
             Some(502 | 503 | 504) => 4,
             _ => match self.code.as_str() {
                 "invalid_input" | "no_terminal" => 2,
+                "authentication_failed" => 3,
                 "remote_offline" | "dashboard_unavailable" => 4,
                 "unknown_server" => 5,
                 _ => 7,
@@ -202,16 +203,28 @@ pub struct FleetClient {
 
 impl FleetClient {
     pub async fn connect(state_dir: &Path, from_stdin: bool) -> Result<Self> {
+        let settings = load_settings(state_dir)
+            .map_err(|e| FleetError::new("dashboard_not_configured", format!("{e:#}")))?;
+        let pins = local_certificate_pins(state_dir)?;
         let mut secret = password(from_stdin)?;
-        let result = Self::connect_password(state_dir, &secret).await;
+        let result = Self::connect_ready(settings, pins, &secret).await;
         secret.zeroize();
         result
     }
 
+    #[cfg(test)]
     async fn connect_password(state_dir: &Path, password: &str) -> Result<Self> {
         let settings = load_settings(state_dir)
             .map_err(|e| FleetError::new("dashboard_not_configured", format!("{e:#}")))?;
         let pins = local_certificate_pins(state_dir)?;
+        Self::connect_ready(settings, pins, password).await
+    }
+
+    async fn connect_ready(
+        settings: super::Settings,
+        pins: Vec<[u8; 32]>,
+        password: &str,
+    ) -> Result<Self> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let config = rustls::ClientConfig::builder_with_provider(provider.clone())
             .with_safe_default_protocol_versions()
@@ -294,7 +307,11 @@ impl FleetClient {
             if body.is_some() {
                 request = request.header(header::CONTENT_TYPE, "application/json");
             }
-            let bytes = body.map_or_else(Vec::new, |v| serde_json::to_vec(&v).unwrap_or_default());
+            let bytes = body
+                .map(|value| serde_json::to_vec(&value))
+                .transpose()
+                .map_err(|e| FleetError::new("invalid_input", e))?
+                .unwrap_or_default();
             let request = request
                 .body(Full::new(Bytes::from(bytes)))
                 .map_err(|e| FleetError::new("invalid_input", e))?;
@@ -595,6 +612,13 @@ pub async fn menu(state_dir: &Path, from_stdin: bool) -> AnyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn missing_dashboard_reports_configuration_before_prompting_for_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = FleetClient::connect(dir.path(), false).await.err().unwrap();
+        assert_eq!(error.code, "dashboard_not_configured");
+    }
 
     #[test]
     fn path_components_cannot_inject_another_route() {
