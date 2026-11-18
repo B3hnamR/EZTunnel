@@ -220,12 +220,14 @@ fn optimize_screen() -> Result<()> {
 }
 
 #[derive(Debug,Clone,Copy,PartialEq,Eq)]
-enum ToolAction{Dashboard,Checker,Optimize,Undo,Key,CheckConfigs,Export,Import,Update,Rollback,LinkTest,Mirage}
-const TOOLS:[ToolAction;12]=[ToolAction::Dashboard,ToolAction::Checker,ToolAction::Optimize,ToolAction::Undo,ToolAction::Key,ToolAction::CheckConfigs,ToolAction::Export,ToolAction::Import,ToolAction::Update,ToolAction::Rollback,ToolAction::LinkTest,ToolAction::Mirage];
+enum ToolAction{Dashboard,#[cfg(feature="dashboard")]Fleet,Checker,Optimize,Undo,Key,CheckConfigs,Export,Import,Update,Rollback,LinkTest,Mirage}
+const TOOLS:&[ToolAction]=&[ToolAction::Dashboard,#[cfg(feature="dashboard")]ToolAction::Fleet,ToolAction::Checker,ToolAction::Optimize,ToolAction::Undo,ToolAction::Key,ToolAction::CheckConfigs,ToolAction::Export,ToolAction::Import,ToolAction::Update,ToolAction::Rollback,ToolAction::LinkTest,ToolAction::Mirage];
 fn tool_label(action:ToolAction)->String{
     use console::style;
     let(category,title,description,color)=match action{
         ToolAction::Dashboard=>("WEB","Web dashboard","set up, run and manage the browser dashboard",14),
+        #[cfg(feature="dashboard")]
+        ToolAction::Fleet=>("WEB","Dashboard servers","manage enrolled servers and tunnels from the central terminal",14),
         ToolAction::Checker=>("TEST","Transport checker","compare transports between servers",6),
         ToolAction::Mirage=>("TEST","Mirage source tests","find working spoof IPs and create a tunnel",6),
         ToolAction::LinkTest=>("TEST","Link test","listen or probe TCP, UDP and MTU",6),
@@ -252,6 +254,12 @@ fn tools(store: &Store) -> Result<()> {
         let result = (|| -> Result<()> {
             match action {
                 ToolAction::Dashboard => dashboard_screen::screen()?,
+                #[cfg(feature="dashboard")]
+                ToolAction::Fleet => tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(crate::dashboard::terminal::menu(
+                        std::path::Path::new(crate::dashboard::DEFAULT_STATE_DIR), false,
+                    ))
+                })?,
                 ToolAction::Checker => checker::menu(store)?,
                 ToolAction::Optimize => optimize_screen()?,
                 ToolAction::Undo => {
@@ -659,9 +667,9 @@ fd000000000000000000000000000001 02 40 00 80     eth0
     #[test]
     fn tools_have_one_stable_route_per_action_and_one_combined_link_test(){
         let mut seen=std::collections::HashSet::new();
-        for action in TOOLS{assert!(seen.insert(format!("{action:?}")));let label=tool_label(action);assert!(!console::strip_ansi_codes(&label).is_empty());}
+        for action in TOOLS.iter().copied(){assert!(seen.insert(format!("{action:?}")));let label=tool_label(action);assert!(!console::strip_ansi_codes(&label).is_empty());}
         assert_eq!(TOOLS.iter().filter(|action|**action==ToolAction::LinkTest).count(),1);
-        assert_eq!(TOOLS.len(),12);
+        assert_eq!(TOOLS.len(), 12 + usize::from(cfg!(feature = "dashboard")));
     }
 
     #[test]

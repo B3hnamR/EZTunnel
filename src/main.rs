@@ -109,6 +109,17 @@ enum Command {
         #[command(subcommand)]
         action: DashboardCommand,
     },
+    /// Manage Dashboard-enrolled servers from this server's terminal or headless CLI.
+    #[cfg(feature = "dashboard")]
+    Fleet {
+        #[arg(long, global = true, default_value = eztunnel::dashboard::DEFAULT_STATE_DIR)]
+        state_dir: PathBuf,
+        /// Read the Dashboard password from stdin (never pass credentials as CLI arguments).
+        #[arg(long, global = true)]
+        password_stdin: bool,
+        #[command(subcommand)]
+        action: FleetCommand,
+    },
     /// Let a dashboard on another server manage this server's tunnels.
     #[cfg(feature = "dashboard")]
     Agent {
@@ -123,6 +134,46 @@ enum Command {
         #[arg(long, default_value = "localhost")]
         name: Vec<String>,
     },
+}
+
+#[cfg(feature = "dashboard")]
+#[derive(Subcommand)]
+enum FleetCommand {
+    /// List registered servers, last-seen information, and the local snapshot as JSON.
+    Servers,
+    /// List tunnels on the central host or a Dashboard-enrolled server as JSON.
+    Tunnels {
+        #[arg(long, default_value = "local")]
+        server: String,
+    },
+    /// Start a specific tunnel (never all tunnels) on the selected server.
+    Start {
+        name: String,
+        #[arg(long, default_value = "local")]
+        server: String,
+    },
+    /// Stop a specific tunnel on the selected server.
+    Stop {
+        name: String,
+        #[arg(long, default_value = "local")]
+        server: String,
+    },
+    /// Restart a specific tunnel on the selected server.
+    Restart {
+        name: String,
+        #[arg(long, default_value = "local")]
+        server: String,
+    },
+    /// Read the recent log of a tunnel.
+    Logs {
+        name: String,
+        #[arg(long, default_value = "local")]
+        server: String,
+        #[arg(long, default_value_t = 40)]
+        lines: usize,
+    },
+    /// Open the interactive Dashboard server and tunnel manager.
+    Menu,
 }
 
 #[cfg(feature = "dashboard")]
@@ -475,6 +526,29 @@ async fn run(cli: Cli) -> Result<()> {
         match command {
             Command::Menu => eztunnel::manager::run()?,
             Command::Key => println!("{}", eztunnel::tunnel_key::TunnelKey::generate()?.display()),
+            #[cfg(feature = "dashboard")]
+            Command::Fleet { state_dir, password_stdin, action } => {
+                use eztunnel::dashboard::terminal::{self, Operation};
+                let operation = match action {
+                    FleetCommand::Servers => Operation::Servers,
+                    FleetCommand::Tunnels { server } => Operation::Tunnels { server },
+                    FleetCommand::Start { name, server } => Operation::Action { server, tunnel: name, action: "start" },
+                    FleetCommand::Stop { name, server } => Operation::Action { server, tunnel: name, action: "stop" },
+                    FleetCommand::Restart { name, server } => Operation::Action { server, tunnel: name, action: "restart" },
+                    FleetCommand::Logs { name, server, lines } => Operation::Logs { server, tunnel: name, lines },
+                    FleetCommand::Menu => {
+                        terminal::menu(&state_dir, password_stdin).await?;
+                        return Ok(());
+                    }
+                };
+                match terminal::execute(&state_dir, password_stdin, operation).await {
+                    Ok(value) => println!("{}", serde_json::to_string_pretty(&value)?),
+                    Err(error) => {
+                        eprintln!("{}", error.as_json());
+                        std::process::exit(error.exit_code());
+                    }
+                }
+            }
             #[cfg(feature = "dashboard")]
             Command::Agent { action } => match action {
                 AgentCommand::Join { code } => eztunnel::dashboard::agent_join(&code).await?,

@@ -6,8 +6,9 @@ create, edit, start, stop and delete tunnels, read their logs, run connection ch
 EZTunnel, keep backups and get alerts on Telegram. It comes in English and Persian, with a dark and
 a light theme.
 
-Everything the dashboard does, the terminal manager (`sudo eztunnel`) still does too. Tunnels do
-not depend on the dashboard: stopping or removing it never stops a tunnel.
+The local terminal manager (`sudo eztunnel`) remains available when the dashboard is stopped.
+The central terminal can also view and operate on enrolled servers while the dashboard is running.
+Tunnels do not depend on the dashboard: stopping or removing it never stops a tunnel.
 
 ## Set it up
 
@@ -54,6 +55,47 @@ dashboard's **Servers** page:
 
 On the other server, **Tools → Web dashboard → Join this server to a dashboard on another server**
 does the same with a join code, and **Leave the dashboard** ends it. Leaving never stops a tunnel.
+
+## Manage enrolled servers from the central terminal
+
+On the server **running the Dashboard**, these commands reuse the same authenticated Dashboard
+and Agent actions as the browser (there is no separate terminal registry or Agent connection):
+
+```sh
+sudo eztunnel fleet servers                            # all server IDs and freshness (JSON)
+sudo eztunnel fleet tunnels --server SERVER_ID         # inventory and online/offline state (JSON)
+sudo eztunnel fleet tunnels --server local             # the central host
+sudo eztunnel fleet start TUNNEL --server SERVER_ID
+sudo eztunnel fleet stop TUNNEL --server SERVER_ID
+sudo eztunnel fleet restart TUNNEL --server SERVER_ID
+sudo eztunnel fleet logs TUNNEL --server SERVER_ID --lines 80
+sudo eztunnel fleet menu                               # interactive selection and operations
+```
+
+Use an ID returned by `fleet servers`, not a hostname that might change. Commands
+prompt for the Dashboard password without echoing it. For unattended use, pass the password
+through **standard input**, for example from your existing secret manager:
+
+```sh
+secret-manager-command | sudo eztunnel fleet --password-stdin servers
+```
+
+The executable never expects a password or session token in an argument, and it does not save
+terminal sessions to disk. `fleet --state-dir PATH` selects a different **local Dashboard**
+state directory; this is not a remote dashboard URL. It connects over loopback HTTPS and pins
+the Dashboard's locally stored certificate. Keep that state directory root-readable only.
+
+Headless commands print JSON to stdout. Errors print JSON to stderr with a nonzero exit code:
+2 invalid input; 3 authentication/authorization; 4 offline/unavailable/timeout; 5 unknown server
+or tunnel; 6 conflicting operation; 7 other failure. An offline server's tunnel list is **null**
+(unknown), not an empty list. A completed HTTP operation is not proof that the data plane has
+connected; inspect the resulting status separately.
+
+Remote work requires the Dashboard and the target Agent to be connected. **Local** management
+with `sudo eztunnel menu` still works when the Dashboard is offline, and stopping the Dashboard
+never stops existing tunnels. Create/pair/edit/delete and specialized TUN/Raw/CDN workflows
+remain available through their established interfaces; this initial CLI covers fleet inventory,
+basic tunnel actions and recent logs only.
 
 ## What it shows and does
 
