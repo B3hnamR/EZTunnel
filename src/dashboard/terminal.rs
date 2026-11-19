@@ -1166,6 +1166,46 @@ fn wizard_transport<'a>(transports: &'a [Value], name: &str) -> Result<&'a Value
         .ok_or_else(|| invalid(format!("unsupported Dashboard wizard carrier {name}")))
 }
 
+/// Game forwards datagrams, so TCP-only is not a valid guided Game choice.
+fn guided_forward_protocols(is_game: bool) -> (&'static [&'static str], usize) {
+    if is_game {
+        (&["udp", "both"], 1)
+    } else {
+        (&["tcp", "udp", "both"], 0)
+    }
+}
+
+fn menu_ip(prompt: &str) -> AnyResult<std::net::IpAddr> {
+    let raw = crate::manager::ui::ask(prompt, None, |text: &String| {
+        if text.trim().trim_matches(['[', ']']).parse::<std::net::IpAddr>().is_ok() {
+            Ok(())
+        } else {
+            Err("enter a valid IPv4 or IPv6 address (not a hostname)".into())
+        }
+    })?;
+    Ok(raw.trim().trim_matches(['[', ']']).parse()?)
+}
+
+/// Keep the guided Game form aligned with the shared Dashboard wizard requirements.
+fn guided_game_form(
+    form: &mut Value,
+    is_game: bool,
+    iran_address: Option<std::net::IpAddr>,
+) -> Result<()> {
+    if !is_game {
+        return Ok(());
+    }
+    form["game"] = json!(true);
+    if form["carry"] == "ports" && form["protocol"].as_str().unwrap_or("tcp") == "tcp" {
+        return Err(invalid("Game requires UDP or both forwarding, or SOCKS5"));
+    }
+    if form["direction"] == "direct" {
+        let ip = iran_address.ok_or_else(|| invalid("direct Game requires the Iran endpoint IP"))?;
+        form["iran_address"] = json!(ip.to_string());
+    }
+    Ok(())
+}
+
 async fn menu_create(client: &FleetClient) -> AnyResult<()> {
     use crate::manager::ui;
     let ways = [
@@ -1231,6 +1271,7 @@ async fn menu_create(client: &FleetClient) -> AnyResult<()> {
             None
         };
         let effective = wizard_transport(types, ipv6_transport.as_deref().unwrap_or(&transport))?;
+        let is_game = effective["name"] == "game";
         let port = menu_port(
             "Tunnel listen port",
             effective["port"].as_u64().unwrap_or(7000) as u16,
@@ -1243,6 +1284,11 @@ async fn menu_create(client: &FleetClient) -> AnyResult<()> {
         };
         ui::note("Supply the address reachable from the dialing endpoint. This is NOT automatically inferred from a private Agent IP.");
         let address = menu_text("Public IP or hostname of the listening endpoint", None)?;
+        let iran_address = if is_game && direction == "direct" {
+            Some(menu_ip("Iran endpoint IP reachable from the Foreign server (for Game UDP)")?)
+        } else {
+            None
+        };
         let mut form = json!({"iran": iran, "foreign": foreign, "name": name, "transport": transport,
             "direction": direction, "address": address, "tunnel_port": port, "reach": "local"});
         if let Some(carrier) = ipv6_transport {
@@ -1252,8 +1298,9 @@ async fn menu_create(client: &FleetClient) -> AnyResult<()> {
         if ui::choose_required("Carry", &carry_options, 0)? == 0 {
             form["carry"] = json!("ports");
             form["ports"] = json!(menu_text("Forwarded ports (e.g. 8080, 8081=80)", None)?);
-            let protocols = ["tcp", "udp", "both"].map(str::to_string);
-            let selected = ui::choose_required("Forward protocol", &protocols, 0)?;
+            let (protocols, default) = guided_forward_protocols(is_game);
+            let labels: Vec<String> = protocols.iter().map(|p| (*p).to_owned()).collect();
+            let selected = ui::choose_required("Forward protocol", &labels, default)?;
             form["protocol"] = json!(protocols[selected]);
             let reach = ["Loopback targets only (recommended)", "Any target"].map(str::to_string);
             if ui::choose_required("Foreign reach policy", &reach, 0)? == 1 {
@@ -1275,9 +1322,7 @@ async fn menu_create(client: &FleetClient) -> AnyResult<()> {
         if effective["options"]["pacer"] == true {
             form["fec_pacer"] = json!(ui::confirm("Enable FEC pacer?", false)?);
         }
-        if transport == "game" {
-            form["game"] = json!(true);
-        }
+        guided_game_form(&mut form, is_game, iran_address)?;
         ui::note(
             "Advanced settings such as speed, pool, game, congestion and carrier-specific options can also be supplied through a JSON form file.",
         );
@@ -1809,6 +1854,54 @@ mod tests {
             assert_eq!(error.as_json()["report"]["results"], mixed["results"]);
             assert!(classify_restart_all(server, json!({"results":[]})).is_err());
         }
+    }
+
+    #[test]
+    fn guided_game_forms_pass_existing_wizard_for_reverse_direct_and_ipv6() {
+        let (normal, normal_default) = guided_forward_protocols(false);
+        assert_eq!(normal[normal_default], "tcp");
+        let (game_protocols, game_default) = guided_forward_protocols(true);
+        assert_eq!(game_protocols[game_default], "both");
+        assert!(!game_protocols.contains(&"tcp"));
+
+        for (transport, direction, address, iran_ip) in [
+            ("game", "reverse", "203.0.113.10", None),
+            ("game", "direct", "203.0.113.10", Some("198.51.100.30")),
+            ("ipv6", "direct", "2001:db8::10", Some("2001:db8::30")),
+        ] {
+            let mut form = json!({
+                "name":"qa-game", "transport":transport, "direction":direction,
+                "address":address, "tunnel_port":7770, "carry":"ports",
+                "ports":"9392", "protocol":game_protocols[game_default], "reach":"local",
+            });
+            if transport == "ipv6" {
+                form["ipv6_transport"] = json!("game");
+            }
+            let iran_address = iran_ip.map(|ip| ip.parse().unwrap());
+            guided_game_form(&mut form, true, iran_address).unwrap();
+            assert_eq!(form["protocol"], "both");
+            assert_eq!(form["game"], true);
+            if direction == "direct" {
+                assert_eq!(form["iran_address"], iran_ip.unwrap());
+            } else {
+                assert!(form.get("iran_address").is_none());
+            }
+            let built = super::super::wizard::build(&form)
+                .unwrap_or_else(|e| panic!("{transport} {direction}: {e:#}"));
+            for endpoint in [&built.iran, &built.foreign] {
+                assert_eq!(endpoint["gaming"]["copies"], 3);
+                super::super::wizard::creatable(endpoint).unwrap();
+                crate::manager::plan::check(endpoint).unwrap();
+            }
+        }
+
+        let mut tcp_only = json!({"carry":"ports", "protocol":"tcp", "direction":"reverse"});
+        assert!(guided_game_form(&mut tcp_only, true, None).is_err());
+        let mut missing_ip = json!({"carry":"socks", "direction":"direct"});
+        assert!(guided_game_form(&mut missing_ip, true, None).is_err());
+        let mut regular = json!({"carry":"ports", "protocol":"tcp", "direction":"direct"});
+        guided_game_form(&mut regular, false, None).unwrap();
+        assert!(regular.get("game").is_none());
     }
 
     #[test]
