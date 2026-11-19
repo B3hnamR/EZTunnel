@@ -85,8 +85,8 @@ terminal sessions to disk. `fleet --state-dir PATH` selects a different **local 
 state directory; this is not a remote dashboard URL. It connects over loopback HTTPS and pins
 the Dashboard's locally stored certificate. Keep that state directory root-readable only.
 
-Headless commands print JSON to stdout. Errors (including invalid fleet command arguments)
-print JSON to stderr with a nonzero exit code:
+Headless commands print JSON to stdout. Errors (including invalid fleet command arguments
+when root options precede `fleet`) print JSON to stderr with a nonzero exit code:
 2 invalid input; 3 authentication/authorization; 4 offline/unavailable/timeout; 5 unknown server
 or tunnel; 6 conflicting operation; 7 other failure. `fleet --help` retains normal CLI help.
 For remote operations, typed Agent and connection failure codes are mapped to the same statuses

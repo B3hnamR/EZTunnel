@@ -508,6 +508,30 @@ fn fleet_argument_error(detail: impl std::fmt::Display) -> ! {
     std::process::exit(2);
 }
 
+/// Identify the root subcommand when Clap has rejected the arguments.
+#[cfg(feature = "dashboard")]
+fn fleet_command_in_argv() -> bool {
+    let mut args = std::env::args_os().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.to_str() {
+            Some("fleet") => return true,
+            // Values for the known root options are not subcommands, even if "fleet".
+            Some("-c" | "--config" | "--gen") => {
+                if args.next().is_none() {
+                    return false;
+                }
+            }
+            // Past "--", Clap does not recognize another root subcommand.
+            Some("--") => return false,
+            // Unknown flags can fail Clap before it reaches a later fleet subcommand.
+            Some(word) if word.starts_with('-') => {}
+            // Another root subcommand must retain human-readable Clap errors.
+            _ => return false,
+        }
+    }
+    false
+}
+
 fn main() -> Result<()> {
     // Other commands keep Clap's familiar human-readable help and errors.
     // Fleet is a machine-oriented JSON interface, including argument failures.
@@ -515,7 +539,7 @@ fn main() -> Result<()> {
         Ok(cli) => cli,
         Err(error) => {
             #[cfg(feature = "dashboard")]
-            if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("fleet"))
+            if fleet_command_in_argv()
                 && !matches!(
                     error.kind(),
                     clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
