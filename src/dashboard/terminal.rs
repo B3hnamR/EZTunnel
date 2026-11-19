@@ -79,7 +79,7 @@ impl FleetError {
             _ => match self.code.as_str() {
                 "invalid_input" | "no_terminal" => 2,
                 "authentication_failed" => 3,
-                "remote_offline" | "dashboard_unavailable" => 4,
+                "remote_offline" | "snapshot_unavailable" | "dashboard_unavailable" => 4,
                 "unknown_server" | "unknown_tunnel" => 5,
                 "partial_failure" => 8,
                 _ => 7,
@@ -449,11 +449,19 @@ impl FleetClient {
     }
 
     pub async fn action(&self, server: &str, tunnel: &str, action: &str) -> Result<Value> {
+        self.action_guarded(server, tunnel, action, None).await
+    }
+
+    async fn action_guarded(&self, server: &str, tunnel: &str, action: &str, pair: Option<&str>) -> Result<Value> {
+        if let Some(pair) = pair && !super::ops::valid_pair(pair) {
+            return Err(invalid("expected pair fingerprint must be 16 hexadecimal characters"));
+        }
         if !matches!(action, "start" | "stop" | "restart") {
             return Err(invalid("action must be start, stop or restart"));
         }
         let path = if server == "local" {
-            format!("/api/tunnels/{}/{}", segment(tunnel), action)
+            format!("/api/tunnels/{}/{}", segment(tunnel),
+                if pair.is_some() { format!("paired-{action}") } else { action.to_string() })
         } else {
             if !self.remote(server).await?["online"]
                 .as_bool()
@@ -468,10 +476,14 @@ impl FleetClient {
                 "/api/servers/{}/tunnels/{}/{}",
                 segment(server),
                 segment(tunnel),
-                action
+                if pair.is_some() { format!("paired-{action}") } else { action.to_string() }
             )
         };
-        let result = self.api(Method::POST, &path).await?;
+        let result = self.api_body(
+            Method::POST, &path,
+            pair.map(|pair| json!({"expect_pair": pair})),
+            Duration::from_secs(55),
+        ).await?;
         Ok(
             json!({"ok": true, "server": server, "tunnel": tunnel, "action": action, "result": result}),
         )
@@ -663,13 +675,14 @@ impl FleetClient {
         } else {
             format!("/api/servers/{}/restart-all", segment(server))
         };
-        self.api_body(
+        let response = self.api_body(
             Method::POST,
             &path,
             Some(json!({})),
             Duration::from_secs(325),
         )
-        .await
+        .await?;
+        classify_restart_all(server, response)
     }
 
     pub async fn tool(&self, server: &str, tunnel: &str, tool: &str, form: Value) -> Result<Value> {
@@ -809,7 +822,7 @@ impl FleetClient {
                     self.delete(&target.server, &target.name, Some(&group.pair))
                         .await
                 } else {
-                    self.action(&target.server, &target.name, step).await
+                    self.action_guarded(&target.server, &target.name, step, Some(&group.pair)).await
                 };
                 let bad_start =
                     matches!(&result, Ok(v) if step == "start" && v["result"]["came_up"] == false);
@@ -842,6 +855,7 @@ struct PairTarget {
     side: String,
     direction: String,
 }
+#[derive(Clone)]
 struct PairTargets {
     pair: String,
     targets: Vec<PairTarget>,
@@ -851,26 +865,44 @@ struct PairTargets {
 /// Read a bounded JSON object as data, without touching stdin (reserved for the password).
 fn read_json_file(path: &Path) -> Result<Value> {
     if path.as_os_str() == "-" {
-        return Err(invalid(
-            "use a file for JSON; standard input is reserved for the password",
-        ));
+        return Err(invalid("use a file for JSON; standard input is reserved for the password"));
     }
-    let metadata = std::fs::metadata(path)
+    let file = std::fs::File::open(path)
         .map_err(|e| invalid(format!("cannot read {}: {e}", path.display())))?;
+    let metadata = file.metadata()
+        .map_err(|e| invalid(format!("cannot inspect {}: {e}", path.display())))?;
     if !metadata.is_file() || metadata.len() > 8192 {
-        return Err(invalid(
-            "JSON file must be a regular file no larger than 8 KiB",
-        ));
+        return Err(invalid("JSON file must be a regular file no larger than 8 KiB"));
     }
-    let bytes =
-        std::fs::read(path).map_err(|e| invalid(format!("cannot read {}: {e}", path.display())))?;
-    if bytes.len() > 8192 { return Err(invalid("JSON file grew beyond 8 KiB while reading")); }
-    let value: Value =
-        serde_json::from_slice(&bytes).map_err(|e| invalid(format!("JSON file: {e}")))?;
+    // Bound the actual descriptor read too: metadata can go stale if the file grows.
+    let mut bytes = Vec::with_capacity(8193);
+    file.take(8193).read_to_end(&mut bytes)
+        .map_err(|e| invalid(format!("cannot read {}: {e}", path.display())))?;
+    if bytes.len() > 8192 {
+        return Err(invalid("JSON file grew beyond 8 KiB while reading"));
+    }
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|e| invalid(format!("JSON file: {e}")))?;
     if !value.is_object() {
         return Err(invalid("JSON file must contain an object"));
     }
     Ok(value)
+}
+
+/// An HTTP 200 does not mean restart-all succeeded: both Dashboard handlers
+/// deliberately return 200 with ok=false and per-tunnel outcomes on partial failure.
+fn classify_restart_all(server: &str, response: Value) -> Result<Value> {
+    match response["ok"].as_bool() {
+        Some(true) => Ok(response),
+        Some(false) => Err(FleetError::partial(
+            format!("one or more tunnels on {server} failed to restart; inspect per-tunnel results"),
+            json!({"server": server, "results": response["results"]}),
+        )),
+        None => Err(FleetError::new(
+            "invalid_response",
+            format!("restart-all on {server} returned no aggregate success indicator"),
+        )),
+    }
 }
 
 /// Escape each path component rather than allowing tunnel names to add path or query segments.
@@ -1035,7 +1067,7 @@ pub async fn execute(state_dir: &Path, from_stdin: bool, operation: Operation) -
             if both {
                 match client.pair_targets(&server, &tunnel).await {
                     Err(error) => Err(error),
-                    Ok(group) if expected_pair.as_deref().is_some_and(|p| p != group.pair) => {
+                    Ok(group) if expected_pair.as_deref().is_some_and(|p| !p.eq_ignore_ascii_case(&group.pair)) => {
                         Err(FleetError::new(
                             "pair_mismatch",
                             "the selected tunnel has another pair fingerprint",
@@ -1081,12 +1113,23 @@ fn confirm_action(answer: AnyResult<bool>) -> AnyResult<bool> {
 }
 
 fn selected_status(inventory: Value, name: &str) -> Result<Value> {
-    let tunnel = inventory["tunnels"].as_array()
-        .and_then(|tunnels| tunnels.iter().find(|t| t["name"] == name))
+    let server = inventory["server"].as_str().unwrap_or("unknown");
+    if inventory["online"] != true {
+        return Err(FleetError::new(
+            "remote_offline",
+            format!("server {server} is offline; its tunnel state is unknown"),
+        ));
+    }
+    let tunnels = inventory["tunnels"].as_array().ok_or_else(|| FleetError::new(
+        "snapshot_unavailable",
+        format!("server {server} has no current tunnel snapshot"),
+    ))?;
+    let tunnel = tunnels.iter()
+        .find(|t| t["name"] == name)
         .cloned()
         .ok_or_else(|| FleetError::new("unknown_tunnel", format!("no tunnel named {name}")))?;
     Ok(json!({
-        "ok": true, "server": inventory["server"], "online": inventory["online"],
+        "ok": true, "server": inventory["server"], "online": true,
         "last_seen_ms": inventory["last_seen_ms"], "tunnel": tunnel,
     }))
 }
@@ -1113,6 +1156,14 @@ fn menu_port(prompt: &str, default: u16) -> AnyResult<u16> {
             },
         )?;
     Ok(entered.parse()?)
+}
+
+/// Use the effective carrier, including for the synthetic IPv6 selector,
+/// instead of assuming that IPv6 inherits the TCP entry's options.
+fn wizard_transport<'a>(transports: &'a [Value], name: &str) -> Result<&'a Value> {
+    transports.iter()
+        .find(|entry| entry["name"] == name)
+        .ok_or_else(|| invalid(format!("unsupported Dashboard wizard carrier {name}")))
 }
 
 async fn menu_create(client: &FleetClient) -> AnyResult<()> {
@@ -1169,9 +1220,20 @@ async fn menu_create(client: &FleetClient) -> AnyResult<()> {
             .collect();
         let chosen_index = ui::choose_required("Transport", &kinds, 0)?;
         let transport = kinds[chosen_index].clone();
+        let ipv6_transport = if transport == "ipv6" {
+            let over = types[chosen_index]["transports"]
+                .as_array().ok_or_else(|| invalid("missing IPv6 transport list"))?;
+            let candidates: Vec<String> = over.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned)).collect();
+            let choice = ui::choose_required("IPv6 transport", &candidates, 0)?;
+            Some(candidates[choice].clone())
+        } else {
+            None
+        };
+        let effective = wizard_transport(types, ipv6_transport.as_deref().unwrap_or(&transport))?;
         let port = menu_port(
             "Tunnel listen port",
-            types[chosen_index]["port"].as_u64().unwrap_or(7000) as u16,
+            effective["port"].as_u64().unwrap_or(7000) as u16,
         )?;
         let directions = ["reverse (Iran listens)", "direct (Foreign listens)"].map(str::to_string);
         let direction = if ui::choose_required("Direction", &directions, 0)? == 0 {
@@ -1179,22 +1241,12 @@ async fn menu_create(client: &FleetClient) -> AnyResult<()> {
         } else {
             "direct"
         };
-        ui::note(
-            "Supply the address reachable from the dialing endpoint. This is NOT automatically inferred from a private Agent IP.",
-        );
+        ui::note("Supply the address reachable from the dialing endpoint. This is NOT automatically inferred from a private Agent IP.");
         let address = menu_text("Public IP or hostname of the listening endpoint", None)?;
         let mut form = json!({"iran": iran, "foreign": foreign, "name": name, "transport": transport,
             "direction": direction, "address": address, "tunnel_port": port, "reach": "local"});
-        if transport == "ipv6" {
-            let over = types[chosen_index]["transports"]
-                .as_array()
-                .ok_or_else(|| invalid("missing IPv6 transport list"))?;
-            let candidates: Vec<String> = over
-                .iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .collect();
-            let choice = ui::choose_required("IPv6 transport", &candidates, 0)?;
-            form["ipv6_transport"] = json!(candidates[choice]);
+        if let Some(carrier) = ipv6_transport {
+            form["ipv6_transport"] = json!(carrier);
         }
         let carry_options = ["Forward ports", "SOCKS5"].map(str::to_string);
         if ui::choose_required("Carry", &carry_options, 0)? == 0 {
@@ -1211,16 +1263,16 @@ async fn menu_create(client: &FleetClient) -> AnyResult<()> {
             form["carry"] = json!("socks");
             form["socks_bind"] = json!(menu_text("SOCKS5 bind address", Some("127.0.0.1:1080"))?);
         }
-        if types[chosen_index]["options"]["parallax"] == true {
+        if effective["options"]["parallax"] == true {
             let modes = ["stream", "packet"].map(str::to_string);
             form["parallax_mode"] = json!(modes[ui::choose_required("Parallax mode", &modes, 0)?]);
         }
-        if types[chosen_index]["options"]["tls"] == true {
+        if effective["options"]["tls"] == true {
             let tls = ["classic", "chrome"].map(str::to_string);
             form["tls_profile"] = json!(tls[ui::choose_required("TLS profile", &tls, 0)?]);
             form["tls_fragment"] = json!(ui::confirm("Fragment TLS handshake?", false)?);
         }
-        if types[chosen_index]["options"]["pacer"] == true {
+        if effective["options"]["pacer"] == true {
             form["fec_pacer"] = json!(ui::confirm("Enable FEC pacer?", false)?);
         }
         if transport == "game" {
@@ -1660,8 +1712,10 @@ pub async fn menu(state_dir: &Path, from_stdin: bool) -> AnyResult<()> {
                                 &format!("Restart all tunnels on {server}?"),
                                 false,
                             ))? {
-                                let value = client.restart_all(server).await?;
-                                ui::info(&serde_json::to_string_pretty(&value)?);
+                                match client.restart_all(server).await {
+                                    Ok(value) => ui::info(&serde_json::to_string_pretty(&value)?),
+                                    Err(error) => ui::warn(&serde_json::to_string_pretty(&error.as_json())?),
+                                }
                             }
                             Ok(())
                         }
@@ -1718,6 +1772,70 @@ mod tests {
                 .exit_code(),
             5
         );
+    }
+
+    #[test]
+    fn offline_or_missing_snapshot_is_not_an_unknown_tunnel() {
+        let offline = json!({"server":"joined-1", "online":false,
+            "tunnels":null, "last_seen_ms":10});
+        let error = selected_status(offline, "qa").unwrap_err();
+        assert_eq!(error.code, "remote_offline");
+        assert_eq!(error.exit_code(), 4);
+
+        let awaiting = json!({"server":"joined-1", "online":true,
+            "tunnels":null, "last_seen_ms":10});
+        let error = selected_status(awaiting, "qa").unwrap_err();
+        assert_eq!(error.code, "snapshot_unavailable");
+        assert_eq!(error.exit_code(), 4);
+
+        let available = json!({"server":"joined-1", "online":true,
+            "tunnels":[{"name":"qa", "state":"stopped"}]});
+        assert_eq!(selected_status(available.clone(), "qa").unwrap()["tunnel"]["name"], "qa");
+        assert_eq!(selected_status(available, "not-found").unwrap_err().exit_code(), 5);
+    }
+
+    #[test]
+    fn restart_all_keeps_each_result_and_exits_nonzero_on_partial_failure() {
+        for server in ["local", "joined-1"] {
+            let successes = json!({"ok":true, "results":[{"name":"first","ok":true,"came_up":true}]});
+            assert_eq!(classify_restart_all(server, successes).unwrap()["ok"], true);
+            let mixed = json!({"ok":false,"results":[
+                {"name":"first","ok":true,"came_up":true},
+                {"name":"second","ok":false,"detail":"service failed"}]});
+            let error = classify_restart_all(server, mixed.clone()).unwrap_err();
+            assert_eq!(error.code, "partial_failure");
+            assert_eq!(error.exit_code(), 8);
+            assert_eq!(error.as_json()["report"]["server"], server);
+            assert_eq!(error.as_json()["report"]["results"], mixed["results"]);
+            assert!(classify_restart_all(server, json!({"results":[]})).is_err());
+        }
+    }
+
+    #[test]
+    fn guided_ipv6_transport_uses_actual_wizard_carrier_options() {
+        let mut types = Vec::new();
+        for name in super::super::wizard::TRANSPORTS {
+            let transport: crate::config::Transport = serde_json::from_value(json!(name)).unwrap();
+            types.push(json!({"name":name,"port":crate::manager::plan::default_tunnel_port(transport),
+                "options": super::super::wizard::options_of(transport)}));
+        }
+        for (name, option) in [("tcp","congestion"),("parallax","parallax"),
+            ("fec-udp","pacer"),("wss","tls")] {
+            let effective = wizard_transport(&types, name).unwrap();
+            assert_eq!(effective["options"][option], true, "{name}: {option}");
+            let mut form = json!({"name":"test-v6","transport":"ipv6", "ipv6_transport":name,
+                "address":"2001:db8::10", "ports":"9392", "carry":"ports",
+                "tunnel_port":effective["port"]});
+            match name {
+                "parallax" => form["parallax_mode"] = json!("packet"),
+                "fec-udp" => form["fec_pacer"] = json!(true),
+                "wss" => form["tls_profile"] = json!("classic"),
+                _ => {},
+            }
+            let built = super::super::wizard::build(&form).unwrap();
+            assert_eq!(built.iran["tunnel_key"], built.foreign["tunnel_key"]);
+        }
+        assert!(wizard_transport(&types, "not-listed").is_err());
     }
 
     #[tokio::test]
@@ -1807,8 +1925,15 @@ mod tests {
         assert_eq!(read_json_file(&form).unwrap()["name"], "qa");
         std::fs::write(&form, b"[]").unwrap();
         assert_eq!(read_json_file(&form).unwrap_err().code, "invalid_input");
+        // Exact boundary (including JSON framing), not a byte more.
+        std::fs::write(&form, format!("{{\"x\":\"{}\"}}", "a".repeat(8192 - 8))).unwrap();
+        assert_eq!(std::fs::metadata(&form).unwrap().len(), 8192);
+        assert_eq!(read_json_file(&form).unwrap()["x"].as_str().unwrap().len(), 8192 - 8);
+        std::fs::write(&form, format!("{{\"x\":\"{}\"}}", "a".repeat(8193 - 8))).unwrap();
+        assert_eq!(read_json_file(&form).unwrap_err().code, "invalid_input");
         std::fs::write(&form, vec![b'x'; 8193]).unwrap();
         assert_eq!(read_json_file(&form).unwrap_err().code, "invalid_input");
+        assert_eq!(read_json_file(dir.path()).unwrap_err().code, "invalid_input");
         assert_eq!(
             read_json_file(Path::new("-")).unwrap_err().code,
             "invalid_input"
@@ -1855,8 +1980,10 @@ mod tests {
     async fn mock_joined_agent(
         fleet: Arc<super::super::fleet::Fleet>,
         name: &str,
+        fail_restart_all: bool,
     ) -> (
         String,
+        super::super::ops::DemoOps,
         tokio::task::JoinHandle<()>,
         tokio::task::JoinHandle<()>,
     ) {
@@ -1869,6 +1996,8 @@ mod tests {
             let _ = hub.serve(hub_stream, |_, _| {}).await;
         });
         let name = name.to_owned();
+        let demo = ops::DemoOps::new(&["qa-test"]);
+        let inspect_demo = demo.clone();
         let (id_tx, id_rx) = tokio::sync::oneshot::channel();
         let agent_task = tokio::spawn(async move {
             let (private, _) = link::generate_keypair().unwrap();
@@ -1884,7 +2013,6 @@ mod tests {
             id_tx
                 .send(welcome["id"].as_str().unwrap().to_owned())
                 .unwrap();
-            let demo = ops::DemoOps::new(&["qa-test"]);
             let snapshot = |demo: &ops::DemoOps| {
                 let mut tunnels = vec![json!({"name":"qa-test","state":
                     if demo.running("qa-test", true) {"running"} else {"stopped"}})];
@@ -1902,7 +2030,11 @@ mod tests {
                 if request["type"] != "request" {
                     continue;
                 }
-                let response = match ops::answer(&demo, &request) {
+                let response = if request["op"] == "restart_all" && fail_restart_all {
+                    json!({"type":"response","id":request["id"],"ok":true,
+                        "result":[{"name":"qa-test","ok":false,
+                            "detail":"simulated single-tunnel restart failure"}]})
+                } else { match ops::answer(&demo, &request) {
                     Ok(result) => {
                         json!({"type":"response","id":request["id"],"ok":true,"result":result})
                     }
@@ -1915,9 +2047,9 @@ mod tests {
                             Some("pair_mismatch")
                         } else { None }
                     }),
-                };
+                } };
                 writer.send(&response).await.unwrap();
-                if ["act", "create", "delete", "delete_pair", "edit", "undo"]
+                if ["act", "act_pair", "create", "delete", "delete_pair", "edit", "undo"]
                     .contains(&request["op"].as_str().unwrap_or(""))
                 {
                     writer.send(&snapshot(&demo)).await.unwrap();
@@ -1925,7 +2057,7 @@ mod tests {
             }
         });
         let id = id_rx.await.unwrap();
-        (id, agent_task, hub_task)
+        (id, inspect_demo, agent_task, hub_task)
     }
 
     /// Exercises the real HTTPS router/session and fleet snapshot, without host services.
@@ -2071,8 +2203,8 @@ mod tests {
 
         // Both independently enrolled synthetic Agents flow through the same live
         // encrypted Hub links, authenticated HTTPS routes and terminal client.
-        let (id_a, agent_a, link_a) = mock_joined_agent(qa_fleet.clone(), "qa-agent-a").await;
-        let (id_b, agent_b, link_b) = mock_joined_agent(qa_fleet.clone(), "qa-agent-b").await;
+        let (id_a, _demo_a, agent_a, link_a) = mock_joined_agent(qa_fleet.clone(), "qa-agent-a", true).await;
+        let (id_b, demo_b, agent_b, link_b) = mock_joined_agent(qa_fleet.clone(), "qa-agent-b", false).await;
         assert_ne!(id_a, id_b);
         let mut online = false;
         for _ in 0..100 {
@@ -2143,6 +2275,13 @@ mod tests {
                 .exit_code(),
             5
         );
+        // Full HTTPS -> Agent response -> HTTP-200 aggregate -> Fleet error classification.
+        let partial_restart = client.restart_all(&id_a).await.unwrap_err();
+        assert_eq!(partial_restart.exit_code(), 8);
+        assert_eq!(partial_restart.as_json()["report"]["results"][0]["name"], "qa-test");
+        assert_eq!(partial_restart.as_json()["report"]["results"][0]["ok"], false);
+        assert_eq!(client.restart_all(&id_b).await.unwrap()["ok"], true);
+        assert_eq!(client.restart_all("local").await.unwrap()["ok"], true);
 
         // End-to-end protocol test: the CLI and Web use the same builder, both encrypted
         // Agent links and session/CSRF guard; the pair appears in Dashboard snapshots.
@@ -2161,6 +2300,20 @@ mod tests {
         assert_eq!(created["ok"], true);
         assert_eq!(created["iran"]["came_up"], true);
         assert_eq!(created["foreign"]["came_up"], true);
+        // An old Hub does not recognize the distinct paired-* action name;
+        // a current Hub requires the fingerprint for that name, rejecting
+        // any unguarded or mismatched URL/body combination before dispatch.
+        assert!(super::super::ops::parse_action("paired-start").is_none());
+        let guarded_path = format!("/api/servers/{id_b}/tunnels/paired-qa/paired-start");
+        let missing = client.api_body(Method::POST, &guarded_path, Some(json!({})),
+            Duration::from_secs(10)).await.unwrap_err();
+        assert_eq!(missing.code, "invalid_pair");
+        assert_eq!(missing.status, Some(400));
+        let mixed_path = format!("/api/servers/{id_b}/tunnels/paired-qa/start");
+        let invalid = client.api_body(Method::POST, &mixed_path,
+            Some(json!({"expect_pair":"0000000000000000"})),
+            Duration::from_secs(10)).await.unwrap_err();
+        assert_eq!(invalid.code, "invalid_pair");
         let mut found = false;
         for _ in 0..100 {
             let left = client.tunnels(&id_a).await.unwrap();
@@ -2238,6 +2391,43 @@ mod tests {
         verifier_state.busy.lock().unwrap().remove(&held_key);
         let recovered = client.paired(&id_a, "paired-qa", "start").await.unwrap();
         assert_eq!(recovered["attempts"].as_array().unwrap().len(), 2);
+
+        // Snapshot discovery sees pair A, then Agent B's persisted key changes
+        // before dispatch. All three paired lifecycle actions must refuse B.
+        let stale_group = client.pair_targets(&id_a, "paired-qa").await.unwrap();
+        let previous = demo_b.added.lock().unwrap().iter().rev()
+            .find(|(name, _)| name == "paired-qa").unwrap().1.clone();
+        let mut replacement = previous.clone();
+        replacement["tunnel_key"] = json!("replacement-unrelated-key");
+        assert_ne!(super::super::data::pair_of(&replacement).as_deref(), Some(pair.as_str()));
+        demo_b.added.lock().unwrap().push(("paired-qa".to_owned(), replacement));
+        let before = demo_b.overrides.lock().unwrap().get("paired-qa").copied();
+        for action in ["start", "stop", "restart"] {
+            let error = client.paired_targets(stale_group.clone(), action).await.unwrap_err();
+            assert_eq!(error.exit_code(), 8, "{action}");
+            let attempted = error.as_json()["report"]["attempts"].as_array().unwrap().clone();
+            assert!(attempted.iter().any(|entry| entry["server"] == id_b
+                && entry["error"]["error"] == "pair_mismatch"), "{action}: {attempted:?}");
+            assert_eq!(demo_b.overrides.lock().unwrap().get("paired-qa").copied(), before,
+                "{action} mutated replacement B");
+            let direct_error = client.action_guarded(&id_b, "paired-qa", action, Some(&pair)).await.unwrap_err();
+            assert_eq!(direct_error.code, "pair_mismatch");
+            assert_eq!(direct_error.status, Some(409));
+            assert_eq!(demo_b.overrides.lock().unwrap().get("paired-qa").copied(), before);
+        }
+        // Restore the fixture's original pair and refresh its published snapshot.
+        let restored = demo_b.added.lock().unwrap().pop().unwrap();
+        assert_eq!(restored.0, "paired-qa");
+        client.action(&id_b, "paired-qa", "start").await.unwrap();
+        let mut reflected = false;
+        for _ in 0..100 {
+            if client.status(&id_b, "paired-qa").await.unwrap()["tunnel"]["pair"] == pair {
+                reflected = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(reflected, "the Agent snapshot must reflect the restored pair identity");
         assert_eq!(
             client
                 .delete(&id_a, "paired-qa", Some("0000000000000000"))

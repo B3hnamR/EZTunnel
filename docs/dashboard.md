@@ -151,9 +151,14 @@ JSON for operator reconciliation. It does not claim rollback or safe blind retry
 
 For guarded deletion, the current saved tunnel fingerprint is checked under its own exclusive
 store lock immediately before removing its service, configuration and task-owned resources. A
-reused tunnel name with another key is refused (HTTP 409). **Both Hub and Agent must support
-`delete_pair`** for guarded deletion; older Agents refuse this new allowlisted operation rather
-than silently ignoring the fingerprint. Upgrade before centrally deleting protected pairs.
+reused tunnel name with another key is refused (HTTP 409). The same lock-protected identity
+guard applies to paired start/stop/restart. **Both Hub and Agent must support `act_pair` and
+`delete_pair`** for protected pair operations. Older Agents refuse these new allowlisted
+operations instead of silently ignoring a fingerprint. Paired lifecycle requests use distinct
+`paired-start/stop/restart` action names on the **existing** Dashboard URL, so older Hubs also
+reject them instead of silently ignoring an extra field. Upgrade both before protected paired
+actions. The Web deletion dialog distinguishes a stale pair from ordinary Busy errors and
+disables retry until the operator refreshes and reselects the target.
 An offline Agent's snapshot is unknown (not an empty list); Fleet lists any offline server IDs
 as **unverified**, not as confirmed non-members of the pair. On a partial deletion, inspect the
 current inventory and retry only a specific remaining endpoint with `--expect-pair`.
@@ -168,10 +173,15 @@ secret-manager-command | sudo eztunnel fleet --password-stdin create --form /roo
 ```
 
 Form and change inputs must be regular JSON-object files no larger than 8 KiB (the Dashboard API body limit). `-` is not a
-supported form path, because stdin is reserved for the password. All commands return JSON
-on stdout, and JSON errors on stderr; `fleet --help` remains regular human-readable help.
+supported form path, because stdin is reserved for the password. All **headless** Fleet commands
+return JSON on stdout and JSON errors on stderr; `fleet menu` uses interactive prompts
+instead, and `fleet --help` remains regular human-readable help.
 Errors use these nonzero codes: **2** invalid input, **3** auth, **4** disconnected/timeout,
-**5** unknown server/tunnel, **6** busy/conflict, **7** other error, **8** partial paired operation.
+**5** unknown server/tunnel, **6** busy/conflict, **7** other error,
+**8** partially failed paired operation or restart-all. Restart-all returns all per-tunnel
+results with a nonzero exit code if any restart fails; the interactive menu displays the same
+structured failure. Offline status requests return exit **4** (unknown live state), not
+`unknown_tunnel`.
 A successful HTTP action does not establish that an encrypted tunnel carries traffic: inspect
 status, connection checks and actual application traffic separately. Join codes and pairing
 codes are secrets; handle output and temporary files accordingly.

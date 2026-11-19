@@ -26,6 +26,8 @@
   /** "server/name" keys of the other ends chosen for deleting too. */
   let also = $state({});
   let problem = $state("");
+  // A replaced pair invalidates the dialog's original selection. Never retry it.
+  let stalePair = $state(false);
   // Preserve failed targets even when live snapshots remove the successfully deleted primary.
   let remaining = $state(null);
   let targetCount = $state(0);
@@ -35,6 +37,7 @@
       typed = "";
       also = {};
       problem = "";
+      stalePair = false;
       remaining = null;
       targetCount = 0;
       dialog.showModal();
@@ -64,12 +67,13 @@
 
   function failure(status, data) {
     if (status === 401) return t("signedOutNow");
+    if (data?.error === "pair_mismatch") return t("pairChangedT");
     if (status === 409) return t("busyT");
     return data?.detail ?? "";
   }
 
   async function run() {
-    if (!confirmed || pending[key] || pending["*"]) return;
+    if (!confirmed || stalePair || pending[key] || pending["*"]) return;
     const targets = remaining ?? [{ server, name }, ...others.filter((o) => also[o.key] && o.online)];
     if (remaining === null) targetCount = targets.length;
     remaining = targets;
@@ -92,6 +96,11 @@
           const { status, data } = await deleteTunnel(target.name, target.server, pair);
           if (status !== 200) {
             failed.push(`${target.name}: ${failure(status, data)}`);
+            if (data?.error === "pair_mismatch") {
+              // Remaining targets came from the same stale selection; stop here.
+              stalePair = true;
+              break;
+            }
             retry.push(target);
           }
         } catch {
@@ -152,7 +161,7 @@
   </div>
   <div class="dlg-f">
     <button class="btn" onclick={shut} disabled={working}>{t("cancel")}</button>
-    <button class="btn danger" onclick={run} disabled={!confirmed || working} aria-busy={working}>
+    <button class="btn danger" onclick={run} disabled={!confirmed || working || stalePair} aria-busy={working}>
       <Icon name="trash" />{working ? t("deleting") : t("deleteTunnel")}
     </button>
   </div>

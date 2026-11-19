@@ -69,6 +69,12 @@ pub trait Ops: Send + Sync {
     }
     /// Blocking: runs the action and, after a start, watches the tunnel come up.
     fn act(&self, name: &str, action: Action) -> Result<Outcome>;
+    /// Run a paired lifecycle action only while the saved tunnel still has its expected
+    /// fingerprint. An older Agent must refuse this distinct allowlisted operation.
+    fn act_pair(&self, name: &str, action: Action, pair: &str) -> Result<Outcome> {
+        let _ = (name, action, pair);
+        bail!("pair-guarded lifecycle is unsupported")
+    }
     /// Blocking: the last `lines` lines of the tunnel's log.
     fn logs(&self, name: &str, lines: usize) -> Result<LogTail>;
     /// New log lines as they are written, until the returned value is dropped: those after
@@ -145,13 +151,18 @@ pub struct PairMismatch;
 
 impl std::fmt::Display for PairMismatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("the tunnel no longer belongs to the expected pair; nothing was deleted")
+        f.write_str("the tunnel no longer belongs to the expected pair; no action was performed on this endpoint")
     }
 }
 impl std::error::Error for PairMismatch {}
 
 pub fn valid_pair(pair: &str) -> bool {
     pair.len() == 16 && pair.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn matches_pair(config: &serde_json::Value, expected: &str) -> bool {
+    super::data::pair_of(config)
+        .is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
 }
 
 impl std::fmt::Display for UnknownTunnel {
@@ -174,6 +185,13 @@ pub fn answer(ops: &dyn Ops, request: &serde_json::Value) -> Result<serde_json::
                 return Err(UnknownTunnel(name.to_owned()).into());
             }
             Ok(serde_json::to_value(ops.act(name, action)?)?)
+        }
+        // Never piggyback on 'act' with an optional ignored field: old Agents must fail closed.
+        Some("act_pair") => {
+            let action = parse_action(request["action"].as_str().unwrap_or("")).context("unknown action")?;
+            let pair = request["expect_pair"].as_str().filter(|p| valid_pair(p))
+                .context("the expected pair fingerprint is missing or invalid")?;
+            Ok(serde_json::to_value(ops.act_pair(name, action, pair)?)?)
         }
         Some("logs") => {
             if !ops.has_tunnel(name)? {
@@ -371,6 +389,30 @@ impl LocalOps {
     }
 }
 
+impl LocalOps {
+    /// Caller holds this tunnel's exclusive store lock and has checked its identity.
+    fn act_locked(store: &Store, name: &str, action: Action) -> Result<Outcome> {
+        if !store.system {
+            bail!("tunnel services need root and systemd");
+        }
+        let Some(step) = bulk::step_for(action, service::state(store, name)) else {
+            return Ok(Outcome { changed: false, came_up: None });
+        };
+        match step {
+            Step::Start => service::start(name)?,
+            Step::Install => service::install_with(store, name, &installed_program())?,
+            Step::Stop => service::stop(name)?,
+        }
+        let came_up = (step != Step::Stop).then(|| {
+            service::watch_started(
+                || service::state(store, name) == State::Running,
+                std::thread::sleep,
+            )
+        });
+        Ok(Outcome { changed: true, came_up })
+    }
+}
+
 impl Ops for LocalOps {
     fn names(&self) -> Vec<String> {
         Self::store().and_then(|s| s.names()).unwrap_or_default()
@@ -384,24 +426,17 @@ impl Ops for LocalOps {
         let store = Self::store()?;
         let _lock = store.lock(name, false)?;
         Self::known(&store, name)?;
-        if !store.system {
-            bail!("tunnel services need root and systemd");
+        Self::act_locked(&store, name, action)
+    }
+
+    fn act_pair(&self, name: &str, action: Action, pair: &str) -> Result<Outcome> {
+        let store = Self::store()?;
+        let _lock = store.lock(name, false)?;
+        Self::known(&store, name)?;
+        if !matches_pair(&store.read(name)?, pair) {
+            return Err(PairMismatch.into());
         }
-        let Some(step) = bulk::step_for(action, service::state(&store, name)) else {
-            return Ok(Outcome { changed: false, came_up: None });
-        };
-        match step {
-            Step::Start => service::start(name)?,
-            Step::Install => service::install_with(&store, name, &installed_program())?,
-            Step::Stop => service::stop(name)?,
-        }
-        let came_up = (step != Step::Stop).then(|| {
-            service::watch_started(
-                || service::state(&store, name) == State::Running,
-                std::thread::sleep,
-            )
-        });
-        Ok(Outcome { changed: true, came_up })
+        Self::act_locked(&store, name, action)
     }
 
     fn logs(&self, name: &str, lines: usize) -> Result<LogTail> {
@@ -616,7 +651,7 @@ impl Ops for LocalOps {
         let store = Self::store()?;
         Self::known(&store, name)?;
         let _lock = store.lock(name, false)?;
-        if super::data::pair_of(&store.read(name)?).as_deref() != Some(pair) {
+        if !matches_pair(&store.read(name)?, pair) {
             return Err(PairMismatch.into());
         }
         if store.system {
@@ -704,7 +739,11 @@ impl DemoOps {
 
     /// The tunnels created in this demo.
     pub fn created(&self) -> Vec<(String, serde_json::Value)> {
-        self.added.lock().unwrap().iter().filter(|(n, _)| !self.deleted(n)).cloned().collect()
+        let added = self.added.lock().unwrap();
+        let mut seen = std::collections::HashSet::new();
+        added.iter().rev()
+            .filter(|(n, _)| seen.insert(n.clone()) && !self.deleted(n))
+            .cloned().collect()
     }
 
     fn known(&self, name: &str) -> Result<()> {
@@ -723,7 +762,10 @@ impl DemoOps {
 impl Ops for DemoOps {
     fn names(&self) -> Vec<String> {
         let added = self.added.lock().unwrap().iter().map(|(n, _)| n.clone()).collect::<Vec<_>>();
-        self.names.iter().chain(added.iter()).filter(|n| !self.deleted(n)).cloned().collect()
+        let mut seen = std::collections::HashSet::new();
+        self.names.iter().chain(added.iter())
+            .filter(|n| !self.deleted(n) && seen.insert((*n).clone()))
+            .cloned().collect()
     }
 
     fn create(&self, name: &str, config: &serde_json::Value) -> Result<Outcome> {
@@ -927,18 +969,22 @@ impl Ops for DemoOps {
 
     fn delete_pair(&self, name: &str, pair: &str) -> Result<()> {
         self.known(name)?;
-        let saved = self
-            .added
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, v)| v.clone());
-        // The demo samples have no real shared key: they cannot be guarded as paired tunnels.
-        if saved.as_ref().and_then(super::data::pair_of).as_deref() != Some(pair) {
+        let latest = self.added.lock().unwrap().iter().rev()
+            .find(|(n, _)| n == name).map(|(_, v)| v.clone());
+        if !latest.as_ref().is_some_and(|config| matches_pair(config, pair)) {
             return Err(PairMismatch.into());
         }
         self.delete(name)
+    }
+
+    fn act_pair(&self, name: &str, action: Action, pair: &str) -> Result<Outcome> {
+        self.known(name)?;
+        let latest = self.added.lock().unwrap().iter().rev()
+            .find(|(n, _)| n == name).map(|(_, v)| v.clone());
+        if !latest.as_ref().is_some_and(|config| matches_pair(config, pair)) {
+            return Err(PairMismatch.into());
+        }
+        self.act(name, action)
     }
 
     fn delete(&self, name: &str) -> Result<()> {
@@ -1069,6 +1115,61 @@ mod tests {
             assert!(!cursor_ok(bad), "{bad}");
         }
         assert!(ops.follow("nothing", None).is_err());
+    }
+
+    #[test]
+    fn paired_action_and_delete_refuse_a_recreated_tunnel_with_the_same_name() {
+        // Use the actual wizard model: both key fingerprints are valid, but different.
+        let form = serde_json::json!({"name":"qa-reuse", "transport":"tcp",
+            "address":"203.0.113.10", "ports":"9392"});
+        let original = super::super::wizard::build(&form).unwrap().foreign;
+        let replacement = super::super::wizard::build(&form).unwrap().foreign;
+        let old_pair = super::super::data::pair_of(&original).unwrap();
+        let new_pair = super::super::data::pair_of(&replacement).unwrap();
+        assert_ne!(old_pair, new_pair);
+        let mut demo = DemoOps::new(&[]);
+        demo.delay = Duration::ZERO;
+        demo.create("qa-reuse", &original).unwrap();
+        demo.delete("qa-reuse").unwrap();
+        demo.create("qa-reuse", &replacement).unwrap();
+        assert_eq!(demo.names().iter().filter(|n| *n == "qa-reuse").count(), 1);
+        assert_eq!(demo.created().iter().filter(|(n, _)| n == "qa-reuse").count(), 1);
+        assert_eq!(super::super::data::pair_of(&demo.created()[0].1).as_deref(), Some(new_pair.as_str()));
+        assert!(demo.running("qa-reuse", true));
+
+        // Pair A was captured earlier, then B took the exact same server/name.
+        for action in ["start", "stop", "restart"] {
+            let request = serde_json::json!({"op":"act_pair", "name":"qa-reuse",
+                "action":action, "expect_pair":old_pair});
+            let error = answer(&demo, &request).unwrap_err();
+            assert!(error.downcast_ref::<PairMismatch>().is_some(), "{action}: {error:#}");
+            assert!(demo.running("qa-reuse", true), "{action} touched replacement B");
+        }
+        assert!(answer(&demo, &serde_json::json!({"op":"delete_pair",
+            "name":"qa-reuse", "expect_pair":old_pair})).unwrap_err()
+            .downcast_ref::<PairMismatch>().is_some());
+        assert!(demo.names().iter().any(|n| n == "qa-reuse"));
+        // Correct current key works even with uppercase user input.
+        let stopped = answer(&demo, &serde_json::json!({"op":"act_pair", "name":"qa-reuse",
+            "action":"stop", "expect_pair":new_pair.to_uppercase()})).unwrap();
+        assert_eq!(stopped["changed"], true);
+        assert!(!demo.running("qa-reuse", true));
+        answer(&demo, &serde_json::json!({"op":"delete_pair", "name":"qa-reuse",
+            "expect_pair":new_pair.to_uppercase()})).unwrap();
+        assert!(demo.deleted("qa-reuse"));
+    }
+
+    #[test]
+    fn paired_lifecycle_requires_fingerprint_and_allowlisted_action() {
+        let demo = DemoOps::new(&["qa"]);
+        for request in [
+            serde_json::json!({"op":"act_pair", "name":"qa", "action":"start"}),
+            serde_json::json!({"op":"act_pair", "name":"qa", "action":"start", "expect_pair":"invalid"}),
+            serde_json::json!({"op":"act_pair", "name":"qa", "action":"remove", "expect_pair":"0123456789abcdef"}),
+        ] {
+            assert!(answer(&demo, &request).is_err());
+        }
+        assert!(demo.running("qa", true));
     }
 
     #[test]
