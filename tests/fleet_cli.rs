@@ -99,6 +99,28 @@ fn help_and_non_fleet_errors_remain_human_readable() {
 }
 
 #[test]
+fn missing_root_option_values_do_not_misidentify_fleet() {
+    // Even if "fleet" appears later, Clap fails on the missing root value first.
+    // These errors belong to the root CLI, not the fleet JSON interface.
+    for args in [
+        &["--gen", "--config", "fleet"][..],
+        &["--config", "--gen", "fleet"][..],
+        &["-c", "--gen", "fleet"][..],
+        &["--gen", "-c", "fleet"][..],
+        &["--gen", "--", "fleet"][..],
+    ] {
+        let output = run(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).starts_with("error: "),
+            "{args:?}: {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
 fn non_fleet_parser_errors_stay_human_readable() {
     for args in [
         &["key", "fleet"][..],

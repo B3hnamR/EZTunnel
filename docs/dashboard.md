@@ -96,7 +96,8 @@ An offline server's tunnel list is **null**
 (unknown), not an empty list. A completed HTTP operation is not proof that the data plane has
 connected; inspect the resulting status separately.
 
-Remote work requires the Dashboard and the target Agent to be connected. **Local** management
+Remote actions and logs require the Dashboard and target Agent to be connected; fleet inventory
+remains available through the Dashboard even while an enrolled Agent is offline. **Local** management
 with `sudo eztunnel menu` still works when the Dashboard is offline, and stopping the Dashboard
 never stops existing tunnels. Create/pair/edit/delete and specialized TUN/Raw/CDN workflows
 remain available through their established interfaces; this initial CLI covers fleet inventory,

@@ -516,11 +516,12 @@ fn fleet_command_in_argv() -> bool {
         match arg.to_str() {
             Some("fleet") => return true,
             // Values for the known root options are not subcommands, even if "fleet".
-            Some("-c" | "--config" | "--gen") => {
-                if args.next().is_none() {
-                    return false;
-                }
-            }
+            Some("-c" | "--config" | "--gen") => match args.next() {
+                // A new option means the previous option is missing its value.
+                // Clap rejects that root invocation before any Fleet command.
+                Some(value) if !value.to_string_lossy().starts_with('-') => {}
+                _ => return false,
+            },
             // Past "--", Clap does not recognize another root subcommand.
             Some("--") => return false,
             // Unknown flags can fail Clap before it reaches a later fleet subcommand.
