@@ -787,6 +787,7 @@ fn remote_request_status(failure: &anyhow::Error) -> (StatusCode, &'static str) 
             "unknown_tunnel" => (StatusCode::NOT_FOUND, "unknown_tunnel"),
             "invalid_input" => (StatusCode::BAD_REQUEST, "invalid_input"),
             "busy" => (StatusCode::CONFLICT, "busy"),
+            "pair_mismatch" => (StatusCode::CONFLICT, "pair_mismatch"),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, "failed"),
         },
         _ => (StatusCode::INTERNAL_SERVER_ERROR, "failed"),
@@ -2277,28 +2278,62 @@ async fn new_tunnel_owned(State(state): State<Arc<AppState>>, request: Request) 
 }
 
 /// Deletes a tunnel here or on a joined server.
-async fn delete_answer(state: Arc<AppState>, server: String, name: String, request: Request) -> Response {
+async fn delete_answer(
+    state: Arc<AppState>,
+    server: String,
+    name: String,
+    request: Request,
+) -> Response {
     if !state.signed_in(request.headers()) {
         return unauthorized();
     }
     let ip = client_ip(&request);
+    let expected_pair = match read_body(request, MAX_BODY).await {
+        Ok(bytes) if bytes.is_empty() => None,
+        Ok(bytes) => {
+            let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+                return error(StatusCode::BAD_REQUEST, "bad_request");
+            };
+            match value.get("expect_pair") {
+                Some(Value::String(pair)) if ops::valid_pair(pair) => Some(pair.to_owned()),
+                Some(_) => return error(StatusCode::BAD_REQUEST, "invalid_pair"),
+                None if value.is_object() => None,
+                None => return error(StatusCode::BAD_REQUEST, "bad_request"),
+            }
+        }
+        Err(response) => return response,
+    };
     let local = server == "local";
-    let key = if local { name.clone() } else { format!("{server}/{name}") };
+    let key = if local {
+        name.clone()
+    } else {
+        format!("{server}/{name}")
+    };
     if !local && state.busy.lock().unwrap().contains(&format!("{server}/*")) {
         return error(StatusCode::CONFLICT, "busy");
     }
     let Some(busy) = Busy::take(&state, vec![key]) else {
         return error(StatusCode::CONFLICT, "busy");
     };
-    let place = if local { String::new() } else { format!(" on {server}") };
-    state.audit.record(ip, "action", &format!("delete {name}{place}"));
+    let place = if local {
+        String::new()
+    } else {
+        format!(" on {server}")
+    };
+    state
+        .audit
+        .record(ip, "action", &format!("delete {name}{place}"));
     let answer: Result<()> = if local {
         let ops = state.ops.clone();
         let task_name = name.clone();
+        let expected = expected_pair.clone();
         // The guard moves into the task, so a slow delete keeps the tunnel marked busy.
         let task = tokio::task::spawn_blocking(move || {
             let _busy = busy;
-            ops.delete(&task_name)
+            match expected {
+                Some(pair) => ops.delete_pair(&task_name, &pair),
+                None => ops.delete(&task_name),
+            }
         });
         match tokio::time::timeout(ACTION_TIMEOUT, task).await {
             Ok(Ok(result)) => result,
@@ -2309,7 +2344,9 @@ async fn delete_answer(state: Arc<AppState>, server: String, name: String, reque
         let Some(fleet) = state.fleet.clone() else {
             return error(StatusCode::NOT_FOUND, "unknown_server");
         };
-        let answer = fleet.request_held(&server, json!({"op": "delete", "name": name}), ACTION_TIMEOUT, busy.clone()).await.map(|_| ());
+        let answer = fleet.request_held(&server,
+            json!({"op": if expected_pair.is_some() { "delete_pair" } else { "delete" }, "name": name, "expect_pair": expected_pair}),
+            ACTION_TIMEOUT, busy.clone()).await.map(|_| ());
         drop(busy);
         answer
     };
@@ -2318,8 +2355,21 @@ async fn delete_answer(state: Arc<AppState>, server: String, name: String, reque
         Ok(()) => Json(json!({"ok": true})).into_response(),
         Err(failure) => {
             let detail = format!("{failure:#}");
-            state.audit.record(ip, "action_failed", &format!("delete {name}{place}: {detail}"));
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "failed", "detail": detail}))).into_response()
+            state.audit.record(
+                ip,
+                "action_failed",
+                &format!("delete {name}{place}: {detail}"),
+            );
+            let (status, code) = if failure.downcast_ref::<ops::PairMismatch>().is_some() {
+                (StatusCode::CONFLICT, "pair_mismatch")
+            } else if failure.downcast_ref::<ops::UnknownTunnel>().is_some() {
+                (StatusCode::NOT_FOUND, "unknown_tunnel")
+            } else if !local {
+                remote_request_status(&failure)
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, "failed")
+            };
+            (status, Json(json!({"error": code, "detail": detail}))).into_response()
         }
     }
 }

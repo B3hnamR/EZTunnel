@@ -46,7 +46,9 @@ export const getEditable = (name, server, signal) => call("GET", `${base(server)
 export const saveEdit = (name, changes, server) => call("POST", `${base(server)}/tunnels/${encodeURIComponent(name)}/settings`, changes, 90_000);
 export const undoEdit = (name, server) => call("POST", `${base(server)}/tunnels/${encodeURIComponent(name)}/undo`, {}, 90_000);
 // Deleting stops the tunnel's service first, so it gets the action timeout.
-export const deleteTunnel = (name, server) => call("DELETE", `${base(server)}/tunnels/${encodeURIComponent(name)}`, undefined, 45_000);
+export const deleteTunnel = (name, server, pair = null) =>
+  call("DELETE", `${base(server)}/tunnels/${encodeURIComponent(name)}`,
+    pair ? { expect_pair: pair } : undefined, 45_000);
 // A new tunnel on two servers: the form's options, and creating it (both ends start and are
 // watched, so it gets a long timeout).
 export const getNewTunnel = () => call("GET", "/api/new-tunnel");

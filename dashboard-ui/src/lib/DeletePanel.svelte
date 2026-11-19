@@ -87,7 +87,9 @@
         }
         if (k !== key) pending[k] = "delete";
         try {
-          const { status, data } = await deleteTunnel(target.name, target.server);
+          // Match the pair fingerprint under the Agent store lock so a reused name
+          // cannot make this panel delete a different tunnel after a stale snapshot.
+          const { status, data } = await deleteTunnel(target.name, target.server, pair);
           if (status !== 200) {
             failed.push(`${target.name}: ${failure(status, data)}`);
             retry.push(target);

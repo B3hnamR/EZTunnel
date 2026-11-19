@@ -338,6 +338,8 @@ async fn serve(mut reader: LinkReader<Stream>, mut writer: LinkWriter<Stream>) -
                         Some("unknown_tunnel")
                     } else if error.downcast_ref::<crate::manager::store::ChangeLockBusy>().is_some() {
                         Some("busy")
+                    } else if error.downcast_ref::<ops::PairMismatch>().is_some() {
+                        Some("pair_mismatch")
                     } else {
                         None
                     },

@@ -85,6 +85,12 @@ pub trait Ops: Send + Sync {
     /// Blocking: stops the tunnel and removes its service, firewall rules, traffic count and
     /// configuration, as the terminal manager's Delete does.
     fn delete(&self, name: &str) -> Result<()>;
+    /// Delete only when the current saved tunnel has the requested public pair fingerprint.
+    /// The check and removal must share the store's exclusive lock so a reused name is safe.
+    fn delete_pair(&self, name: &str, pair: &str) -> Result<()> {
+        let _ = (name, pair);
+        bail!("pair-guarded deletion is unsupported")
+    }
     /// Blocking: saves a new tunnel (one `wizard::creatable` accepts), installs its service and
     /// watches it come up. A name that is taken is refused.
     fn create(&self, name: &str, config: &serde_json::Value) -> Result<Outcome>;
@@ -133,6 +139,21 @@ fn pairing_of(config: &serde_json::Value, address: Option<String>) -> Result<ser
 #[derive(Debug)]
 pub struct UnknownTunnel(pub String);
 
+/// A concurrent replacement has the same name but belongs to a different pair.
+#[derive(Debug)]
+pub struct PairMismatch;
+
+impl std::fmt::Display for PairMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the tunnel no longer belongs to the expected pair; nothing was deleted")
+    }
+}
+impl std::error::Error for PairMismatch {}
+
+pub fn valid_pair(pair: &str) -> bool {
+    pair.len() == 16 && pair.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 impl std::fmt::Display for UnknownTunnel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "no tunnel named {}", self.0)
@@ -169,6 +190,14 @@ pub fn answer(ops: &dyn Ops, request: &serde_json::Value) -> Result<serde_json::
                 Some(key) => ops.delete_own(name, key)?,
                 None => ops.delete(name)?,
             }
+            Ok(json!({"deleted": true}))
+        }
+        // Distinct allowlisted operation: an older Agent must fail closed rather than
+        // ignore an unknown optional fingerprint and delete a reused tunnel name.
+        Some("delete_pair") => {
+            let pair = request["expect_pair"].as_str().filter(|p| valid_pair(p))
+                .context("the expected pair fingerprint is missing or invalid")?;
+            ops.delete_pair(name, pair)?;
             Ok(json!({"deleted": true}))
         }
         Some("create") => Ok(serde_json::to_value(ops.create(name, &request["config"])?)?),
@@ -583,6 +612,19 @@ impl Ops for LocalOps {
         store.remove_locked(name)
     }
 
+    fn delete_pair(&self, name: &str, pair: &str) -> Result<()> {
+        let store = Self::store()?;
+        Self::known(&store, name)?;
+        let _lock = store.lock(name, false)?;
+        if super::data::pair_of(&store.read(name)?).as_deref() != Some(pair) {
+            return Err(PairMismatch.into());
+        }
+        if store.system {
+            service::remove(name)?;
+        }
+        store.remove_locked(name)
+    }
+
     fn delete_own(&self, name: &str, tunnel_key: &str) -> Result<()> {
         let store = Self::store()?;
         Self::known(&store, name)?;
@@ -881,6 +923,22 @@ impl Ops for DemoOps {
         self.known(name)?;
         std::thread::sleep(self.delay);
         Ok(Outcome { changed: true, came_up: Some(true) })
+    }
+
+    fn delete_pair(&self, name: &str, pair: &str) -> Result<()> {
+        self.known(name)?;
+        let saved = self
+            .added
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.clone());
+        // The demo samples have no real shared key: they cannot be guarded as paired tunnels.
+        if saved.as_ref().and_then(super::data::pair_of).as_deref() != Some(pair) {
+            return Err(PairMismatch.into());
+        }
+        self.delete(name)
     }
 
     fn delete(&self, name: &str) -> Result<()> {

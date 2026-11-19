@@ -139,30 +139,52 @@ enum Command {
 #[cfg(feature = "dashboard")]
 #[derive(Subcommand)]
 enum FleetCommand {
-    /// List registered servers, last-seen information, and the local snapshot as JSON.
+    /// List enrolled servers, last-seen information and the local snapshot.
     Servers,
-    /// List tunnels on the central host or a Dashboard-enrolled server as JSON.
+    /// List tunnels on the central host or an enrolled server.
     Tunnels {
         #[arg(long, default_value = "local")]
         server: String,
     },
-    /// Start a specific tunnel (never all tunnels) on the selected server.
+    /// List the supported new-tunnel transport types and their options.
+    Options,
+    /// Create and start both ends of a tunnel using a Web-compatible JSON form file.
+    Create {
+        #[arg(long)]
+        form: PathBuf,
+    },
+    /// Start one tunnel, or both paired endpoints if --both is set.
     Start {
         name: String,
         #[arg(long, default_value = "local")]
         server: String,
+        #[arg(long)]
+        both: bool,
     },
-    /// Stop a specific tunnel on the selected server.
+    /// Stop one tunnel, or both paired endpoints if --both is set.
     Stop {
         name: String,
         #[arg(long, default_value = "local")]
         server: String,
+        #[arg(long)]
+        both: bool,
     },
-    /// Restart a specific tunnel on the selected server.
+    /// Restart one tunnel, or stop and start its two paired endpoints in safe order.
     Restart {
         name: String,
         #[arg(long, default_value = "local")]
         server: String,
+        #[arg(long)]
+        both: bool,
+    },
+    /// Current tunnel status from the Dashboard snapshot.
+    Status {
+        name: String,
+        #[arg(long, default_value = "local")]
+        server: String,
+        /// Query the live control socket instead of inventory.
+        #[arg(long)]
+        live: bool,
     },
     /// Read the recent log of a tunnel.
     Logs {
@@ -171,6 +193,66 @@ enum FleetCommand {
         server: String,
         #[arg(long, default_value_t = 40)]
         lines: usize,
+    },
+    /// Read editable tunnel settings and available ranges.
+    Settings {
+        name: String,
+        #[arg(long, default_value = "local")]
+        server: String,
+    },
+    /// Apply a Web-compatible JSON changes file, reverting if the service fails.
+    Edit {
+        name: String,
+        #[arg(long, default_value = "local")]
+        server: String,
+        #[arg(long)]
+        changes: PathBuf,
+    },
+    /// Restore the previous tunnel configuration on the chosen server.
+    Undo {
+        name: String,
+        #[arg(long, default_value = "local")]
+        server: String,
+    },
+    /// Delete a tunnel and its owned resources; --both deletes the matching pair.
+    Delete {
+        name: String,
+        #[arg(long, default_value = "local")]
+        server: String,
+        #[arg(long)]
+        both: bool,
+        #[arg(long)]
+        expect_pair: Option<String>,
+        #[arg(long)]
+        confirm: String,
+    },
+    /// Generate a single-use Agent enrollment code (secret: protect stdout).
+    JoinCode,
+    /// Forget an enrolled Agent without deleting its tunnels.
+    RemoveServer {
+        id: String,
+        #[arg(long)]
+        confirm: String,
+    },
+    /// Health diagnostics for the chosen server.
+    Health {
+        #[arg(long, default_value = "local")]
+        server: String,
+    },
+    /// Restart every tunnel on the chosen server, sequentially.
+    RestartAll {
+        #[arg(long, default_value = "local")]
+        server: String,
+    },
+    /// Run an existing allowlisted tunnel tool.
+    Tool {
+        name: String,
+        #[arg(long, default_value = "local")]
+        server: String,
+        #[arg(value_parser = ["speedtest", "pairing", "quota_reset"])]
+        tool: String,
+        #[arg(long)]
+        form: Option<PathBuf>,
     },
     /// Open the interactive Dashboard server and tunnel manager.
     Menu,
@@ -585,10 +667,86 @@ async fn run(cli: Cli) -> Result<()> {
                 let operation = match action {
                     FleetCommand::Servers => Operation::Servers,
                     FleetCommand::Tunnels { server } => Operation::Tunnels { server },
-                    FleetCommand::Start { name, server } => Operation::Action { server, tunnel: name, action: "start" },
-                    FleetCommand::Stop { name, server } => Operation::Action { server, tunnel: name, action: "stop" },
-                    FleetCommand::Restart { name, server } => Operation::Action { server, tunnel: name, action: "restart" },
-                    FleetCommand::Logs { name, server, lines } => Operation::Logs { server, tunnel: name, lines },
+                    FleetCommand::Options => Operation::Options,
+                    FleetCommand::Create { form } => Operation::Create { form_file: form },
+                    FleetCommand::Start { name, server, both } => Operation::Action {
+                        server,
+                        tunnel: name,
+                        action: "start",
+                        both,
+                    },
+                    FleetCommand::Stop { name, server, both } => Operation::Action {
+                        server,
+                        tunnel: name,
+                        action: "stop",
+                        both,
+                    },
+                    FleetCommand::Restart { name, server, both } => Operation::Action {
+                        server,
+                        tunnel: name,
+                        action: "restart",
+                        both,
+                    },
+                    FleetCommand::Status { name, server, live } => Operation::Status {
+                        server, tunnel: name, live,
+                    },
+                    FleetCommand::Logs {
+                        name,
+                        server,
+                        lines,
+                    } => Operation::Logs {
+                        server,
+                        tunnel: name,
+                        lines,
+                    },
+                    FleetCommand::Settings { name, server } => Operation::Settings {
+                        server,
+                        tunnel: name,
+                    },
+                    FleetCommand::Edit {
+                        name,
+                        server,
+                        changes,
+                    } => Operation::Edit {
+                        server,
+                        tunnel: name,
+                        changes_file: changes,
+                    },
+                    FleetCommand::Undo { name, server } => Operation::Undo {
+                        server,
+                        tunnel: name,
+                    },
+                    FleetCommand::Delete {
+                        name,
+                        server,
+                        both,
+                        expect_pair,
+                        confirm,
+                    } => Operation::Delete {
+                        server,
+                        tunnel: name,
+                        both,
+                        expected_pair: expect_pair,
+                        confirm,
+                    },
+                    FleetCommand::JoinCode => Operation::JoinCode,
+                    FleetCommand::RemoveServer { id, confirm } => Operation::RemoveServer {
+                        server: id,
+                        confirm,
+                    },
+                    FleetCommand::Health { server } => Operation::Health { server },
+                    FleetCommand::RestartAll { server } => Operation::RestartAll { server },
+                    FleetCommand::Tool {
+                        name,
+                        server,
+                        tool,
+                        form,
+                    } => Operation::Tool {
+                        server,
+                        tunnel: name,
+                        tool,
+                        form_file: form,
+                    },
                     FleetCommand::Menu => {
                         terminal::menu(&state_dir, password_stdin).await?;
                         return Ok(());
