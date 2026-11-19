@@ -499,6 +499,15 @@ fn example(mode: ExampleMode) -> serde_json::Value {
     }
 }
 
+#[cfg(feature = "dashboard")]
+fn fleet_argument_error(detail: impl std::fmt::Display) -> ! {
+    eprintln!("{}", serde_json::json!({
+        "ok": false, "error": "invalid_input",
+        "detail": detail.to_string(), "http_status": null,
+    }));
+    std::process::exit(2);
+}
+
 fn main() -> Result<()> {
     // Other commands keep Clap's familiar human-readable help and errors.
     // Fleet is a machine-oriented JSON interface, including argument failures.
@@ -512,11 +521,7 @@ fn main() -> Result<()> {
                     clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
                 )
             {
-                eprintln!("{}", serde_json::json!({
-                    "ok": false, "error": "invalid_input",
-                    "detail": error.to_string(), "http_status": null,
-                }));
-                std::process::exit(2);
+                fleet_argument_error(error);
             }
             error.exit();
         }
@@ -539,10 +544,13 @@ fn main() -> Result<()> {
 
 async fn run(cli: Cli) -> Result<()> {
     if let Some(command) = cli.command {
-        anyhow::ensure!(
-            cli.config.is_none() && cli.r#gen.is_none() && !cli.check,
-            "subcommands cannot be combined with configuration options"
-        );
+        if cli.config.is_some() || cli.r#gen.is_some() || cli.check {
+            #[cfg(feature = "dashboard")]
+            if matches!(&command, Command::Fleet { .. }) {
+                fleet_argument_error("subcommands cannot be combined with configuration options");
+            }
+            anyhow::bail!("subcommands cannot be combined with configuration options");
+        }
         match command {
             Command::Menu => eztunnel::manager::run()?,
             Command::Key => println!("{}", eztunnel::tunnel_key::TunnelKey::generate()?.display()),
