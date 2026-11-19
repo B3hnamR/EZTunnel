@@ -18,6 +18,18 @@ pub struct ChangeLock {
     _file: fs::File,
 }
 
+/// A contended nonblocking lock, distinct from an I/O or permissions failure.
+#[derive(Debug)]
+pub struct ChangeLockBusy(pub String);
+
+impl std::fmt::Display for ChangeLockBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} is being changed elsewhere (in the terminal manager or the dashboard); try again in a moment", self.0)
+    }
+}
+
+impl std::error::Error for ChangeLockBusy {}
+
 pub struct Store {
     root: PathBuf,
     /// Running as root with systemd: tunnels become system services. Otherwise (a test
@@ -182,7 +194,11 @@ impl Store {
             let flags = libc::LOCK_EX | if wait { 0 } else { libc::LOCK_NB };
             // SAFETY: flock on a descriptor this function owns; it is released when the file closes.
             if unsafe { libc::flock(file.as_raw_fd(), flags) } != 0 {
-                bail!("{name} is being changed elsewhere (in the terminal manager or the dashboard); try again in a moment");
+                let failure = std::io::Error::last_os_error();
+                if failure.kind() == std::io::ErrorKind::WouldBlock {
+                    return Err(ChangeLockBusy(name.to_owned()).into());
+                }
+                return Err(failure).with_context(|| format!("lock {}", path.display()));
             }
         }
         Ok(ChangeLock { _file: file })
@@ -459,6 +475,17 @@ mod tests {
         std::fs::write(store.dir().join("t.json.bak"), "{ not json").unwrap();
         assert!(store.restore_previous("t").is_err());
         assert_eq!(port(&store), "192.0.2.1:7001");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn contended_change_lock_is_typed_and_released() {
+        let (_directory, store) = store();
+        let first = store.lock("qa", false).unwrap();
+        let error = store.lock("qa", false).err().unwrap();
+        assert_eq!(error.downcast_ref::<ChangeLockBusy>().unwrap().0, "qa");
+        drop(first);
+        assert!(store.lock("qa", false).is_ok());
     }
 
     #[test]

@@ -500,7 +500,27 @@ fn example(mode: ExampleMode) -> serde_json::Value {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    // Other commands keep Clap's familiar human-readable help and errors.
+    // Fleet is a machine-oriented JSON interface, including argument failures.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            #[cfg(feature = "dashboard")]
+            if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("fleet"))
+                && !matches!(
+                    error.kind(),
+                    clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+                )
+            {
+                eprintln!("{}", serde_json::json!({
+                    "ok": false, "error": "invalid_input",
+                    "detail": error.to_string(), "http_status": null,
+                }));
+                std::process::exit(2);
+            }
+            error.exit();
+        }
+    };
     // A running tunnel uses the thread count from its configuration; the other commands are short.
     let workers = match (&cli.config, &cli.command, cli.check) {
         (Some(path), None, false) => Config::load(path).ok().map(|config| config.worker_threads),

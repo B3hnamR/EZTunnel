@@ -68,7 +68,7 @@ impl FleetError {
                 "invalid_input" | "no_terminal" => 2,
                 "authentication_failed" => 3,
                 "remote_offline" | "dashboard_unavailable" => 4,
-                "unknown_server" => 5,
+                "unknown_server" | "unknown_tunnel" => 5,
                 _ => 7,
             },
         }
@@ -496,6 +496,12 @@ pub enum Operation {
 }
 
 pub async fn execute(state_dir: &Path, from_stdin: bool, operation: Operation) -> Result<Value> {
+    // Reject invalid script arguments even when no Dashboard is configured or reachable.
+    if let Operation::Logs { lines, .. } = &operation
+        && !(1..=super::ops::MAX_LINES).contains(lines)
+    {
+        return Err(invalid(format!("lines must be 1 to {}", super::ops::MAX_LINES)));
+    }
     let mut client = FleetClient::connect(state_dir, from_stdin).await?;
     let result = match operation {
         Operation::Servers => client.servers().await,
@@ -515,6 +521,25 @@ pub async fn execute(state_dir: &Path, from_stdin: bool, operation: Operation) -
     result
 }
 
+/// A confirmation's Back/Esc is navigation, not a failed tunnel operation.
+fn confirm_action(answer: AnyResult<bool>) -> AnyResult<bool> {
+    match answer {
+        Err(error) if crate::manager::ui::is_back(&error) => Ok(false),
+        other => other,
+    }
+}
+
+fn selected_status(inventory: Value, name: &str) -> Result<Value> {
+    let tunnel = inventory["tunnels"].as_array()
+        .and_then(|tunnels| tunnels.iter().find(|t| t["name"] == name))
+        .cloned()
+        .ok_or_else(|| FleetError::new("unknown_tunnel", format!("no tunnel named {name}")))?;
+    Ok(json!({
+        "ok": true, "server": inventory["server"], "online": inventory["online"],
+        "last_seen_ms": inventory["last_seen_ms"], "tunnel": tunnel,
+    }))
+}
+
 /// The same client and operation paths as the headless CLI; no separate menu state.
 pub async fn menu(state_dir: &Path, from_stdin: bool) -> AnyResult<()> {
     use crate::manager::ui;
@@ -530,15 +555,9 @@ pub async fn menu(state_dir: &Path, from_stdin: bool) -> AnyResult<()> {
                 if id.is_empty() {
                     continue;
                 }
-                let online = if server["online"] == true {
-                    "online"
-                } else {
-                    "offline"
-                };
+                let online = if server["online"] == true { "online" } else { "offline" };
                 items.push(format!(
-                    "{}  {} ({online})",
-                    id,
-                    server["name"].as_str().unwrap_or("server")
+                    "{}  {} ({online})", id, server["name"].as_str().unwrap_or("server")
                 ));
                 ids.push(id.to_string());
             }
@@ -549,62 +568,73 @@ pub async fn menu(state_dir: &Path, from_stdin: bool) -> AnyResult<()> {
             let Some(server) = ids.get(index) else {
                 break;
             };
-            let inventory = client.tunnels(server).await?;
-            if inventory["online"] != true {
-                ui::warn("This server is offline; no remote operation will be attempted.");
-                ui::pause();
-                continue;
-            }
-            let mut tunnels = Vec::new();
-            for tunnel in inventory["tunnels"].as_array().into_iter().flatten() {
-                if let Some(name) = tunnel["name"].as_str() {
-                    let state = tunnel["state"].as_str().unwrap_or("unknown");
-                    tunnels.push((name.to_string(), format!("{name}  ({state})")));
+
+            loop {
+                ui::banner(&format!("Dashboard tunnels · {server}"));
+                let inventory = client.tunnels(server).await?;
+                if inventory["online"] != true {
+                    ui::warn("This server is offline; no remote operation will be attempted.");
+                    ui::pause();
+                    break;
                 }
-            }
-            if tunnels.is_empty() {
-                ui::info("No tunnel snapshot is available (or there are no tunnels).");
-                ui::pause();
-                continue;
-            }
-            let mut choices: Vec<String> = tunnels.iter().map(|(_, label)| label.clone()).collect();
-            choices.push("Back".into());
-            let Some(tunnel_index) = ui::choose("Tunnel", &choices, 0)? else {
-                continue;
-            };
-            let Some((name, _)) = tunnels.get(tunnel_index) else {
-                continue;
-            };
-            let actions =
-                ["Status", "Start", "Stop", "Restart", "Recent logs", "Back"].map(str::to_string);
-            let Some(choice) = ui::choose("Action", &actions, 0)? else {
-                continue;
-            };
-            let result = match choice {
-                0 => client.tunnels(server).await,
-                1..=3 => {
-                    let action = match choice {
-                        1 => "start",
-                        2 => "stop",
-                        _ => "restart",
-                    };
-                    if !ui::confirm(&format!("{action} {name} on {server}?"), false)? {
-                        continue;
+                let mut tunnels = Vec::new();
+                for tunnel in inventory["tunnels"].as_array().into_iter().flatten() {
+                    if let Some(name) = tunnel["name"].as_str() {
+                        let state = tunnel["state"].as_str().unwrap_or("unknown");
+                        tunnels.push((name.to_string(), format!("{name}  ({state})")));
                     }
-                    client.action(server, name, action).await
                 }
-                4 => client.logs(server, name, 40).await,
-                _ => continue,
-            };
-            match result {
-                Ok(value) => ui::info(&serde_json::to_string_pretty(&value)?),
-                Err(error) => ui::warn(&error.to_string()),
-            };
-            ui::pause();
+                if tunnels.is_empty() {
+                    ui::info("No tunnel snapshot is available (or there are no tunnels).");
+                    ui::pause();
+                    break;
+                }
+                let mut choices: Vec<String> = tunnels.iter().map(|(_, label)| label.clone()).collect();
+                choices.push("Back".into());
+                let Some(tunnel_index) = ui::choose("Tunnel", &choices, 0)? else {
+                    break;
+                };
+                let Some((name, _)) = tunnels.get(tunnel_index) else {
+                    break;
+                };
+
+                loop {
+                    ui::banner(&format!("Dashboard tunnel · {server}/{name}"));
+                    let actions = ["Status", "Start", "Stop", "Restart", "Recent logs", "Back"]
+                        .map(str::to_string);
+                    let Some(choice) = ui::choose("Action", &actions, 0)? else {
+                        break;
+                    };
+                    let result = match choice {
+                        0 => client.tunnels(server).await
+                            .and_then(|inventory| selected_status(inventory, name)),
+                        1..=3 => {
+                            let action = match choice {
+                                1 => "start",
+                                2 => "stop",
+                                _ => "restart",
+                            };
+                            if !confirm_action(ui::confirm(
+                                &format!("{action} {name} on {server}?"), false
+                            ))? {
+                                // No request was sent. Back/Esc returns to the action level.
+                                continue;
+                            }
+                            client.action(server, name, action).await
+                        }
+                        4 => client.logs(server, name, 40).await,
+                        _ => break,
+                    };
+                    match result {
+                        Ok(value) => ui::info(&serde_json::to_string_pretty(&value)?),
+                        Err(error) => ui::warn(&error.to_string()),
+                    };
+                    ui::pause();
+                }
+            }
         }
         Ok::<(), anyhow::Error>(())
-    }
-    .await;
+    }.await;
     client.logout().await;
     result
 }
@@ -618,6 +648,36 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let error = FleetClient::connect(dir.path(), false).await.err().unwrap();
         assert_eq!(error.code, "dashboard_not_configured");
+    }
+
+    #[test]
+    fn cancelled_confirmation_stays_in_menu_without_mutating() {
+        assert!(!confirm_action(Err(crate::manager::ui::Back.into())).unwrap());
+        assert!(!confirm_action(Ok(false)).unwrap());
+        assert!(confirm_action(Ok(true)).unwrap());
+        assert!(confirm_action(Err(anyhow::anyhow!("terminal failed"))).is_err());
+    }
+
+    #[test]
+    fn tunnel_status_is_about_the_selected_tunnel() {
+        let inventory = json!({"server": "agent-a", "online": true, "last_seen_ms": 123,
+            "tunnels": [{"name": "first", "state": "running"}, {"name": "second", "state": "stopped"}]});
+        let status = selected_status(inventory.clone(), "second").unwrap();
+        assert_eq!(status["tunnel"]["name"], "second");
+        assert_eq!(status["tunnel"]["state"], "stopped");
+        assert_eq!(status["last_seen_ms"], 123);
+        assert!(status.get("tunnels").is_none());
+        assert_eq!(selected_status(inventory, "missing").unwrap_err().exit_code(), 5);
+    }
+
+    #[tokio::test]
+    async fn invalid_log_lines_are_rejected_before_dashboard_sign_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = execute(dir.path(), false, Operation::Logs {
+            server: "local".into(), tunnel: "qa-test".into(), lines: 0,
+        }).await.unwrap_err();
+        assert_eq!(error.code, "invalid_input");
+        assert_eq!(error.exit_code(), 2);
     }
 
     #[test]
@@ -655,6 +715,58 @@ mod tests {
                 .is_err()
         );
     }
+    /// Two independently joined in-process Agent links exercise the real Hub/Agent protocol
+    /// through HTTPS. No remote service/systemd commands run in this fixture.
+    async fn mock_joined_agent(
+        fleet: Arc<super::super::fleet::Fleet>,
+        name: &str,
+    ) -> (String, tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
+        use super::super::{link, ops};
+        let (code, _) = fleet.join_code("127.0.0.1", 12345).unwrap();
+        let code = link::JoinCode::decode(&code).unwrap();
+        let (stream, hub_stream) = tokio::io::duplex(1 << 20);
+        let hub = fleet.clone();
+        let hub_task = tokio::spawn(async move {
+            let _ = hub.serve(hub_stream, |_, _| {}).await;
+        });
+        let name = name.to_owned();
+        let (id_tx, id_rx) = tokio::sync::oneshot::channel();
+        let agent_task = tokio::spawn(async move {
+            let (private, _) = link::generate_keypair().unwrap();
+            let (mut reader, mut writer) = link::connect(stream, &private, &code.hub_key).await.unwrap();
+            writer.send(&json!({"type":"join","token":hex::encode(code.token),"name":name})).await.unwrap();
+            let welcome = reader.recv().await.unwrap();
+            assert_eq!(welcome["type"], "welcome");
+            id_tx.send(welcome["id"].as_str().unwrap().to_owned()).unwrap();
+            let demo = ops::DemoOps::new(&["qa-test"]);
+            let snapshot = |demo: &ops::DemoOps| json!({
+                "type": "snapshot",
+                "snapshot": {"tunnels": [
+                    {"name": "qa-test",
+                     "state": if demo.running("qa-test", true) {"running"} else {"stopped"}}
+                ]}
+            });
+            writer.send(&snapshot(&demo)).await.unwrap();
+            while let Ok(request) = reader.recv().await {
+                if request["type"] != "request" { continue; }
+                let response = match ops::answer(&demo, &request) {
+                    Ok(result) => json!({"type":"response","id":request["id"],"ok":true,"result":result}),
+                    Err(error) => json!({
+                        "type":"response","id":request["id"],"ok":false,
+                        "error": format!("{error:#}"),
+                        "error_code": error.downcast_ref::<ops::UnknownTunnel>().map(|_| "unknown_tunnel")
+                    }),
+                };
+                writer.send(&response).await.unwrap();
+                if request["op"] == "act" {
+                    writer.send(&snapshot(&demo)).await.unwrap();
+                }
+            }
+        });
+        let id = id_rx.await.unwrap();
+        (id, agent_task, hub_task)
+    }
+
     /// Exercises the real HTTPS router/session and fleet snapshot, without host services.
     /// This is protocol-level QA; it does not substitute for two managed physical nodes.
     #[tokio::test]
@@ -685,6 +797,7 @@ mod tests {
         .unwrap();
 
         let demo = ops::DemoOps::new(&["game-fec", "web-wss", "cdn-xhttps", "backup-tcp"]);
+        let qa_fleet = fleet::Fleet::open(dir.path()).unwrap();
         let state = Arc::new(http::AppState {
             history: Arc::new(history::History::new(Box::new(history::DemoStore {
                 tunnels: Vec::new(),
@@ -699,7 +812,7 @@ mod tests {
             ops: Arc::new(demo),
             busy: Default::default(),
             followers: Arc::new(tokio::sync::Semaphore::new(http::MAX_FOLLOWERS)),
-            fleet: Some(fleet::Fleet::open(dir.path()).unwrap()),
+            fleet: Some(qa_fleet.clone()),
             public: ("127.0.0.1".into(), port),
             agent_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             cert: None,
@@ -709,6 +822,7 @@ mod tests {
             alerts: Default::default(),
         });
         let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        let qa_state = state.clone();
         let task = tokio::spawn(async move {
             let _ = http::serve(state, address, Some(tls_config)).await;
         });
@@ -792,6 +906,67 @@ mod tests {
                 .exit_code(),
             2
         );
+
+        // Both independently enrolled synthetic Agents flow through the same live
+        // encrypted Hub links, authenticated HTTPS routes and terminal client.
+        let (id_a, agent_a, link_a) = mock_joined_agent(qa_fleet.clone(), "qa-agent-a").await;
+        let (id_b, agent_b, link_b) = mock_joined_agent(qa_fleet.clone(), "qa-agent-b").await;
+        assert_ne!(id_a, id_b);
+        let mut online = false;
+        for _ in 0..100 {
+            let inventory = client.servers().await.unwrap();
+            if inventory["servers"].as_array().unwrap().iter().filter(
+                |s| (s["id"] == id_a || s["id"] == id_b) && s["online"] == true &&
+                    s["snapshot"]["tunnels"].is_array()
+            ).count() == 2 {
+                online = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(online, "both independent Agent links must publish snapshots");
+        let inventory_a = client.tunnels(&id_a).await.unwrap();
+        assert_eq!(inventory_a["tunnels"][0]["name"], "qa-test");
+        let inventory_b = client.tunnels(&id_b).await.unwrap();
+        assert_eq!(inventory_b["online"], true);
+
+        assert_eq!(client.action(&id_a, "qa-test", "stop").await.unwrap()["ok"], true);
+        let mut stopped = false;
+        for _ in 0..100 {
+            if client.tunnels(&id_a).await.unwrap()["tunnels"][0]["state"] == "stopped" {
+                stopped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(stopped, "remote action must update the Web/CLI inventory");
+        assert_eq!(client.tunnels(&id_b).await.unwrap()["tunnels"][0]["state"], "running");
+        assert_eq!(client.logs(&id_b, "qa-test", 10).await.unwrap()["logs"]["lines"].as_array().unwrap().len(), 10);
+        assert_eq!(client.action(&id_a, "missing", "stop").await.unwrap_err().exit_code(), 5);
+        assert_eq!(client.logs(&id_b, "missing", 10).await.unwrap_err().exit_code(), 5);
+
+        let busy = format!("{id_a}/qa-test");
+        qa_state.busy.lock().unwrap().insert(busy.clone());
+        assert_eq!(client.action(&id_a, "qa-test", "start").await.unwrap_err().exit_code(), 6);
+        qa_state.busy.lock().unwrap().remove(&busy);
+
+        agent_a.abort();
+        let _ = agent_a.await;
+        let mut disconnected = false;
+        for _ in 0..100 {
+            if client.tunnels(&id_a).await.unwrap()["online"] == false {
+                disconnected = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(disconnected, "lost Agent connection must become offline");
+        assert_eq!(client.action(&id_a, "qa-test", "start").await.unwrap_err().exit_code(), 4);
+        assert_eq!(client.tunnels(&id_b).await.unwrap()["online"], true);
+        agent_b.abort();
+        let _ = agent_b.await;
+        let _ = link_a.await;
+        let _ = link_b.await;
 
         client.logout().await;
         assert_eq!(client.servers().await.unwrap_err().exit_code(), 3);

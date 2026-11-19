@@ -63,6 +63,10 @@ pub struct Outcome {
 pub trait Ops: Send + Sync {
     /// The tunnels that exist; every other call checks its name against this list.
     fn names(&self) -> Vec<String>;
+    /// Unlike the user-facing inventory, validation must propagate store read errors.
+    fn has_tunnel(&self, name: &str) -> Result<bool> {
+        Ok(self.names().iter().any(|existing| existing == name))
+    }
     /// Blocking: runs the action and, after a start, watches the tunnel come up.
     fn act(&self, name: &str, action: Action) -> Result<Outcome>;
     /// Blocking: the last `lines` lines of the tunnel's log.
@@ -125,6 +129,18 @@ fn pairing_of(config: &serde_json::Value, address: Option<String>) -> Result<ser
     Ok(serde_json::json!({"needs_address": needs, "code": code, "creator": made.creator}))
 }
 
+/// A machine-readable missing-resource cause, independent of the message text.
+#[derive(Debug)]
+pub struct UnknownTunnel(pub String);
+
+impl std::fmt::Display for UnknownTunnel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no tunnel named {}", self.0)
+    }
+}
+
+impl std::error::Error for UnknownTunnel {}
+
 /// Answers one request of the fixed list, for the agent and for the hub's own server alike.
 pub fn answer(ops: &dyn Ops, request: &serde_json::Value) -> Result<serde_json::Value> {
     use serde_json::json;
@@ -133,9 +149,15 @@ pub fn answer(ops: &dyn Ops, request: &serde_json::Value) -> Result<serde_json::
         Some("names") => Ok(json!(ops.names())),
         Some("act") => {
             let action = parse_action(request["action"].as_str().unwrap_or("")).context("unknown action")?;
+            if !ops.has_tunnel(name)? {
+                return Err(UnknownTunnel(name.to_owned()).into());
+            }
             Ok(serde_json::to_value(ops.act(name, action)?)?)
         }
         Some("logs") => {
+            if !ops.has_tunnel(name)? {
+                return Err(UnknownTunnel(name.to_owned()).into());
+            }
             let lines = request["lines"].as_u64().unwrap_or(200) as usize;
             Ok(serde_json::to_value(ops.logs(name, lines)?)?)
         }
@@ -273,7 +295,7 @@ impl LocalOps {
 
     fn known(store: &Store, name: &str) -> Result<()> {
         if !store.names()?.iter().any(|n| n == name) {
-            bail!("no tunnel named {name}");
+            return Err(UnknownTunnel(name.to_owned()).into());
         }
         Ok(())
     }
@@ -323,6 +345,10 @@ impl LocalOps {
 impl Ops for LocalOps {
     fn names(&self) -> Vec<String> {
         Self::store().and_then(|s| s.names()).unwrap_or_default()
+    }
+
+    fn has_tunnel(&self, name: &str) -> Result<bool> {
+        Ok(Self::store()?.names()?.iter().any(|existing| existing == name))
     }
 
     fn act(&self, name: &str, action: Action) -> Result<Outcome> {
@@ -641,7 +667,7 @@ impl DemoOps {
 
     fn known(&self, name: &str) -> Result<()> {
         if !self.names().iter().any(|n| n == name) {
-            bail!("no tunnel named {name}");
+            return Err(UnknownTunnel(name.to_owned()).into());
         }
         Ok(())
     }
@@ -950,6 +976,18 @@ mod tests {
         }
         for action in [Action::Start, Action::Stop, Action::Restart] {
             assert_eq!(parse_action(action_word(action)), Some(action));
+        }
+    }
+
+    #[test]
+    fn remote_action_and_logs_report_typed_unknown_tunnel_without_parsing_messages() {
+        let demo = DemoOps::new(&["exists"]);
+        for request in [
+            serde_json::json!({"op": "act", "name": "missing", "action": "stop"}),
+            serde_json::json!({"op": "logs", "name": "missing", "lines": 20}),
+        ] {
+            let err = answer(&demo, &request).unwrap_err();
+            assert_eq!(err.downcast_ref::<UnknownTunnel>().unwrap().0, "missing");
         }
     }
 

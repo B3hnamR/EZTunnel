@@ -109,6 +109,28 @@ pub struct Fleet {
     histories: Mutex<HashMap<String, Arc<super::history::History>>>,
 }
 
+/// Failure categories that survive the Hub/Agent boundary without parsing display text.
+#[derive(Debug)]
+pub enum RequestFailure {
+    NotConnected,
+    Disconnected,
+    TimedOut,
+    Agent { code: Option<String>, detail: String },
+}
+
+impl std::fmt::Display for RequestFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotConnected => f.write_str("that server is not connected"),
+            Self::Disconnected => f.write_str("the connection to that server ended"),
+            Self::TimedOut => f.write_str("that server did not answer in time"),
+            Self::Agent { detail, .. } => f.write_str(detail),
+        }
+    }
+}
+
+impl std::error::Error for RequestFailure {}
+
 fn id_of(key: &[u8; 32]) -> String {
     hex::encode(&key[..6])
 }
@@ -258,7 +280,7 @@ impl Fleet {
             .unwrap()
             .get(id)
             .map(|c| c.requests.clone())
-            .context("that server is not connected")?;
+            .ok_or(RequestFailure::NotConnected)?;
         self.request_on(&sender, request, timeout, hold).await
     }
 
@@ -268,13 +290,16 @@ impl Fleet {
         let (answer_tx, answer_rx) = oneshot::channel();
         let answer = tokio::time::timeout(timeout, async {
             sender.send((request, answer_tx, hold)).await
-                .map_err(|_| anyhow!("that server is not connected"))?;
-            answer_rx.await.map_err(|_| anyhow!("the connection to that server ended"))
-        }).await.context("that server did not answer in time")??;
+                .map_err(|_| RequestFailure::NotConnected)?;
+            answer_rx.await.map_err(|_| RequestFailure::Disconnected)
+        }).await.map_err(|_| RequestFailure::TimedOut)??;
         if answer["ok"] == true {
             Ok(answer["result"].clone())
         } else {
-            bail!("{}", answer["error"].as_str().unwrap_or("the server could not do it"))
+            Err(RequestFailure::Agent {
+                code: answer["error_code"].as_str().map(str::to_owned),
+                detail: answer["error"].as_str().unwrap_or("the server could not do it").to_owned(),
+            }.into())
         }
     }
 

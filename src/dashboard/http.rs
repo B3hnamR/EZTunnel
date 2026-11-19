@@ -486,7 +486,13 @@ async fn act(
         Ok(Ok(Err(failure))) => {
             let detail = format!("{failure:#}");
             state.audit.record(ip, "action_failed", &format!("{word} {name}: {detail}"));
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "failed", "detail": detail}))).into_response()
+            let (status, code) =
+                if failure.downcast_ref::<crate::manager::store::ChangeLockBusy>().is_some() {
+                    (StatusCode::CONFLICT, "busy")
+                } else {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "failed")
+                };
+            (status, Json(json!({"error": code, "detail": detail}))).into_response()
         }
         Ok(Err(_)) => error(StatusCode::INTERNAL_SERVER_ERROR, "failed"),
         Err(_) => error(StatusCode::GATEWAY_TIMEOUT, "timeout"),
@@ -768,6 +774,30 @@ async fn remove_server(State(state): State<Arc<AppState>>, Path(id): Path<String
     }
 }
 
+/// Normalize only typed Agent/transport failures. An older Agent's untyped message
+/// remains an internal error; never guess its meaning from human-readable prose.
+fn remote_request_status(failure: &anyhow::Error) -> (StatusCode, &'static str) {
+    use super::fleet::RequestFailure;
+    match failure.downcast_ref::<RequestFailure>() {
+        Some(RequestFailure::NotConnected | RequestFailure::Disconnected) => {
+            (StatusCode::BAD_GATEWAY, "remote_offline")
+        }
+        Some(RequestFailure::TimedOut) => (StatusCode::GATEWAY_TIMEOUT, "remote_timeout"),
+        Some(RequestFailure::Agent { code: Some(code), .. }) => match code.as_str() {
+            "unknown_tunnel" => (StatusCode::NOT_FOUND, "unknown_tunnel"),
+            "invalid_input" => (StatusCode::BAD_REQUEST, "invalid_input"),
+            "busy" => (StatusCode::CONFLICT, "busy"),
+            _ => (StatusCode::INTERNAL_SERVER_ERROR, "failed"),
+        },
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, "failed"),
+    }
+}
+
+fn remote_request_failed(failure: &anyhow::Error) -> Response {
+    let (status, code) = remote_request_status(failure);
+    (status, Json(json!({"error": code, "detail": format!("{failure:#}")}))).into_response()
+}
+
 /// Start, stop or restart a tunnel on another server.
 async fn server_act(
     State(state): State<Arc<AppState>>,
@@ -800,7 +830,7 @@ async fn server_act(
         Err(failure) => {
             let detail = format!("{failure:#}");
             state.audit.record(ip, "action_failed", &format!("{word} {name} on {id}: {detail}"));
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "failed", "detail": detail}))).into_response()
+            remote_request_failed(&failure)
         }
     }
 }
@@ -2359,7 +2389,7 @@ async fn server_logs(
         // An agent from before the cursor sends the lines alone.
         Ok(lines) if lines.is_array() => Json(json!({"lines": lines})).into_response(),
         Ok(tail) => Json(tail).into_response(),
-        Err(failure) => (StatusCode::BAD_GATEWAY, Json(json!({"error": "failed", "detail": format!("{failure:#}")}))).into_response(),
+        Err(failure) => remote_request_failed(&failure),
     }
 }
 
@@ -2500,6 +2530,24 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_and_link_failures_have_stable_http_codes() {
+        use super::super::fleet::RequestFailure;
+        let cases = [
+            (RequestFailure::NotConnected, StatusCode::BAD_GATEWAY, "remote_offline"),
+            (RequestFailure::Disconnected, StatusCode::BAD_GATEWAY, "remote_offline"),
+            (RequestFailure::TimedOut, StatusCode::GATEWAY_TIMEOUT, "remote_timeout"),
+            (RequestFailure::Agent { code: Some("unknown_tunnel".into()), detail: "missing".into() }, StatusCode::NOT_FOUND, "unknown_tunnel"),
+            (RequestFailure::Agent { code: Some("busy".into()), detail: "busy".into() }, StatusCode::CONFLICT, "busy"),
+            (RequestFailure::Agent { code: Some("invalid_input".into()), detail: "invalid".into() }, StatusCode::BAD_REQUEST, "invalid_input"),
+            (RequestFailure::Agent { code: None, detail: "no tunnel named x".into() }, StatusCode::INTERNAL_SERVER_ERROR, "failed"),
+            (RequestFailure::Agent { code: Some("arbitrary".into()), detail: "x".into() }, StatusCode::INTERNAL_SERVER_ERROR, "failed"),
+        ];
+        for (failure, status, code) in cases {
+            assert_eq!(remote_request_status(&failure.into()), (status, code));
+        }
+    }
 
     #[tokio::test]
     async fn unfinished_bodies_time_out_and_oversized_bodies_are_rejected() {

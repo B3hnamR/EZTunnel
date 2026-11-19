@@ -85,9 +85,14 @@ terminal sessions to disk. `fleet --state-dir PATH` selects a different **local 
 state directory; this is not a remote dashboard URL. It connects over loopback HTTPS and pins
 the Dashboard's locally stored certificate. Keep that state directory root-readable only.
 
-Headless commands print JSON to stdout. Errors print JSON to stderr with a nonzero exit code:
+Headless commands print JSON to stdout. Errors (including invalid fleet command arguments)
+print JSON to stderr with a nonzero exit code:
 2 invalid input; 3 authentication/authorization; 4 offline/unavailable/timeout; 5 unknown server
-or tunnel; 6 conflicting operation; 7 other failure. An offline server's tunnel list is **null**
+or tunnel; 6 conflicting operation; 7 other failure. `fleet --help` retains normal CLI help.
+For remote operations, typed Agent and connection failure codes are mapped to the same statuses
+as local operations; an older Agent that does not provide a typed error code cannot have its
+free-form failure text safely guessed, so it is reported as an internal error.
+An offline server's tunnel list is **null**
 (unknown), not an empty list. A completed HTTP operation is not proof that the data plane has
 connected; inspect the resulting status separately.
 
