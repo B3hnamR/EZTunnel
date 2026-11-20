@@ -26,6 +26,8 @@
   /** "server/name" keys of the other ends chosen for deleting too. */
   let also = $state({});
   let problem = $state("");
+  // A replaced pair invalidates the dialog's original selection. Never retry it.
+  let stalePair = $state(false);
   // Preserve failed targets even when live snapshots remove the successfully deleted primary.
   let remaining = $state(null);
   let targetCount = $state(0);
@@ -35,6 +37,7 @@
       typed = "";
       also = {};
       problem = "";
+      stalePair = false;
       remaining = null;
       targetCount = 0;
       dialog.showModal();
@@ -70,7 +73,7 @@
   }
 
   async function run() {
-    if (!confirmed || pending[key] || pending["*"]) return;
+    if (!confirmed || stalePair || pending[key] || pending["*"]) return;
     const targets = remaining ?? [{ server, name }, ...others.filter((o) => also[o.key] && o.online)];
     if (remaining === null) targetCount = targets.length;
     remaining = targets;
@@ -88,13 +91,17 @@
         }
         if (k !== key) pending[k] = "delete";
         try {
-          // Every end of a pair has the same fingerprint; its server refuses a tunnel that has
-          // been replaced under the same name since it was chosen here.
+          // Match the pair fingerprint under the Agent store lock so a reused name
+          // cannot make this panel delete a different tunnel after a stale snapshot.
           const { status, data } = await deleteTunnel(target.name, target.server, pair);
           if (status !== 200) {
             failed.push(`${target.name}: ${failure(status, data)}`);
-            // Trying again would delete nothing either: that tunnel is another one now.
-            if (data?.error !== "pair_changed") retry.push(target);
+            if (data?.error === "pair_changed") {
+              // Remaining targets came from the same stale selection; stop here.
+              stalePair = true;
+              break;
+            }
+            retry.push(target);
           }
         } catch {
           failed.push(`${target.name}: ${t("slowShort")}`);
@@ -154,7 +161,7 @@
   </div>
   <div class="dlg-f">
     <button class="btn" onclick={shut} disabled={working}>{t("cancel")}</button>
-    <button class="btn danger" onclick={run} disabled={!confirmed || working} aria-busy={working}>
+    <button class="btn danger" onclick={run} disabled={!confirmed || working || stalePair} aria-busy={working}>
       <Icon name="trash" />{working ? t("deleting") : t("deleteTunnel")}
     </button>
   </div>

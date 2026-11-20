@@ -495,6 +495,17 @@ mod tests {
         assert_eq!(port(&store), "192.0.2.1:7001");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn contended_change_lock_is_typed_and_released() {
+        let (_directory, store) = store();
+        let first = store.lock("qa", false).unwrap();
+        let error = store.lock("qa", false).err().unwrap();
+        assert_eq!(error.downcast_ref::<Busy>().unwrap().0, "qa");
+        drop(first);
+        assert!(store.lock("qa", false).is_ok());
+    }
+
     #[test]
     fn saving_checks_keeps_a_backup_and_lists() {
         let (_directory, store) = store();

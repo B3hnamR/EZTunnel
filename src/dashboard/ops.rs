@@ -63,8 +63,18 @@ pub struct Outcome {
 pub trait Ops: Send + Sync {
     /// The tunnels that exist; every other call checks its name against this list.
     fn names(&self) -> Vec<String>;
+    /// Unlike the user-facing inventory, validation must propagate store read errors.
+    fn has_tunnel(&self, name: &str) -> Result<bool> {
+        Ok(self.names().iter().any(|existing| existing == name))
+    }
     /// Blocking: runs the action and, after a start, watches the tunnel come up.
     fn act(&self, name: &str, action: Action) -> Result<Outcome>;
+    /// Run a paired lifecycle action only while the saved tunnel still has its expected
+    /// fingerprint. An older Agent must refuse this distinct allowlisted operation.
+    fn act_pair(&self, name: &str, action: Action, pair: &str) -> Result<Outcome> {
+        let _ = (name, action, pair);
+        bail!("pair-guarded lifecycle is unsupported")
+    }
     /// Blocking: the last `lines` lines of the tunnel's log.
     fn logs(&self, name: &str, lines: usize) -> Result<LogTail>;
     /// New log lines as they are written, until the returned value is dropped: those after
@@ -81,6 +91,12 @@ pub trait Ops: Send + Sync {
     /// Blocking: stops the tunnel and removes its service, firewall rules, traffic count and
     /// configuration, as the terminal manager's Delete does.
     fn delete(&self, name: &str) -> Result<()>;
+    /// Delete only when the current saved tunnel has the requested public pair fingerprint.
+    /// The check and removal must share the store's exclusive lock so a reused name is safe.
+    fn delete_pair(&self, name: &str, pair: &str) -> Result<()> {
+        let _ = (name, pair);
+        bail!("pair-guarded deletion is unsupported")
+    }
     /// Blocking: saves a new tunnel (one `wizard::creatable` accepts), installs its service and
     /// watches it come up. A name that is taken is refused.
     fn create(&self, name: &str, config: &serde_json::Value) -> Result<Outcome>;
@@ -88,13 +104,6 @@ pub trait Ops: Send + Sync {
     /// create of the dashboard made, never a tunnel of the same name someone else made meanwhile.
     fn delete_own(&self, name: &str, tunnel_key: &str) -> Result<()> {
         let _ = tunnel_key;
-        self.delete(name)
-    }
-    /// Blocking: deletes the tunnel only while it still has the pair fingerprint the person
-    /// chose it by (`data::pair_of`), so a tunnel deleted and made again under the same name
-    /// in the meantime is not deleted in its place.
-    fn delete_pair(&self, name: &str, pair: &str) -> Result<()> {
-        let _ = pair;
         self.delete(name)
     }
     /// Blocking: the running tunnel's own figures (its control socket's status answer).
@@ -140,9 +149,22 @@ pub fn answer(ops: &dyn Ops, request: &serde_json::Value) -> Result<serde_json::
         Some("names") => Ok(json!(ops.names())),
         Some("act") => {
             let action = parse_action(request["action"].as_str().unwrap_or("")).context("unknown action")?;
+            if !ops.has_tunnel(name)? {
+                return Err(unknown_tunnel(name));
+            }
             Ok(serde_json::to_value(ops.act(name, action)?)?)
         }
+        // Never piggyback on 'act' with an optional ignored field: old Agents must fail closed.
+        Some("act_pair") => {
+            let action = parse_action(request["action"].as_str().unwrap_or("")).context("unknown action")?;
+            let pair = request["expect_pair"].as_str().filter(|p| valid_pair(p))
+                .context("the expected pair fingerprint is missing or invalid")?;
+            Ok(serde_json::to_value(ops.act_pair(name, action, pair)?)?)
+        }
         Some("logs") => {
+            if !ops.has_tunnel(name)? {
+                return Err(unknown_tunnel(name));
+            }
             let lines = request["lines"].as_u64().unwrap_or(200) as usize;
             Ok(serde_json::to_value(ops.logs(name, lines)?)?)
         }
@@ -159,6 +181,14 @@ pub fn answer(ops: &dyn Ops, request: &serde_json::Value) -> Result<serde_json::
                 }
                 (None, None) => ops.delete(name)?,
             }
+            Ok(json!({"deleted": true}))
+        }
+        // Distinct allowlisted operation: an older Agent must fail closed rather than
+        // ignore an unknown optional fingerprint and delete a reused tunnel name.
+        Some("delete_pair") => {
+            let pair = request["expect_pair"].as_str().filter(|p| valid_pair(p))
+                .context("the expected pair fingerprint is missing or invalid")?;
+            ops.delete_pair(name, pair)?;
             Ok(json!({"deleted": true}))
         }
         Some("create") => Ok(serde_json::to_value(ops.create(name, &request["config"])?)?),
@@ -403,33 +433,54 @@ impl LocalOps {
     }
 }
 
+impl LocalOps {
+    /// Caller holds this tunnel's exclusive store lock and has checked its identity.
+    fn act_locked(store: &Store, name: &str, action: Action) -> Result<Outcome> {
+        if !store.system {
+            bail!("tunnel services need root and systemd");
+        }
+        let Some(step) = bulk::step_for(action, service::state(store, name)) else {
+            return Ok(Outcome { changed: false, came_up: None });
+        };
+        match step {
+            Step::Start => service::start(name)?,
+            Step::Install => service::install_with(store, name, &installed_program())?,
+            Step::Stop => service::stop(name)?,
+        }
+        let came_up = (step != Step::Stop).then(|| {
+            service::watch_started(
+                || service::state(store, name) == State::Running,
+                std::thread::sleep,
+            )
+        });
+        Ok(Outcome { changed: true, came_up })
+    }
+}
+
 impl Ops for LocalOps {
     fn names(&self) -> Vec<String> {
         Self::store().and_then(|s| s.names()).unwrap_or_default()
+    }
+
+    fn has_tunnel(&self, name: &str) -> Result<bool> {
+        Ok(Self::store()?.names()?.iter().any(|existing| existing == name))
     }
 
     fn act(&self, name: &str, action: Action) -> Result<Outcome> {
         let store = Self::store()?;
         let _lock = store.lock(name, false)?;
         Self::known(&store, name)?;
-        if !store.system {
-            bail!("tunnel services need root and systemd");
+        Self::act_locked(&store, name, action)
+    }
+
+    fn act_pair(&self, name: &str, action: Action, pair: &str) -> Result<Outcome> {
+        let store = Self::store()?;
+        let _lock = store.lock(name, false)?;
+        Self::known(&store, name)?;
+        if let Some(failure) = pair_differs(&store.read(name)?, name, pair) {
+            return Err(failure);
         }
-        let Some(step) = bulk::step_for(action, service::state(&store, name)) else {
-            return Ok(Outcome { changed: false, came_up: None });
-        };
-        match step {
-            Step::Start => service::start(name)?,
-            Step::Install => service::install_with(&store, name, &installed_program())?,
-            Step::Stop => service::stop(name)?,
-        }
-        let came_up = (step != Step::Stop).then(|| {
-            service::watch_started(
-                || service::state(&store, name) == State::Running,
-                std::thread::sleep,
-            )
-        });
-        Ok(Outcome { changed: true, came_up })
+        Self::act_locked(&store, name, action)
     }
 
     fn logs(&self, name: &str, lines: usize) -> Result<LogTail> {
@@ -712,7 +763,11 @@ impl DemoOps {
 
     /// The tunnels created in this demo.
     pub fn created(&self) -> Vec<(String, serde_json::Value)> {
-        self.added.lock().unwrap().iter().filter(|(n, _)| !self.deleted(n)).cloned().collect()
+        let added = self.added.lock().unwrap();
+        let mut seen = std::collections::HashSet::new();
+        added.iter().rev()
+            .filter(|(n, _)| seen.insert(n.clone()) && !self.deleted(n))
+            .cloned().collect()
     }
 
     fn known(&self, name: &str) -> Result<()> {
@@ -731,7 +786,10 @@ impl DemoOps {
 impl Ops for DemoOps {
     fn names(&self) -> Vec<String> {
         let added = self.added.lock().unwrap().iter().map(|(n, _)| n.clone()).collect::<Vec<_>>();
-        self.names.iter().chain(added.iter()).filter(|n| !self.deleted(n)).cloned().collect()
+        let mut seen = std::collections::HashSet::new();
+        self.names.iter().chain(added.iter())
+            .filter(|n| !self.deleted(n) && seen.insert((*n).clone()))
+            .cloned().collect()
     }
 
     fn create(&self, name: &str, config: &serde_json::Value) -> Result<Outcome> {
@@ -933,6 +991,19 @@ impl Ops for DemoOps {
         Ok(Outcome { changed: true, came_up: Some(true) })
     }
 
+    fn act_pair(&self, name: &str, action: Action, pair: &str) -> Result<Outcome> {
+        self.known(name)?;
+        let latest = self.added.lock().unwrap().iter().rev()
+            .find(|(n, _)| n == name).map(|(_, v)| v.clone());
+        if let Some(failure) = latest.as_ref().and_then(|config| pair_differs(config, name, pair)) {
+            return Err(failure);
+        }
+        if latest.is_none() {
+            return Err(refused("pair_changed", format!("{UNCHANGED}: {name} has no current saved pair")));
+        }
+        self.act(name, action)
+    }
+
     fn delete(&self, name: &str) -> Result<()> {
         self.known(name)?;
         std::thread::sleep(self.delay);
@@ -1040,6 +1111,18 @@ mod tests {
     }
 
     #[test]
+    fn remote_action_and_logs_report_typed_unknown_tunnel_without_parsing_messages() {
+        let demo = DemoOps::new(&["exists"]);
+        for request in [
+            serde_json::json!({"op": "act", "name": "missing", "action": "stop"}),
+            serde_json::json!({"op": "logs", "name": "missing", "lines": 20}),
+        ] {
+            let err = answer(&demo, &request).unwrap_err();
+            assert_eq!(code_of(&err), Some("unknown_tunnel"));
+        }
+    }
+
+    #[test]
     fn demo_actions_change_state_like_the_manager_and_only_for_known_tunnels() {
         let mut ops = DemoOps::new(&["game-fec", "backup-tcp"]);
         ops.delay = Duration::ZERO;
@@ -1059,6 +1142,60 @@ mod tests {
             assert!(!cursor_ok(bad), "{bad}");
         }
         assert!(ops.follow("nothing", None).is_err());
+    }
+
+    #[test]
+    fn paired_action_and_delete_refuse_a_recreated_tunnel_with_the_same_name() {
+        // Use the actual wizard model: both key fingerprints are valid, but different.
+        let form = serde_json::json!({"name":"qa-reuse", "transport":"tcp",
+            "address":"203.0.113.10", "ports":"9392"});
+        let original = super::super::wizard::build(&form).unwrap().foreign;
+        let replacement = super::super::wizard::build(&form).unwrap().foreign;
+        let old_pair = super::super::data::pair_of(&original).unwrap();
+        let new_pair = super::super::data::pair_of(&replacement).unwrap();
+        assert_ne!(old_pair, new_pair);
+        let mut demo = DemoOps::new(&[]);
+        demo.delay = Duration::ZERO;
+        demo.create("qa-reuse", &original).unwrap();
+        demo.delete("qa-reuse").unwrap();
+        demo.create("qa-reuse", &replacement).unwrap();
+        assert_eq!(demo.names().iter().filter(|n| *n == "qa-reuse").count(), 1);
+        assert_eq!(demo.created().iter().filter(|(n, _)| n == "qa-reuse").count(), 1);
+        assert_eq!(super::super::data::pair_of(&demo.created()[0].1).as_deref(), Some(new_pair.as_str()));
+        assert!(demo.running("qa-reuse", true));
+
+        // Pair A was captured earlier, then B took the exact same server/name.
+        for action in ["start", "stop", "restart"] {
+            let request = serde_json::json!({"op":"act_pair", "name":"qa-reuse",
+                "action":action, "expect_pair":old_pair});
+            let error = answer(&demo, &request).unwrap_err();
+            assert_eq!(code_of(&error), Some("pair_changed"), "{action}: {error:#}");
+            assert!(demo.running("qa-reuse", true), "{action} touched replacement B");
+        }
+        assert_eq!(code_of(&answer(&demo, &serde_json::json!({"op":"delete_pair",
+            "name":"qa-reuse", "expect_pair":old_pair})).unwrap_err()), Some("pair_changed"));
+        assert!(demo.names().iter().any(|n| n == "qa-reuse"));
+        // Correct current key works even with uppercase user input.
+        let stopped = answer(&demo, &serde_json::json!({"op":"act_pair", "name":"qa-reuse",
+            "action":"stop", "expect_pair":new_pair.to_uppercase()})).unwrap();
+        assert_eq!(stopped["changed"], true);
+        assert!(!demo.running("qa-reuse", true));
+        answer(&demo, &serde_json::json!({"op":"delete_pair", "name":"qa-reuse",
+            "expect_pair":new_pair.to_uppercase()})).unwrap();
+        assert!(demo.deleted("qa-reuse"));
+    }
+
+    #[test]
+    fn paired_lifecycle_requires_fingerprint_and_allowlisted_action() {
+        let demo = DemoOps::new(&["qa"]);
+        for request in [
+            serde_json::json!({"op":"act_pair", "name":"qa", "action":"start"}),
+            serde_json::json!({"op":"act_pair", "name":"qa", "action":"start", "expect_pair":"invalid"}),
+            serde_json::json!({"op":"act_pair", "name":"qa", "action":"remove", "expect_pair":"0123456789abcdef"}),
+        ] {
+            assert!(answer(&demo, &request).is_err());
+        }
+        assert!(demo.running("qa", true));
     }
 
     #[test]

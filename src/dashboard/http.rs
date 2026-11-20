@@ -461,6 +461,36 @@ async fn tunnel_names(state: &Arc<AppState>) -> Vec<String> {
     tokio::task::spawn_blocking(move || ops.names()).await.unwrap_or_default()
 }
 
+/// Use a distinct action-name variant on the EXISTING URL so an older Hub
+/// also fails closed (its legacy parse_action rejects paired-start/stop/restart).
+fn action_route(word: &str) -> Option<(crate::manager::bulk::Action, bool)> {
+    if let Some(legacy) = ops::parse_action(word) {
+        return Some((legacy, false));
+    }
+    word.strip_prefix("paired-")
+        .and_then(ops::parse_action)
+        .map(|action| (action, true))
+}
+
+/// A guarded lifecycle request uses the existing action URL, with an expected pair
+/// identity checked atomically inside the target Agent (or LocalOps) store lock.
+async fn action_pair_guard(request: Request) -> Result<Option<String>, Response> {
+    let bytes = read_body(request, MAX_BODY).await?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let body: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| error(StatusCode::BAD_REQUEST, "bad_request"))?;
+    if !body.is_object() {
+        return Err(error(StatusCode::BAD_REQUEST, "bad_request"));
+    }
+    match body.get("expect_pair") {
+        None => Ok(None),
+        Some(Value::String(pair)) if ops::valid_pair(pair) => Ok(Some(pair.to_ascii_lowercase())),
+        _ => Err(error(StatusCode::BAD_REQUEST, "invalid_pair")),
+    }
+}
+
 /// Start, stop or restart one tunnel. Answers when the action is done; after a start it also
 /// says whether the tunnel came up and stayed up.
 async fn act(
@@ -472,11 +502,18 @@ async fn act(
         return unauthorized();
     }
     let ip = client_ip(&request);
-    let Some(action) = ops::parse_action(&action) else {
+    let Some((action, paired)) = action_route(&action) else {
         return error(StatusCode::NOT_FOUND, "unknown_action");
     };
     if !tunnel_names(&state).await.contains(&name) {
         return error(StatusCode::NOT_FOUND, "unknown_tunnel");
+    }
+    let expected_pair = match action_pair_guard(request).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if expected_pair.is_some() != paired {
+        return error(StatusCode::BAD_REQUEST, "invalid_pair");
     }
     let Some(busy) = Busy::take(&state, vec![name.clone()]) else {
         return error(StatusCode::CONFLICT, "busy");
@@ -489,7 +526,10 @@ async fn act(
     // until the action really ends.
     let task = tokio::task::spawn_blocking(move || {
         let _busy = busy;
-        ops.act(&task_name, action)
+        match expected_pair {
+            Some(pair) => ops.act_pair(&task_name, action, &pair),
+            None => ops.act(&task_name, action),
+        }
     });
     let answer = tokio::time::timeout(ACTION_TIMEOUT, task).await;
     state.live.refresh();
@@ -853,10 +893,20 @@ async fn server_act(
         return unauthorized();
     }
     let ip = client_ip(&request);
-    let Some(action) = ops::parse_action(&action) else {
+    let Some((action, paired)) = action_route(&action) else {
         return error(StatusCode::NOT_FOUND, "unknown_action");
     };
+    let expected_pair = match action_pair_guard(request).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if expected_pair.is_some() != paired {
+        return error(StatusCode::BAD_REQUEST, "invalid_pair");
+    }
     let Some(fleet) = state.fleet.clone() else {
+        if expected_pair.is_some() {
+            return error(StatusCode::BAD_GATEWAY, "remote_offline");
+        }
         tokio::time::sleep(Duration::from_millis(700)).await;
         return Json(json!({"ok": true, "changed": true, "came_up": (action != crate::manager::bulk::Action::Stop).then_some(true)})).into_response();
     };
@@ -868,7 +918,10 @@ async fn server_act(
     };
     let word = ops::action_word(action);
     state.audit.record(ip, "action", &format!("{word} {name} on {id}"));
-    let answer = fleet.request_held(&id, json!({"op": "act", "name": name, "action": word}), ACTION_TIMEOUT, busy.clone()).await;
+    let answer = fleet.request_held(&id,
+        json!({"op": if expected_pair.is_some() { "act_pair" } else { "act" },
+            "name": name, "action": word, "expect_pair": expected_pair}),
+        ACTION_TIMEOUT, busy.clone()).await;
     drop(busy);
     match answer {
         Ok(outcome) => Json(json!({"ok": true, "changed": outcome["changed"], "came_up": outcome["came_up"]})).into_response(),
@@ -2357,7 +2410,12 @@ async fn new_tunnel_owned(State(state): State<Arc<AppState>>, request: Request) 
 }
 
 /// Deletes a tunnel here or on a joined server.
-async fn delete_answer(state: Arc<AppState>, server: String, name: String, request: Request) -> Response {
+async fn delete_answer(
+    state: Arc<AppState>,
+    server: String,
+    name: String,
+    request: Request,
+) -> Response {
     if !state.signed_in(request.headers()) {
         return unauthorized();
     }
@@ -2377,15 +2435,25 @@ async fn delete_answer(state: Arc<AppState>, server: String, name: String, reque
         Err(response) => return response,
     };
     let local = server == "local";
-    let key = if local { name.clone() } else { format!("{server}/{name}") };
+    let key = if local {
+        name.clone()
+    } else {
+        format!("{server}/{name}")
+    };
     if !local && state.busy.lock().unwrap().contains(&format!("{server}/*")) {
         return error(StatusCode::CONFLICT, "busy");
     }
     let Some(busy) = Busy::take(&state, vec![key]) else {
         return error(StatusCode::CONFLICT, "busy");
     };
-    let place = if local { String::new() } else { format!(" on {server}") };
-    state.audit.record(ip, "action", &format!("delete {name}{place}"));
+    let place = if local {
+        String::new()
+    } else {
+        format!(" on {server}")
+    };
+    state
+        .audit
+        .record(ip, "action", &format!("delete {name}{place}"));
     let answer: Result<()> = if local {
         let ops = state.ops.clone();
         let task_name = name.clone();
@@ -2407,8 +2475,12 @@ async fn delete_answer(state: Arc<AppState>, server: String, name: String, reque
         let Some(fleet) = state.fleet.clone() else {
             return error(StatusCode::NOT_FOUND, "unknown_server");
         };
-        // An agent from before `expect_pair` ignores it and deletes by name, as it always did.
-        let answer = fleet.request_held(&server, json!({"op": "delete", "name": name, "expect_pair": pair}), ACTION_TIMEOUT, busy.clone()).await.map(|_| ());
+        // Guarded removal is an explicit Agent operation: older Agents without it reject
+        // the request rather than ignore a fingerprint and delete a replacement tunnel.
+        let op = if pair.is_some() { "delete_pair" } else { "delete" };
+        let answer = fleet.request_held(&server,
+            json!({"op": op, "name": name, "expect_pair": pair}),
+            ACTION_TIMEOUT, busy.clone()).await.map(|_| ());
         drop(busy);
         answer
     };

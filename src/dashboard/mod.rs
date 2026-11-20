@@ -25,6 +25,7 @@ mod service;
 mod spoofcheck;
 mod sshadd;
 mod tls;
+pub mod terminal;
 mod tools;
 mod wizard;
 

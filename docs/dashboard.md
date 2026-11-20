@@ -6,8 +6,9 @@ create, edit, start, stop and delete tunnels, read their logs, run connection ch
 EZTunnel, keep backups and get alerts on Telegram. It comes in English and Persian, with a dark and
 a light theme.
 
-Everything the dashboard does, the terminal manager (`sudo eztunnel`) still does too. Tunnels do
-not depend on the dashboard: stopping or removing it never stops a tunnel.
+The local terminal manager (`sudo eztunnel`) remains available when the dashboard is stopped.
+The central terminal can also view and operate on enrolled servers while the dashboard is running.
+Tunnels do not depend on the dashboard: stopping or removing it never stops a tunnel.
 
 ## Set it up
 
@@ -54,6 +55,173 @@ dashboard's **Servers** page:
 
 On the other server, **Tools → Web dashboard → Join this server to a dashboard on another server**
 does the same with a join code, and **Leave the dashboard** ends it. Leaving never stops a tunnel.
+
+## Manage enrolled servers from the central terminal
+
+The browser, interactive central menu and headless CLI reuse the **same authenticated Dashboard HTTPS
+API and live Agent connections**. No terminal-only server registry, management database or alternate
+Agent exists. Run these on the **server hosting the Dashboard** (not on an Agent):
+
+```sh
+sudo eztunnel fleet servers                       # online/offline and current inventories (JSON)
+sudo eztunnel fleet tunnels --server SERVER_ID
+sudo eztunnel fleet options                       # currently supported central-create transports
+sudo eztunnel fleet status TUNNEL --server SERVER_ID
+sudo eztunnel fleet status TUNNEL --server SERVER_ID --live  # control-socket figures
+sudo eztunnel fleet logs TUNNEL --server SERVER_ID --lines 80
+sudo eztunnel fleet settings TUNNEL --server SERVER_ID
+sudo eztunnel fleet preset TUNNEL --server SERVER_ID --preset gaming       # preview
+sudo eztunnel fleet preset TUNNEL --server SERVER_ID --preset gaming --write # apply
+sudo eztunnel fleet rename-server SERVER_ID --name 'Display name'
+sudo eztunnel fleet health --server SERVER_ID
+sudo eztunnel fleet tool TUNNEL pairing --server SERVER_ID --form /root/pairing-options.json
+sudo eztunnel fleet tool TUNNEL speedtest --server SERVER_ID --form /root/speedtest-options.json
+sudo eztunnel fleet tool TUNNEL quota_reset --server SERVER_ID
+sudo eztunnel fleet start TUNNEL --server SERVER_ID
+sudo eztunnel fleet stop TUNNEL --server SERVER_ID --both
+sudo eztunnel fleet restart TUNNEL --server SERVER_ID --both
+sudo eztunnel fleet restart-all --server SERVER_ID
+sudo eztunnel fleet join-code                      # secret, single-use Agent enrollment code
+sudo eztunnel fleet remove-server SERVER_ID --confirm SERVER_ID
+sudo eztunnel fleet menu                           # interactive server and tunnel operations
+```
+
+`SERVER_ID` is an ID from `fleet servers`; `local` means the Dashboard host (and is the default).
+An Agent can enroll with the generated join code by running `sudo eztunnel agent join CODE`
+**on that Agent**. The Dashboard's optional SSH-based automatic installer remains a browser-only
+shortcut; direct terminal enrollment does not require SSH to the Agent.
+
+### Create both ends, edit, undo and delete
+
+The JSON form uses the **same fields as the Dashboard's new-tunnel wizard**, not separate
+config-generation code. Choose two distinct online enrolled servers, or one and `local`. Specify
+the **reachable address of the listening endpoint**; never assume the Agent's reported private IP
+is reachable from the other end. Example `/root/new-pair.json` for a reverse TCP tunnel:
+
+```json
+{
+  "iran": "local",
+  "foreign": "SERVER_ID",
+  "name": "site-link",
+  "transport": "tcp",
+  "direction": "reverse",
+  "address": "203.0.113.10",
+  "tunnel_port": 7000,
+  "carry": "ports",
+  "ports": "8080",
+  "protocol": "tcp",
+  "reach": "local"
+}
+```
+
+```sh
+sudo eztunnel fleet create --form /root/new-pair.json
+sudo eztunnel fleet settings site-link --server local
+```
+
+Both endpoint configurations are built with one fresh tunnel key. The listener is created and
+started before the dialing end. Creation uses the Dashboard's existing busy locks, audit trail,
+service installation and key-guarded cleanup attempts if creation fails. The Dashboard and Fleet
+inventory share the resulting pair fingerprint.
+
+For configuration changes, save **only** the fields to change (same as the browser's edit panel)
+in `/root/changes.json`:
+
+```json
+{
+  "quota": {"limit_gb": 100, "period_days": 30},
+  "settings": [{"name": "heartbeat_sec", "place": "top", "value": 15}]
+}
+```
+
+```sh
+sudo eztunnel fleet edit site-link --server local --changes /root/changes.json
+sudo eztunnel fleet undo site-link --server local
+sudo eztunnel fleet delete site-link --server local --both --confirm site-link
+# If only the matching remote endpoint remains after a partial failure:
+sudo eztunnel fleet delete site-link --server SERVER_ID --expect-pair PAIR_FINGERPRINT --confirm site-link
+```
+
+`settings` returns editable fields, types, ranges, the 0.12.0 performance presets with their
+server-specific values, and whether undo is available. `fleet preset` previews the current
+server's numeric and connection-pool changes. `--write` applies them through the existing
+Dashboard edit/undo path; without it, no configuration is changed. Apply the same preset
+separately to both tunnel endpoints, using each server's own hardware-dependent values.
+`fleet rename-server` changes only the Dashboard display name (an empty name resets it).
+Edit and undo reuse the existing validate/apply/restart/revert behavior. A plain deletion requires the exact
+name via `--confirm`; `--both` requires **exactly two visible online endpoints** with the same
+pair fingerprint and consistent roles before modifying either endpoint. Paired start, stop,
+restart and delete report results separately for each side. Starting is listener-first; stopping
+and deleting are dialer-first; paired restart stops both before starting the listener. There is
+no distributed two-phase transaction: if one request fails or times out, the CLI exits nonzero
+(code **8** for a partially executed pair) and prints completed attempts and remaining targets in
+JSON for operator reconciliation. It does not claim rollback or safe blind retry.
+
+For guarded deletion, the current saved tunnel fingerprint is checked under its own exclusive
+store lock immediately before removing its service, configuration and task-owned resources. A
+reused tunnel name with another key is refused (HTTP 409). The same lock-protected identity
+guard applies to paired start/stop/restart. **Both Hub and Agent must support `act_pair` and
+`delete_pair`** for protected pair operations. Older Agents refuse these new allowlisted
+operations instead of silently ignoring a fingerprint. Paired lifecycle requests use distinct
+`paired-start/stop/restart` action names on the **existing** Dashboard URL, so older Hubs also
+reject them instead of silently ignoring an extra field. Upgrade both before protected paired
+actions. The Web deletion dialog distinguishes a stale pair from ordinary Busy errors and
+disables retry until the operator refreshes and reselects the target.
+An offline Agent's snapshot is unknown (not an empty list); Fleet lists any offline server IDs
+as **unverified**, not as confirmed non-members of the pair. On a partial deletion, inspect the
+current inventory and retry only a specific remaining endpoint with `--expect-pair`.
+
+### Input, credentials and automation
+
+The CLI prompts privately for the Dashboard password. For automation, pass it on **stdin** from
+your secret manager (never via argv or an environment variable):
+
+```sh
+secret-manager-command | sudo eztunnel fleet --password-stdin create --form /root/new-pair.json
+```
+
+Form and change inputs must be regular JSON-object files no larger than 8 KiB (the Dashboard API body limit). `-` is not a
+supported form path, because stdin is reserved for the password. All **headless** Fleet commands
+return JSON on stdout and JSON errors on stderr; `fleet menu` uses interactive prompts
+instead, and `fleet --help` remains regular human-readable help.
+Errors use these nonzero codes: **2** invalid input, **3** auth, **4** disconnected/timeout,
+**5** unknown server/tunnel, **6** busy/conflict, **7** other error,
+**8** partially failed paired operation or restart-all. Restart-all returns all per-tunnel
+results with a nonzero exit code if any restart fails; the interactive menu displays the same
+structured failure. Offline status requests return exit **4** (unknown live state), not
+`unknown_tunnel`.
+A successful HTTP action does not establish that an encrypted tunnel carries traffic: inspect
+status, connection checks and actual application traffic separately. Join codes and pairing
+codes are secrets; handle output and temporary files accordingly.
+
+The interactive `fleet menu` offers guided creation with the supported carriers, or a JSON form
+file for specialized wizard options; selecting a server offers Health and Restart all; selecting
+a tunnel offers edit, undo, single/paired lifecycle and single/paired deletion. Back/Esc/No do not
+submit mutations. With the Dashboard offline, the **local** `sudo eztunnel menu` still manages
+local tunnels without the central Agent fleet.
+
+### Current central-management coverage
+
+| Capability | Web | Central interactive menu | Headless Fleet CLI | Limit |
+|---|---|---|---|---|
+| Server list, connectivity, tunnel inventory | Yes | Yes | `servers`, `tunnels` | Offline snapshot unknown |
+| Tunnel details, recent logs | Yes | Yes | `status`, `logs` | Continuous log follow remains Web-only |
+| Create/pair/start both ends | Yes | Guided + JSON form | `create --form` | Dashboard wizard-supported carriers only |
+| TCP/UDP, TLS/WSS, Parallax, FEC/KCP, IPv6/Game variants | Yes | Wizard options / JSON file | Same wizard JSON | Not a new transport implementation |
+| Edit / undo tunnel configuration | Yes | Fields + JSON changes file | `settings`, `edit`, `undo` | Side-specific settings are edited per endpoint |
+| 0.12.0 performance presets and automatic pool | Yes | Preview/apply inside Edit settings | `preset --preset NAME [--write]` | Server-specific values; apply on each end |
+| Start/stop/restart one or both matched ends | Yes | Yes | `start/stop/restart [--both]` | Both sides online and identified |
+| Delete both ends, with guarded target identity | Yes (manual pair selection) | Yes | `delete --both --confirm` | Pair guard requires updated Agent |
+| Server health, tunnel speed test / quota / pairing | Yes | Health; settings / operations | `health`, `tool` | Detailed diagnostic views remain Web-first |
+| Enroll / forget Agent | Yes | Code / forget | `join-code`, `remove-server` + `agent join` | SSH auto-install remains Web-only |
+| Rename server display name | Yes | Yes | `rename-server ID --name NAME` | Host identity and tunnels unchanged |
+| Restart every tunnel on a selected server | Yes | Yes | `restart-all` | Sequential; affects multiple services |
+| Backups, restores, binary updates, advanced checks, charts and alert configuration | Yes | Local manager / Web | Dashboard and existing local commands | Not exposed as new Fleet shortcuts |
+| Path Finder cancellation, connection-test filtering, Alerts history (0.12) | Yes | Web Dashboard | Web Dashboard | Browser workflows; not duplicated as terminal screens |
+| Local Raw/TUN, Mirage and specialist CDN setup | Local manager where available | Local manager | Existing local commands | The Dashboard wizard cannot create these centrally |
+
+The matrix distinguishes **practical central parity** from engine support. An operation unavailable
+in the Dashboard/Agent architecture is not magically implemented by exposing a CLI entry point.
 
 ## What it shows and does
 

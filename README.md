@@ -502,7 +502,8 @@ over SSH. From there you can:
 - get alerts in the dashboard and on Telegram.
 
 It runs as its own service over HTTPS with a random port and password, and tunnels never depend on
-it. See [the dashboard guide](docs/dashboard.md).
+it. See [the dashboard guide](docs/dashboard.md), including the current central Web/Menu/CLI
+feature-parity matrix, JSON automation examples, and partial-failure recovery rules.
 
 ## Managing tunnels
 
