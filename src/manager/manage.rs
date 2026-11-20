@@ -405,6 +405,7 @@ enum Action {
     RawFirewall,
     Wire,
     Settings,
+    Preset,
     LogLevel,
     QuotaReset,
     Edit,
@@ -495,6 +496,7 @@ fn tunnel(store: &Store, name: &str) -> Result<()> {
             add(Action::Wire, &wire_label(&config));
         }
         add(Action::Settings, "Change settings");
+        add(Action::Preset, "Apply a preset   ready-made settings for this transport");
         if store.system {
             add(
                 Action::LogLevel,
@@ -557,6 +559,7 @@ fn tunnel(store: &Store, name: &str) -> Result<()> {
                     Some(edited) => save_and_restart(store, name, &edited),
                     None => Ok(()),
                 },
+                Action::Preset => apply_preset(store, name, &config),
                 Action::LogLevel => {
                     let debug = !service::debug_logging(name);
                     service::set_debug_logging(name, debug).map(|()| {
@@ -736,6 +739,60 @@ fn toggle_raw_firewall(store: &Store, name: &str) -> Result<()> {
 /// Saves new settings and restarts the tunnel with them. A configuration that passes every check
 /// can still fail to start (a port another program holds), so the tunnel is watched for a few
 /// seconds afterwards; if it does not stay up, the previous settings can be put back.
+/// Chooses a preset, shows exactly what it changes, and saves it (restarting the tunnel) only
+/// after the operator confirms.
+fn apply_preset(store: &Store, name: &str, config: &Value) -> Result<()> {
+    use super::presets::{self, Capacity, Preset};
+    let capacity = Capacity::here();
+    let current = presets::current(config, capacity);
+    let items: Vec<String> = Preset::ALL
+        .iter()
+        .map(|preset| {
+            let mark = if current == Some(*preset) { ui::green("  (in use)") } else { String::new() };
+            format!("{}  {}{mark}", ui::bold(&format!("{:<26}", preset.label())), ui::dim(preset.description()))
+        })
+        .collect();
+    let start = current.and_then(|c| Preset::ALL.iter().position(|p| *p == c)).unwrap_or(0);
+    ui::heading("Apply a preset", &format!("this server: {} MiB, {} cores", capacity.memory_mb, capacity.cores));
+    let Some(choice) = ui::choose("Preset", &items, start)? else {
+        return Ok(());
+    };
+    let preset = Preset::ALL[choice];
+    let outcome = presets::outcome(config, preset, capacity)?;
+    if outcome.active() {
+        ui::ok(&format!("{name} already uses {}.", preset.label()));
+        ui::pause();
+        return Ok(());
+    }
+    let edited = match presets::apply(config, preset, capacity) {
+        Ok(edited) => edited,
+        Err(error) => {
+            ui::fail(&format!("{error:#}"));
+            ui::pause();
+            return Ok(());
+        }
+    };
+    let shown = |value: Option<u64>, default: &Value| match value {
+        Some(value) => value.to_string(),
+        None => format!("default {}", default.as_u64().map_or("(automatic)".into(), |d| d.to_string())),
+    };
+    let mut lines: Vec<String> = outcome
+        .changes
+        .iter()
+        .map(|c| format!("{:<28} {} → {}", c.setting.name, ui::dim(&shown(c.from, &c.setting.default)), ui::accent(&shown(c.to, &c.setting.default))))
+        .collect();
+    if let Some((now, after)) = outcome.pool.filter(|(now, after)| now != after) {
+        lines.push(format!("{:<28} {} → {}", "connection_pool", ui::dim(&now.to_string()), ui::accent(&after.to_string())));
+    }
+    eprintln!();
+    ui::boxed(&format!("{} on {name}", preset.label()), &lines);
+    ui::note("Set the same preset on the other server of this tunnel too.");
+    if !ui::confirm("Save these settings and restart the tunnel now?", true)? {
+        return Ok(());
+    }
+    save_and_restart(store, name, &edited)
+}
+
 fn save_and_restart(store: &Store, name: &str, config: &Value) -> Result<()> {
     let _lock = store.lock(name, true)?;
     let earlier = store.previous_bytes(name);

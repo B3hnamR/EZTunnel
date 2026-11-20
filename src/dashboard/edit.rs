@@ -80,6 +80,8 @@ pub fn editable(config: &Value) -> Result<Value> {
         },
         "settings": settings,
         "restart_hours": config["schedule"]["restart_every_hours"].as_u64().unwrap_or(0),
+        // Sized on the server that runs the tunnel (an agent answers for its own server).
+        "presets": crate::manager::presets::listed(config, crate::manager::presets::Capacity::here()),
     }))
 }
 
@@ -106,7 +108,7 @@ fn carrier_of(config: &Value, scope: &Scope) -> Value {
         "transport": scope.transport,
         "parallax_mode": (scope.transport == Transport::Parallax)
             .then(|| if scope.parallax_packet { "packet" } else { "stream" }),
-        "pool": (scope.dials() && !single).then(|| entry["connection_pool"].as_u64().unwrap_or(1)),
+        "pool": (scope.dials() && !single).then(|| crate::manager::plan::pool_now(entry, scope.transport)),
         "speed": speed,
         "tls_profile": tls.then(|| entry["tls_profile"].as_str().unwrap_or("classic")),
         "tls_fragment": tls.then(|| entry["tls_fragment"]["enabled"].as_bool().unwrap_or(false)),
@@ -181,14 +183,8 @@ fn apply_carrier(config: &mut Value, carrier: &Value) -> Result<()> {
     if let Some(pool) = carrier.get("pool").filter(|v| !v.is_null()) {
         ensure!(has("pool"), "only the side that connects has parallel connections");
         let pool = pool.as_u64().filter(|p| (1..=16).contains(p)).context("parallel connections must be 1 to 16")?;
-        let entry = &mut config[key][0];
-        if pool == 1 {
-            if let Some(object) = entry.as_object_mut() {
-                object.remove("connection_pool");
-            }
-        } else {
-            entry["connection_pool"] = json!(pool);
-        }
+        let transport = Scope::of_config(config)?.transport;
+        crate::manager::plan::set_pool(&mut config[key][0], transport, pool);
     }
     if let Some(profile) = carrier.get("tls_profile").filter(|v| !v.is_null()) {
         ensure!(has("tls_profile"), "the TLS look applies to the connecting side of a TLS carrier only");
@@ -383,9 +379,12 @@ mod tests {
         let stream = apply(&tuned, &json!({"carrier": {"parallax_mode": "stream"}})).unwrap();
         assert!(stream["paths"][0].get("fec").is_none(), "{}", stream["paths"][0]);
         assert!(stream["paths"][0].get("parallax").is_none(), "{}", stream["paths"][0]);
-        // Pool 1 is the default and is not written.
+        // Pool 1 is no longer the default: it is written. The automatic size is not.
         let one = apply(&foreign, &json!({"carrier": {"pool": 1}})).unwrap();
-        assert!(one["paths"][0].get("connection_pool").is_none());
+        assert_eq!(one["paths"][0]["connection_pool"], 1);
+        let auto = crate::config::Transport::Parallax.auto_pool() as u64;
+        let automatic = apply(&one, &json!({"carrier": {"pool": auto}})).unwrap();
+        assert!(automatic["paths"][0].get("connection_pool").is_none());
         // TLS look and fragmentation: only on the dialing side of a TLS carrier.
         let wss = json!({"mode": "client", "tunnel_key": iran()["tunnel_key"], "allowed_targets": ["127.0.0.1:*"],
             "paths": [{"addr": "203.0.113.10:443", "transport": "wss", "tls_auto": true}]});

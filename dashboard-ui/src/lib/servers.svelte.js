@@ -5,7 +5,10 @@ import { getServers } from "./api.js";
 const POINTS = 150;
 export const LOCAL = "local";
 
-export const fleet = $state({ list: [], loaded: false, error: false, offlineAfter: 20 });
+export const fleet = $state({ list: [], loaded: false, error: false, offlineAfter: 20, localName: null });
+
+/** The name this server is shown under: the one set on the dashboard, else its hostname. */
+export const localName = (hostname) => fleet.localName || hostname || "";
 /** id -> tunnel name -> recent download rates. */
 export const fleetSeries = $state({});
 
@@ -30,6 +33,7 @@ async function pollOnce(request) {
     if (status !== 200) throw new Error(String(status));
     fleet.list = data.servers;
     fleet.offlineAfter = data.offline_after ?? 20;
+    fleet.localName = data.local_name ?? null;
     fleet.loaded = true;
     fleet.error = false;
     for (const server of data.servers) {
@@ -69,6 +73,7 @@ export function stopFleet() {
   fleet.loaded = false;
   fleet.error = false;
   fleet.offlineAfter = 20;
+  fleet.localName = null;
   for (const id of Object.keys(fleetSeries)) delete fleetSeries[id];
 }
 

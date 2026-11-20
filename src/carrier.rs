@@ -959,10 +959,8 @@ pub(crate) fn chunked_io(stream: BoxIo) -> BoxIo {
             loop {
                 let count = input.read(&mut buffer).await?;
                 network_write
-                    .write_all(format!("{count:x}\r\n").as_bytes())
+                    .write_all(&crate::xhttp_carrier::chunk_bytes(&buffer[..count]))
                     .await?;
-                network_write.write_all(&buffer[..count]).await?;
-                network_write.write_all(b"\r\n").await?;
                 network_write.flush().await?;
                 if count == 0 {
                     return anyhow::Ok(());

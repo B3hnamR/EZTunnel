@@ -64,6 +64,7 @@
 
   function failure(status, data) {
     if (status === 401) return t("signedOutNow");
+    if (data?.error === "pair_changed") return t("pairChangedT");
     if (status === 409) return t("busyT");
     return data?.detail ?? "";
   }
@@ -87,10 +88,13 @@
         }
         if (k !== key) pending[k] = "delete";
         try {
-          const { status, data } = await deleteTunnel(target.name, target.server);
+          // Every end of a pair has the same fingerprint; its server refuses a tunnel that has
+          // been replaced under the same name since it was chosen here.
+          const { status, data } = await deleteTunnel(target.name, target.server, pair);
           if (status !== 200) {
             failed.push(`${target.name}: ${failure(status, data)}`);
-            retry.push(target);
+            // Trying again would delete nothing either: that tunnel is another one now.
+            if (data?.error !== "pair_changed") retry.push(target);
           }
         } catch {
           failed.push(`${target.name}: ${t("slowShort")}`);

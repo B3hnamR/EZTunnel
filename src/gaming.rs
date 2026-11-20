@@ -512,6 +512,32 @@ impl Hub {
 
 fn config_role_is_origin(peer:Option<[u8;32]>)->bool {peer.is_none()}
 
+/// A game datagram `send` did not send (no usable channel, or an error on the way): counted, and
+/// logged at most once per `SEND_FAILURE_LOG_EVERY` ms with how many more came since, so a burst
+/// leaves its reason in the journal without flooding it.
+pub fn send_failed(result: &Result<bool>) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    static SKIPPED: AtomicU64 = AtomicU64::new(0);
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    crate::transport_metrics::GAMING_SEND_FAILURES.fetch_add(1, Relaxed);
+    // Offset by one period so the very first failure is logged.
+    let now = START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + SEND_FAILURE_LOG_EVERY;
+    let last = LAST.load(Relaxed);
+    if now.saturating_sub(last) < SEND_FAILURE_LOG_EVERY || LAST.compare_exchange(last, now, Relaxed, Relaxed).is_err() {
+        SKIPPED.fetch_add(1, Relaxed);
+        return;
+    }
+    let skipped = SKIPPED.swap(0, Relaxed);
+    match result {
+        Ok(_) => tracing::warn!(more_since_last_report = skipped, "game datagram dropped: no usable game channel"),
+        Err(error) => tracing::warn!(more_since_last_report = skipped, error = %format!("{error:#}"), "game datagram dropped: sending it failed"),
+    }
+}
+
+/// Milliseconds between two "game datagram dropped" log lines.
+const SEND_FAILURE_LOG_EVERY: u64 = 10_000;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -520,6 +546,17 @@ mod tests {
         let message=Message::Data{flow:[1;16],generation:2,sequence:3,target:"127.0.0.1:1234".into(),payload:vec![]};assert_eq!(Message::decode(&message.encode()?)?,message);
         for n in 0..35 {assert!(Message::decode(&vec![3;n]).is_err());}
         assert!(Message::decode(&[7]).is_err());Ok(())
+    }
+    /// Every failed game send is counted (the status shows it); the log line is rate-limited.
+    #[test]
+    fn failed_game_sends_are_counted() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let before=crate::transport_metrics::GAMING_SEND_FAILURES.load(Relaxed);
+        send_failed(&Ok(false));
+        send_failed(&Err(anyhow::anyhow!("test failure")));
+        send_failed(&Err(anyhow::anyhow!("test failure")));
+        assert!(crate::transport_metrics::GAMING_SEND_FAILURES.load(Relaxed)>=before+3);
+        assert!(crate::transport_metrics::snapshot()["gaming_send_failures"].as_u64().is_some());
     }
     #[test]
     fn malformed_and_reordered_fragment_and_replay_inputs_are_bounded()->Result<()> {

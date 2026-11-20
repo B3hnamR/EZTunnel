@@ -11,12 +11,12 @@
   import { startCheck, getCheck, stopCheck, getNewTunnel } from "../lib/api.js";
   import { say } from "../lib/actions.svelte.js";
   import { live } from "../lib/live.svelte.js";
-  import { fleet, LOCAL } from "../lib/servers.svelte.js";
+  import { fleet, LOCAL, localName } from "../lib/servers.svelte.js";
   import { t, num, duration, list } from "../lib/i18n.svelte.js";
   import { transportLabel } from "../lib/view.js";
 
   const places = $derived([
-    { id: LOCAL, name: t("thisServerIs", live.snapshot?.host?.hostname ?? ""), address: live.snapshot?.host?.address ?? "", address6: live.snapshot?.host?.address6 ?? "", online: true },
+    { id: LOCAL, name: t("thisServerIs", localName(live.snapshot?.host?.hostname)), address: live.snapshot?.host?.address ?? "", address6: live.snapshot?.host?.address6 ?? "", online: true },
     ...fleet.list.map((s) => ({ id: s.id, name: s.name, address: s.snapshot?.host?.address ?? "", address6: s.snapshot?.host?.address6 ?? "", online: s.online })),
   ]);
   const placeOf = (id) => places.find((p) => p.id === id);
@@ -202,6 +202,66 @@
   const pathLabel = (p) => `${p.ipv6 ? "IPv6" : "IPv4"} ${p.dialer === "iran" ? t("dirDirect") : t("dirReverse")}`;
   const dialer = (r) => (r.spec.dialer === "foreign" ? t("dialForeign") : r.spec.dialer === "iran" ? t("dialIran") : t("dialBoth"));
   const topSpeed = $derived(Math.max(1, ...rows.flatMap((r) => [r.download?.mbps ?? 0, r.upload?.mbps ?? 0])));
+  // Sorting and filtering of the result table: click a column to sort (again to reverse, a third
+  // time to go back to the check's own order). Rows without a value always come last.
+  const SORTS = [["name", "transport", ""], ["who", "ctWho", ""], ["result", "ctVerdict", ""], ["ping", "ping", ""], ["down", "downTest", "Mbit/s"], ["up", "upTest", "Mbit/s"]];
+  const RANK = { ok: 0, warn: 1, bad: 2, off: 3 };
+  const pingOf = (r) => r.rtt_ms ?? r.ping?.median_ms ?? null;
+  const speedOf = (x) => (x?.mbps != null && !x.error ? x.mbps : null);
+  const KEYS = {
+    name: (r) => name(r).toLowerCase(),
+    who: (r) => dialer(r),
+    result: (r) => (r.verdict ? RANK[level(r.verdict)] ?? 2 : null),
+    ping: pingOf,
+    down: (r) => speedOf(r.download),
+    up: (r) => speedOf(r.upload),
+  };
+  // Speeds read best-first on the first click; the rest low-first.
+  const HIGH_FIRST = new Set(["down", "up"]);
+  let view = $state({ sort: null, desc: false, q: "", result: "all", who: "all", transport: "" });
+  function sortBy(key) {
+    if (view.sort !== key) {
+      view.sort = key;
+      view.desc = HIGH_FIRST.has(key);
+    } else if (view.desc === HIGH_FIRST.has(key)) view.desc = !view.desc;
+    else view.sort = null;
+  }
+  function resetView() {
+    view.sort = null;
+    view.desc = false;
+    view.q = "";
+    view.result = "all";
+    view.who = "all";
+    view.transport = "";
+  }
+  const transportsShown = $derived([...new Set(rows.map((r) => r.spec.transport))]);
+  const filtered = $derived(Boolean(view.q.trim() || view.result !== "all" || view.who !== "all" || view.transport));
+  const shownRows = $derived.by(() => {
+    const words = view.q.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    let found = rows.filter((r) => {
+      if (view.who !== "all" && r.spec.dialer !== view.who) return false;
+      if (view.transport && r.spec.transport !== view.transport) return false;
+      if (view.result !== "all" && (!r.verdict || level(r.verdict) !== view.result)) return false;
+      if (words.length) {
+        const text = `${name(r)} ${dialer(r)} ${r.verdict ? t("verdicts")[r.verdict] ?? r.verdict : ""} ${r.note ?? ""}`.toLowerCase();
+        if (!words.every((w) => text.includes(w))) return false;
+      }
+      return true;
+    });
+    if (view.sort) {
+      const key = KEYS[view.sort];
+      const sign = view.desc ? -1 : 1;
+      found = found
+        .map((r, i) => [r, key(r), i])
+        .sort(([, a, i], [, b, j]) => {
+          if (a == null || b == null) return a == null && b == null ? i - j : a == null ? 1 : -1;
+          const c = typeof a === "string" ? a.localeCompare(b) : a - b;
+          return c ? c * sign : i - j;
+        })
+        .map(([r]) => r);
+    }
+    return found;
+  });
   const mbps = (x) => (x?.mbps != null && !x.error ? `${num(x.mbps)} Mbit/s` : "-");
 
   // A tunnel from a result: the transport, the direction and the port that worked.
@@ -246,7 +306,7 @@
   const terminalOnly = (r) => usable(r) && !canCreate(r);
 </script>
 
-{#if !running}<PathFinder />{/if}
+<PathFinder />
 
 {#if !running}
   <section class="panel mb16 ct-sec" aria-labelledby="ct-form">
@@ -408,56 +468,65 @@
     {#if isTune && !running}
       <details class="ct-all">
         <summary><span class="flabel m0">{t("ctAllCases", num(rows.length))}</span></summary>
-    <div class="table-wrap">
-      <table class="speed ct-table">
-        <thead>
-          <tr><th scope="col">{t("transport")}</th><th scope="col">{t("ctWho")}</th><th scope="col">{t("ctVerdict")}</th><th scope="col">{t("ping")}</th><th scope="col">{t("downTest")} <span class="muted">Mbit/s</span></th><th scope="col">{t("upTest")} <span class="muted">Mbit/s</span></th><th scope="col"><span class="sr">{t("actionsOf")}</span></th></tr>
-        </thead>
-        <tbody>
-          {#each rows as r (r.spec.id)}
-            <tr class:current={running && state.view?.current === r.spec.id}>
-              <th scope="row"><span class="ltr">{name(r)}</span></th>
-              <td>{dialer(r)}</td>
-              <td>
-                <span class="pill {running && state.view?.current === r.spec.id && !r.verdict ? 'live' : level(r.verdict)}">{r.verdict ? t("verdicts")[r.verdict] ?? r.verdict : running && state.view?.current === r.spec.id ? t("testing") : t("ctWaiting")}</span>
-                {#if r.note}<div class="muted small ltr edesc">{r.note}</div>{/if}
-              </td>
-              <td>{r.rtt_ms != null ? `${num(r.rtt_ms)} ms` : r.ping?.median_ms != null ? `${num(r.ping.median_ms)} ms` : r.handshake_ms != null ? `${num(r.handshake_ms)} ms*` : "-"}</td>
-              <td>{@render speed(r.download)}</td>
-              <td>{@render speed(r.upload)}</td>
-              <td>{#if !running && canCreate(r)}<button class="btn ghost" onclick={() => createFrom(r)}>{t("ctCreateShort")}</button>{:else if !running && terminalOnly(r)}<span class="muted small ct-term" title={t("ctTerminalOnly", name(r))}>{t("ctTerminalShort")}</span>{/if}</td>
-            </tr>
-          {/each}
-        </tbody>
-      </table>
-    </div>
+    {@render caseTable()}
       </details>
     {:else}
-    <div class="table-wrap">
-      <table class="speed ct-table">
-        <thead>
-          <tr><th scope="col">{t("transport")}</th><th scope="col">{t("ctWho")}</th><th scope="col">{t("ctVerdict")}</th><th scope="col">{t("ping")}</th><th scope="col">{t("downTest")} <span class="muted">Mbit/s</span></th><th scope="col">{t("upTest")} <span class="muted">Mbit/s</span></th><th scope="col"><span class="sr">{t("actionsOf")}</span></th></tr>
-        </thead>
-        <tbody>
-          {#each rows as r (r.spec.id)}
-            <tr class:current={running && state.view?.current === r.spec.id}>
-              <th scope="row"><span class="ltr">{name(r)}</span></th>
-              <td>{dialer(r)}</td>
-              <td>
-                <span class="pill {running && state.view?.current === r.spec.id && !r.verdict ? 'live' : level(r.verdict)}">{r.verdict ? t("verdicts")[r.verdict] ?? r.verdict : running && state.view?.current === r.spec.id ? t("testing") : t("ctWaiting")}</span>
-                {#if r.note}<div class="muted small ltr edesc">{r.note}</div>{/if}
-              </td>
-              <td>{r.rtt_ms != null ? `${num(r.rtt_ms)} ms` : r.ping?.median_ms != null ? `${num(r.ping.median_ms)} ms` : r.handshake_ms != null ? `${num(r.handshake_ms)} ms*` : "-"}</td>
-              <td>{@render speed(r.download)}</td>
-              <td>{@render speed(r.upload)}</td>
-              <td>{#if !running && canCreate(r)}<button class="btn ghost" onclick={() => createFrom(r)}>{t("ctCreateShort")}</button>{:else if !running && terminalOnly(r)}<span class="muted small ct-term" title={t("ctTerminalOnly", name(r))}>{t("ctTerminalShort")}</span>{/if}</td>
-            </tr>
-          {/each}
-        </tbody>
-      </table>
-    </div>
+    {@render caseTable()}
     {/if}
     <p class="muted small m0 mt12">{t("ctLegend")}</p>
+    {#snippet caseTable()}
+      <div class="ct-filters" role="group" aria-label={t("ctFilter")}>
+        <label class="sr" for="ct-q">{t("ctSearch")}</label>
+        <input id="ct-q" class="input ct-q" type="search" placeholder={t("ctSearch")} bind:value={view.q} />
+        <div class="seg" role="group" aria-label={t("ctVerdict")}>
+          {#each [["all", "ctAll"], ["ok", "ctOnlyOk"], ["warn", "ctOnlyWarn"], ["bad", "ctOnlyBad"]] as [v, k]}<button type="button" aria-pressed={view.result === v} onclick={() => (view.result = v)}>{t(k)}</button>{/each}
+        </div>
+        <div class="seg" role="group" aria-label={t("ctWho")}>
+          {#each [["all", "ctAll"], ["foreign", "dialForeign"], ["iran", "dialIran"]] as [v, k]}<button type="button" aria-pressed={view.who === v} onclick={() => (view.who = v)}>{t(k)}</button>{/each}
+        </div>
+        {#if transportsShown.length > 1}
+          <label class="sr" for="ct-tr">{t("transport")}</label>
+          <select id="ct-tr" class="input ct-tr" bind:value={view.transport}>
+            <option value="">{t("ctAllTransports")}</option>
+            {#each transportsShown as x (x)}<option value={x}>{transportLabel(x)}</option>{/each}
+          </select>
+        {/if}
+        <span class="muted small ct-count" aria-live="polite">{t("ctShown", num(shownRows.length), num(rows.length))}</span>
+        {#if filtered || view.sort}<button type="button" class="btn ghost sm" onclick={resetView}>{t("ctReset")}</button>{/if}
+      </div>
+      <div class="table-wrap">
+        <table class="speed ct-table">
+          <thead>
+            <tr>
+              {#each SORTS as [key, label, unit] (key)}
+                <th scope="col" aria-sort={view.sort === key ? (view.desc ? "descending" : "ascending") : "none"}>
+                  <button type="button" class="th-sort" class:on={view.sort === key} onclick={() => sortBy(key)}>{t(label)}{#if unit} <span class="muted">{unit}</span>{/if}<span class="th-arrow" aria-hidden="true">{view.sort === key ? (view.desc ? "↓" : "↑") : "↕"}</span></button>
+                </th>
+              {/each}
+              <th scope="col"><span class="sr">{t("actionsOf")}</span></th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each shownRows as r (r.spec.id)}
+              <tr class:current={running && state.view?.current === r.spec.id}>
+                <th scope="row"><span class="ltr">{name(r)}</span></th>
+                <td>{dialer(r)}</td>
+                <td>
+                  <span class="pill {running && state.view?.current === r.spec.id && !r.verdict ? 'live' : level(r.verdict)}">{r.verdict ? t("verdicts")[r.verdict] ?? r.verdict : running && state.view?.current === r.spec.id ? t("testing") : t("ctWaiting")}</span>
+                  {#if r.note}<div class="muted small ltr edesc">{r.note}</div>{/if}
+                </td>
+                <td>{r.rtt_ms != null ? `${num(r.rtt_ms)} ms` : r.ping?.median_ms != null ? `${num(r.ping.median_ms)} ms` : r.handshake_ms != null ? `${num(r.handshake_ms)} ms*` : "-"}</td>
+                <td>{@render speed(r.download)}</td>
+                <td>{@render speed(r.upload)}</td>
+                <td>{#if !running && canCreate(r)}<button class="btn ghost" onclick={() => createFrom(r)}>{t("ctCreateShort")}</button>{:else if !running && terminalOnly(r)}<span class="muted small ct-term" title={t("ctTerminalOnly", name(r))}>{t("ctTerminalShort")}</span>{/if}</td>
+              </tr>
+            {:else}
+              <tr><td colspan="7" class="muted">{t("ctNoMatch")}</td></tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+    {/snippet}
     {#snippet speed(x)}
       {#if x?.mbps != null && !x.error}
         <div class="ct-speed"><span class="num">{num(x.mbps)}</span><svg viewBox="0 0 100 4" preserveAspectRatio="none" aria-hidden="true"><rect class="t" width="100" height="4" rx="2" /><rect class="f" width={Math.max(2, (x.mbps / topSpeed) * 100)} height="4" rx="2" /></svg></div>

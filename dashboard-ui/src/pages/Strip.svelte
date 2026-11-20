@@ -1,4 +1,5 @@
 <script>
+  import { localName } from "../lib/servers.svelte.js";
   // This server at a glance: who it is, how loaded it is (rings with a short trend under each),
   // and what its network is doing right now.
   import { untrack } from "svelte";
@@ -28,7 +29,7 @@
 <section class="panel strip" aria-label={t("thisServer")}>
   <div class="who">
     <span class="eyebrow"><span class="mark ok"></span>{t("thisServer")}</span>
-    <b class="ltr">{host.hostname}</b>
+    <b class="ltr">{localName(host.hostname)}</b>
     {#if host.address}<span class="addr ltr">{host.address}</span>{/if}
     {#if facts.length}
       <div class="facts-row">{#each facts as f}<span class="code-chip ltr">{f}</span>{/each}</div>

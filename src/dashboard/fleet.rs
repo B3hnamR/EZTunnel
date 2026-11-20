@@ -2,6 +2,7 @@
 //! agents connected now with their latest snapshot. Requests to an agent (start a tunnel, read a
 //! log) go over its link and wait for the answer.
 use super::link::{self, JoinCode};
+use super::ops::refused;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -42,6 +43,9 @@ pub struct Registered {
     pub key: String,
     pub name: String,
     pub added: u64,
+    /// A display name set on the dashboard; `name` keeps what the server called itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 /// An agent connected now.
@@ -209,7 +213,8 @@ impl Fleet {
                 let seen = connected.map(|c| c.seen);
                 json!({
                     "id": r.id,
-                    "name": r.name,
+                    "name": r.label.as_ref().unwrap_or(&r.name),
+                    "joined_name": r.name,
                     "added": r.added,
                     "online": seen.is_some_and(|s| now.saturating_sub(s) < OFFLINE_AFTER),
                     "last_seen": seen,
@@ -218,6 +223,17 @@ impl Fleet {
                 })
             })
             .collect()
+    }
+
+    /// Sets (or with `None` clears) a registered server's display name. False if unknown.
+    pub fn rename(&self, id: &str, label: Option<String>) -> Result<bool> {
+        let mut registry = self.registry.lock().unwrap();
+        let Some(server) = registry.iter_mut().find(|r| r.id == id) else {
+            return Ok(false);
+        };
+        server.label = label;
+        self.save_registry(&registry)?;
+        Ok(true)
     }
 
     pub fn remove(&self, id: &str) -> Result<bool> {
@@ -258,7 +274,7 @@ impl Fleet {
             .unwrap()
             .get(id)
             .map(|c| c.requests.clone())
-            .context("that server is not connected")?;
+            .ok_or_else(|| refused("offline", "that server is not connected"))?;
         self.request_on(&sender, request, timeout, hold).await
     }
 
@@ -268,13 +284,17 @@ impl Fleet {
         let (answer_tx, answer_rx) = oneshot::channel();
         let answer = tokio::time::timeout(timeout, async {
             sender.send((request, answer_tx, hold)).await
-                .map_err(|_| anyhow!("that server is not connected"))?;
-            answer_rx.await.map_err(|_| anyhow!("the connection to that server ended"))
-        }).await.context("that server did not answer in time")??;
+                .map_err(|_| refused("offline", "that server is not connected"))?;
+            answer_rx.await.map_err(|_| refused("offline", "the connection to that server ended"))
+        }).await.map_err(|_| refused("timeout", "that server did not answer in time"))??;
         if answer["ok"] == true {
-            Ok(answer["result"].clone())
-        } else {
-            bail!("{}", answer["error"].as_str().unwrap_or("the server could not do it"))
+            return Ok(answer["result"].clone());
+        }
+        let message = answer["error"].as_str().unwrap_or("the server could not do it").to_string();
+        // An agent from before codes sends the words alone.
+        match answer["code"].as_str().and_then(super::ops::known_code) {
+            Some(code) => Err(refused(code, message)),
+            None => Err(anyhow!(message)),
         }
     }
 
@@ -283,7 +303,7 @@ impl Fleet {
     pub async fn follow(&self, id: &str, name: &str, after: Option<String>) -> Result<RemoteFollow> {
         let (streams, requests) = {
             let live = self.live.lock().unwrap();
-            let connected = live.get(id).context("that server is not connected")?;
+            let connected = live.get(id).ok_or_else(|| refused("offline", "that server is not connected"))?;
             (connected.streams.clone(), connected.requests.clone())
         };
         let stream = self.next_request.fetch_add(1, Ordering::Relaxed);
@@ -332,7 +352,7 @@ impl Fleet {
             let mut registry = self.registry.lock().unwrap();
             registry.retain(|r| r.id != id);
             let name = if name.is_empty() { "server".to_string() } else { name };
-            registry.push(Registered { id: id.clone(), key: hex::encode(key), name: name.clone(), added: super::now() });
+            registry.push(Registered { id: id.clone(), key: hex::encode(key), name: name.clone(), added: super::now(), label: None });
             self.save_registry(&registry)?;
             event("server_joined", format!("{name} ({id})"));
         }
@@ -599,8 +619,17 @@ mod tests {
         assert!(second.await.unwrap().is_err());
         assert_eq!(fleet.servers().len(), 1);
 
-        // Removing the server ends its link and it cannot come back.
+        // A dashboard name replaces the shown name, survives a reload and can be cleared.
         let id = servers[0]["id"].as_str().unwrap().to_string();
+        assert!(fleet.rename(&id, Some("Tehran game".into())).unwrap());
+        assert!(!fleet.rename("ffffffffffff", Some("x".into())).unwrap(), "unknown server");
+        assert_eq!(fleet.servers()[0]["name"], "Tehran game");
+        assert_eq!(fleet.servers()[0]["joined_name"], "frankfurt-1rm");
+        assert_eq!(Fleet::open(dir.path()).unwrap().servers()[0]["name"], "Tehran game", "the name is saved");
+        assert!(fleet.rename(&id, None).unwrap());
+        assert_eq!(fleet.servers()[0]["name"], "frankfurt-1rm");
+
+        // Removing the server ends its link and it cannot come back.
         assert!(fleet.remove(&id).unwrap());
         assert_eq!(serving.await.unwrap().unwrap(), "removed");
         assert!(fleet.servers().is_empty());
@@ -669,21 +698,33 @@ mod tests {
             agent_side(a, fleet.public, json!({"type": "join", "token": hex::encode(code.token), "name": "n"})).await;
         let id = fleet.servers()[0]["id"].as_str().unwrap().to_string();
         let agent = tokio::spawn(async move {
-            for _ in 0..2 {
+            for _ in 0..4 {
                 let request = rx.recv().await.unwrap();
                 let answer = if request["op"] == "names" {
                     json!({"type": "response", "id": request["id"], "ok": true, "result": ["t1"]})
-                } else {
+                } else if request["name"] == "x" {
                     json!({"type": "response", "id": request["id"], "ok": false, "error": "no tunnel named x"})
+                } else if request["name"] == "coded" {
+                    json!({"type": "response", "id": request["id"], "ok": false, "error": "no tunnel named coded", "code": "unknown_tunnel"})
+                } else {
+                    // A code this version does not know counts as none.
+                    json!({"type": "response", "id": request["id"], "ok": false, "error": "odd", "code": "made_up"})
                 };
                 tx.send(&answer).await.unwrap();
             }
         });
         let names = fleet.request(&id, json!({"op": "names"}), Duration::from_secs(5)).await.unwrap();
         assert_eq!(names, json!(["t1"]));
-        let failed = fleet.request(&id, json!({"op": "act", "name": "x"}), Duration::from_secs(5)).await;
-        assert_eq!(failed.unwrap_err().to_string(), "no tunnel named x");
+        // An agent from before codes: the words only.
+        let failed = fleet.request(&id, json!({"op": "act", "name": "x"}), Duration::from_secs(5)).await.unwrap_err();
+        assert_eq!(failed.to_string(), "no tunnel named x");
+        assert_eq!(super::super::ops::code_of(&failed), None);
+        let coded = fleet.request(&id, json!({"op": "act", "name": "coded"}), Duration::from_secs(5)).await.unwrap_err();
+        assert_eq!((coded.to_string().as_str(), super::super::ops::code_of(&coded)), ("no tunnel named coded", Some("unknown_tunnel")));
+        let odd = fleet.request(&id, json!({"op": "act", "name": "odd"}), Duration::from_secs(5)).await.unwrap_err();
+        assert_eq!(super::super::ops::code_of(&odd), None);
         agent.await.unwrap();
-        assert!(fleet.request("nothing", json!({}), Duration::from_secs(1)).await.is_err());
+        let offline = fleet.request("nothing", json!({}), Duration::from_secs(1)).await.unwrap_err();
+        assert_eq!(super::super::ops::code_of(&offline), Some("offline"));
     }
 }

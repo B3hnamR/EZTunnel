@@ -27,7 +27,7 @@ work=$(mktemp -d /root/.eztunnel-join.XXXXXXXX)
 trap 'rm -rf -- "$work"' EXIT
 printf 'Checking the latest EZTunnel release (in %s; nothing is installed yet) ...\n' "$work"
 curl -fsSL "$installer" -o "$work/install-latest.sh"
-bash "$work/install-latest.sh" --prefix "$work/try" >/dev/null
+EZTUNNEL_NO_MENU=1 bash "$work/install-latest.sh" --prefix "$work/try" >/dev/null 2>&1
 if ! can_join "$work/try/bin/eztunnel"; then
   die 'The latest EZTunnel release cannot join a dashboard yet. Nothing on this server was changed.'
 fi
@@ -41,6 +41,6 @@ if [[ -x $installed ]]; then
     [[ -z $answer || $answer == [Yy]* ]] || die 'Stopped. Nothing on this server was changed.'
   fi
 fi
-bash "$work/install-latest.sh"
+EZTUNNEL_NO_MENU=1 bash "$work/install-latest.sh"
 can_join "$installed" || die 'The installed program cannot join a dashboard.'
 "$installed" agent join "$code"

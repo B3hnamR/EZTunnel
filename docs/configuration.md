@@ -22,14 +22,16 @@ Strict JSON rejects unknown settings. Bind addresses are literal IP:port, with b
 | `peer_public_keys` | Server | Without `tunnel_key`: the authorized client keys (at least one). |
 | `listeners` | Server | Required nonempty list of tunnel listeners. |
 | `listeners[].addr` | Server | Local carrier bind address; with `server_dials`, the client's address to connect to. |
-| `listeners[].connection_pool` | Server | Default 1; with `server_dials`, the number of parallel connections the server opens. |
+| `listeners[].connection_pool` | Server | With `server_dials`, the number of parallel connections the server opens. Default automatic, as for `paths[].connection_pool`. |
+| `listeners[].connection_pool_max` | Server | With `server_dials`, the most connections under load. Default automatic, as for `paths[].connection_pool_max`. |
 | `listeners[].tls_auto`, `paths[].tls_auto` | Both | Default false. With a TLS carrier and `tunnel_key`: the listening side presents a certificate derived from the key, and the dialing side accepts exactly that certificate. No certificate files are needed and the TLS name (SNI) can be anything. |
 | `listeners[].maps[]` | Server | `type`: `tcp` or `udp`, local `bind`, client-side `target`. Targets under `.invalid` are refused: they are reserved for the speed test. |
 | `socks5` | Server | Optional local SOCKS5 bind: TCP CONNECT and UDP ASSOCIATE (DNS, QUIC and other UDP through the tunnel). No password. |
 | `paths` | Client | Required nonempty server connection paths. |
 | `paths[].addr` | Client | Server endpoint; TCP or UDP according to carrier. With `server_dials`, the local address the client listens on. |
 | `paths[].server_public_key` | Client | Without `tunnel_key`: the pinned server key. |
-| `paths[].connection_pool` | Client | Default 1; 1..1024. |
+| `paths[].connection_pool` | Client | Sessions kept open; 0..1024. Default 0, automatic: 6 for TCP, TCP6, HTTP(S), WS(S) and XHTTP(S); 3 for KCP, FEC-UDP and Parallax; 1 for raw carriers and TUN (which allow only 1). Never more than this path's share of `max_connections`. Several sessions spread the users, so one slow or blocked connection does not stall everyone. |
+| `paths[].connection_pool_max` | Client | The most sessions under load; 0..1024. Default 0, automatic: 16, or 8 for KCP, FEC-UDP and Parallax. Every 5 seconds the pool checks its sessions; while they carry 32 or more user connections each on average and all of them answer, it opens one more, up to this number and `max_connections`. An extra session closes itself after 3 minutes without users. Set it equal to `connection_pool` for a fixed pool. The peer needs no change: the side that dials counts the users on its own sessions. |
 | `paths[].retry_interval` | Client | Default 1; 1..30 seconds; reconnect delay capped at 30. |
 | `paths[].dial_timeout` | Client | Default 10; 1..300 seconds, including connection/handshake. |
 | `listeners[].tls_fragment`, `paths[].tls_fragment` | Both | Off by default. `{"enabled": true}` makes the dialing side of a TLS carrier (`wss`, `https`, `xhttps`) split its ClientHello into small TLS records, each in its own TCP packet, with a cut inside the server name. `min_bytes` (10), `max_bytes` (60) and `delay_ms` (5, random pause up to this) tune it. Any TLS server accepts the result, but some filters drop split packets: then the tunnel never connects. Test it before relying on it, and turn it off if the link does not come up. |
@@ -86,6 +88,7 @@ Addresses are plain IP literals **without a prefix**, use the same address famil
 Open the manager with `sudo eztunnel`, choose **Manage tunnels**, pick the tunnel, then:
 
 - **Change settings** lists every setting that applies to that tunnel's side and carrier, with its current value (values that differ from the default are highlighted). Choose one, type a new value or `default`, then **Save and restart**.
+- **Apply a preset** sets ready-made values for the tunnel's transport: **Balanced**, **Many users**, **Gaming / low delay**, **Streaming / big downloads** or **Max capacity**, which sizes the limits to this server's memory and CPU cores instead of fixed caps. It shows every value it changes before saving, and only changes the settings presets own (sessions, windows, buffers, connection limits, worker threads, keepalive); ports, the traffic limit, the schedule and the traffic shape stay as they are. Choosing another preset later puts back what the first one changed. Set the same preset on both servers. The dashboard's edit screen has the same presets, and `eztunnel preset FILE` lists them for a configuration file (`eztunnel preset FILE NAME --write` applies one; restart the tunnel afterwards).
 - **Change forwarded ports** (Iran server) edits the port list in the same short form the wizard uses: `443, 8443, 2083=443, 9000-9010, 5000=10.0.0.5:5000`.
 - **Edit the config file** opens the JSON in your editor (`$EDITOR`, otherwise nano or vi).
 
@@ -101,7 +104,7 @@ Generated from `eztunnel settings`, which prints this list as JSON (name, defaul
 | `dead_timeout_sec` | top level | both | 40 seconds | 2..86400 | A silent peer is declared dead after this long. Must be larger than heartbeat_sec. |
 | `max_streams` | top level | both | 1024 streams | 1..65536 | Most simultaneous user connections carried by one tunnel session. |
 | `stream_early_data` | top level | both | true | true/false | A new user connection sends its first data right behind the request to open it instead of waiting for the other server's confirmation: one round trip less per new connection (about 90 ms instead of 180 ms on a 90 ms path). The other server queues the data until the destination is connected; every version does, so mixed versions work. With it, SOCKS5 clients are told "connected" at once, and a destination that fails closes the connection. `false` = wait for the confirmation first. |
-| `stream_window` | top level | both | 64 frames | 16..1024 | Data one user connection may have in flight, in 16 KiB frames. One connection's speed is at most window x 16 KiB per round trip (64 = 1 MiB, about 11 MB/s at 90 ms). Larger is faster on long links and uses more memory for slow users. A UDP conversation counts in datagrams instead: it gets a window of 1024 datagrams (or `stream_window`, if larger) for the same memory, so small datagrams are not held to a few hundred per second. A datagram larger than 16 KiB cannot cross the tunnel; it is dropped and counted in `udp_dropped`. |
+| `stream_window` | top level | both | 128 frames | 16..1024 | Data one user connection may have in flight, in 16 KiB frames. One connection's speed is at most window x 16 KiB per round trip (128 = 2 MiB, about 22 MB/s at 90 ms). Larger is faster on long links and uses more memory for slow users. A UDP conversation counts in datagrams instead: it gets a window of 1024 datagrams (or `stream_window`, if larger) for the same memory, so small datagrams are not held to a few hundred per second. A datagram larger than 16 KiB cannot cross the tunnel; it is dropped and counted in `udp_dropped`. |
 | `memory_budget_mb` | top level | both | 0 MiB | 0..1048576 | Total memory the flow-control windows of all user connections may use beyond the first 256 KiB each. 0 = automatic: a quarter of the server's memory, between 64 MiB and 1 GiB. When it is used up, new connections keep a small window (a lower speed on long links) instead of the server running out of memory. |
 | `worker_threads` | top level | both | 1 thread | 1..64 | Threads that run the tunnel. One is the most efficient: the work is many small network operations, and moving them between threads costs more CPU than it saves (see "CPU use" below). Raise it only for a very fast FEC carrier, which one core cannot encode and decode fast enough. Needs a restart. |
 | `stats_interval_sec` | top level | both | 60 seconds | 0..86400 | Log a one-line status summary this often. 0 turns it off. |
@@ -130,11 +133,11 @@ Generated from `eztunnel settings`, which prints this list as JSON (name, defaul
 | `timeouts.server_dial_sec` | top level | both | 30 seconds | 1..300 | When the server dials (server_dials): time to reach the client and finish the handshake. |
 | `queues.stream_frames` | top level | both | 32 frames | 20..4096 | Frames that may wait in memory for one stream. |
 | `queues.session_frames` | top level | both | 128 frames | 16..65536 | Frames that may wait in memory for one session. |
-| `kcp.mtu` | each `listeners[]` entry | server | 1400 bytes | 512..9000 | Packet size of the plain kcp carrier. Use the same value on both ends. |
+| `kcp.mtu` | each `listeners[]` entry | server | 1350 bytes | 512..9000 | Packet size of the plain kcp carrier. Use the same value on both ends. |
 | `kcp.send_window` | each `listeners[]` entry | server | 1024 packets | 16..8192 | Plain kcp send window: packets in flight. Speed is at most window x MTU per round trip. |
 | `kcp.recv_window` | each `listeners[]` entry | server | 1024 packets | 16..8192 | Plain kcp receive window. |
 | `kcp.session_expire_sec` | each `listeners[]` entry | server | 60 seconds | 5..3600 | Inactive plain kcp sessions are closed after this long. |
-| `kcp.mtu` | each `paths[]` entry | client | 1400 bytes | 512..9000 | Packet size of the plain kcp carrier. Use the same value on both ends. |
+| `kcp.mtu` | each `paths[]` entry | client | 1350 bytes | 512..9000 | Packet size of the plain kcp carrier. Use the same value on both ends. |
 | `kcp.send_window` | each `paths[]` entry | client | 1024 packets | 16..8192 | Plain kcp send window: packets in flight. Speed is at most window x MTU per round trip. |
 | `kcp.recv_window` | each `paths[]` entry | client | 1024 packets | 16..8192 | Plain kcp receive window. |
 | `kcp.session_expire_sec` | each `paths[]` entry | client | 60 seconds | 5..3600 | Inactive plain kcp sessions are closed after this long. |
@@ -172,7 +175,8 @@ Generated from `eztunnel settings`, which prints this list as JSON (name, defaul
 | `xhttp.up_concurrency` | each `paths[]` entry | client | 8 requests | 1..16 | XHTTP packet-up: uploads in flight at once. Upload speed is at most this x up_max_bytes per round trip, so long links need more. |
 | `retry_interval` | each `paths[]` entry | client | 1 seconds | 1..30 | First pause before reconnecting; it doubles up to timeouts.retry_max_sec. |
 | `dial_timeout` | each `paths[]` entry | client | 10 seconds | 1..300 | Time allowed to connect and finish the handshake. |
-| `connection_pool` | each `paths[]` entry | client | 1 sessions | 1..1024 | Parallel tunnel sessions to keep open. More sessions spread users and limit the effect of one dropping. |
+| `connection_pool` | each `paths[]` entry | client | 0 (automatic) | 0..1024 | Parallel tunnel sessions to keep open; 0 = automatic (6 for TCP, HTTP and WebSocket carriers, 3 for KCP, FEC-UDP and Parallax). More sessions spread users and limit the effect of one dropping. |
+| `connection_pool_max` | each `paths[]` entry | client | 0 (automatic) | 0..1024 | Most sessions under load: the pool opens more while its sessions are busy and closes the extra ones after 3 idle minutes; 0 = automatic (16, or 8 for packet carriers), the pool size = no growth. Also capped by max_connections. |
 | `xhttp.socket_buf_bytes` | each `listeners[]` entry | server | unset | 65536..67108864 | XHTTP: fixed TCP socket buffer. Unset lets the kernel grow it with the link (fastest); a fixed value caps one connection's speed. |
 | `xhttp.socket_buf_bytes` | each `paths[]` entry | client | unset | 65536..67108864 | XHTTP: fixed TCP socket buffer. Unset lets the kernel grow it with the link (fastest); a fixed value caps one connection's speed. |
 | `tls_fragment.min_bytes` | each `listeners[]` entry | server | 10 bytes | 1..1024 | TLS fragmentation (when on): smallest piece of the ClientHello per TLS record. |
@@ -191,12 +195,12 @@ One user connection can only have a limited amount of data in flight before the 
 
 | Carrier | What limits one connection | Default | About |
 | --- | --- | --- | --- |
-| all | `stream_window` (frames of 16 KiB) | 64 = 1 MiB | 11 MB/s; 256 gives about 45 MB/s |
+| all | `stream_window` (frames of 16 KiB) | 128 = 2 MiB | 22 MB/s; 256 gives about 45 MB/s |
 | `kcp` | `kcp.send_window`/`recv_window` × MTU, and `kcp.socket_buf_bytes` | 1024 packets, 4 MiB | 15 MB/s |
 | `fec-udp`, `fec-raw` | `fec.sndwnd`/`rcvwnd` × MTU, and `fec.socket_buf_bytes` | 1024 packets, 4 MiB | 15 MB/s |
 | `xhttp`, `xhttps` | `xhttp.socket_buf_bytes` when set (unset = the kernel sizes it) | unset | link speed |
 
-The *Streaming / big downloads* profile raises the KCP and FEC windows to 4096 packets with 16 MiB socket buffers (about 4x the speed ceiling at 90 ms); the other profiles leave them at the defaults. On a real Iran link the default windows measured about 100 Mbit/s and a 4096-packet window 125-150 Mbit/s.
+The *Balanced*, *Streaming / big downloads* and *Max capacity* presets raise the FEC windows to 2048 packets (about twice the speed ceiling at 90 ms); on the real test link one connection went from about 100 to 165-185 Mbit/s with no extra loss on a full line. KCP keeps 1024 packets in every preset: larger KCP windows built up several seconds of delay and heavy UDP loss once the line was full. *Streaming* uses a `stream_window` of 256; 512 lost most UDP traffic under load.
 
 Linux caps UDP socket buffers at `net.core.rmem_max`/`wmem_max` (208 KB on many systems). When a KCP or FEC tunnel asks for more, the manager raises that ceiling in `/etc/sysctl.d/60-eztunnel.conf`. Larger windows use more memory only for users that read slower than the tunnel delivers.
 

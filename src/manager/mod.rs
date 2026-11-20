@@ -19,6 +19,7 @@ pub fn mirage_tests()->Result<()> {ui::exit_on_interrupt();mirage_flow::menu(&st
 pub mod optimize;
 pub mod pairing;
 pub mod plan;
+pub mod presets;
 pub mod rawfw;
 pub mod scope;
 pub mod service;

@@ -343,7 +343,7 @@ mod tests {
             assert_eq!(entry[0]["fec"]["interval_ms"], 20, "speed mode on the packet session");
             creatable(end).unwrap();
         }
-        assert_eq!(built.foreign["paths"][0]["connection_pool"], 3, "the dialing end keeps the pool");
+        assert_eq!(crate::manager::plan::pool_now(&built.foreign["paths"][0], crate::config::Transport::Parallax), 3, "the dialing end keeps the pool");
         // TLS look and fragmentation: only the dialing end (the foreign one in a reverse tunnel).
         let mut wss = form("wss", "reverse");
         // The browser-like look exists only in builds with that feature; others refuse it.

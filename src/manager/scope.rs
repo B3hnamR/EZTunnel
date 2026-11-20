@@ -149,7 +149,7 @@ pub fn applies(setting: &Setting, scope: &Scope) -> bool {
             // Reconnect pauses belong to the client that dials; a listening client never retries.
             "retry_interval" => !scope.server_dials,
             // The wizard and Change settings ask for the pool on their own row.
-            "connection_pool" => false,
+            "connection_pool" | "connection_pool_max" => false,
             _ => true,
         },
     }

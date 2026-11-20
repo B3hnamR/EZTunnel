@@ -37,6 +37,7 @@ export const getLogs = (name, lines, server, signal) =>
 export const getServers = (signal) => call("GET", "/api/servers", undefined, 10_000, signal);
 export const createJoinCode = () => call("POST", "/api/join-codes", {});
 export const removeServer = (id) => call("DELETE", `/api/servers/${encodeURIComponent(id)}`);
+export const renameServer = (id, name) => call("POST", `/api/servers/${encodeURIComponent(id)}/name`, { name });
 export const getActivity = (limit) => call("GET", `/api/activity?limit=${limit}`);
 export const followUrl = (name, server, after) =>
   `${base(server)}/tunnels/${encodeURIComponent(name)}/logs/follow${after ? `?after=${encodeURIComponent(after)}` : ""}`;
@@ -46,7 +47,9 @@ export const getEditable = (name, server, signal) => call("GET", `${base(server)
 export const saveEdit = (name, changes, server) => call("POST", `${base(server)}/tunnels/${encodeURIComponent(name)}/settings`, changes, 90_000);
 export const undoEdit = (name, server) => call("POST", `${base(server)}/tunnels/${encodeURIComponent(name)}/undo`, {}, 90_000);
 // Deleting stops the tunnel's service first, so it gets the action timeout.
-export const deleteTunnel = (name, server) => call("DELETE", `${base(server)}/tunnels/${encodeURIComponent(name)}`, undefined, 45_000);
+// With `pair`, the tunnel's server deletes it only while it still has that fingerprint.
+export const deleteTunnel = (name, server, pair) =>
+  call("DELETE", `${base(server)}/tunnels/${encodeURIComponent(name)}`, pair ? { pair } : undefined, 45_000);
 // A new tunnel on two servers: the form's options, and creating it (both ends start and are
 // watched, so it gets a long timeout).
 export const getNewTunnel = () => call("GET", "/api/new-tunnel");
@@ -98,3 +101,4 @@ export const getMirage = () => call("GET", "/api/mirage-test", undefined, 25_000
 export const stopMirage = () => call("POST", "/api/mirage-test/stop", {}, 40_000);
 // Is there a path between two servers, and which server could relay.
 export const findPath = (form) => call("POST", "/api/pathfinder", form, 300_000);
+export const cancelPath = () => call("POST", "/api/pathfinder/cancel", {}, 60_000);

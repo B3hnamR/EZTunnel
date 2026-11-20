@@ -183,7 +183,10 @@ pub(super) async fn associate(
                                 loop {let deadline=activity+tuning.udp_idle;tokio::select!{
                                     packet=packets.recv()=>{
                                         let Some(super::QueuedDatagram{data,_held})=packet else{break;};
-                                        if hub.send(flow,&target,&data).await.unwrap_or(false){stats.bytes_to_peer.fetch_add(data.len() as u64,std::sync::atomic::Ordering::Relaxed);stats.gaming_datagrams.fetch_add(1,std::sync::atomic::Ordering::Relaxed);}else{stats.udp_dropped.fetch_add(1,std::sync::atomic::Ordering::Relaxed);}
+                                        match hub.send(flow,&target,&data).await {
+                                            Ok(true)=>{stats.bytes_to_peer.fetch_add(data.len() as u64,std::sync::atomic::Ordering::Relaxed);stats.gaming_datagrams.fetch_add(1,std::sync::atomic::Ordering::Relaxed);}
+                                            failed=>{crate::gaming::send_failed(&failed);stats.udp_dropped.fetch_add(1,std::sync::atomic::Ordering::Relaxed);}
+                                        }
                                         activity=Instant::now();
                                     }
                                     answer=answers.recv()=>{

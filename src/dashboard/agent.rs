@@ -330,7 +330,8 @@ async fn serve(mut reader: LinkReader<Stream>, mut writer: LinkWriter<Stream>) -
             let id = request["id"].clone();
             let answer = match tokio::task::spawn_blocking(move || answer(&request)).await {
                 Ok(Ok(result)) => json!({"type": "response", "id": id, "ok": true, "result": result}),
-                Ok(Err(error)) => json!({"type": "response", "id": id, "ok": false, "error": format!("{error:#}")}),
+                // The code is extra: a dashboard from before codes reads the words alone.
+                Ok(Err(error)) => json!({"type": "response", "id": id, "ok": false, "error": format!("{error:#}"), "code": ops::code_of(&error)}),
                 Err(_) => json!({"type": "response", "id": id, "ok": false, "error": "the agent failed"}),
             };
             let _ = out.send(answer).await;

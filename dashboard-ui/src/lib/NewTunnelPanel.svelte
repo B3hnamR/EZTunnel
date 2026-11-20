@@ -6,7 +6,7 @@
   import { getNewTunnel, createTunnel } from "./api.js";
   import { say } from "./actions.svelte.js";
   import { live } from "./live.svelte.js";
-  import { fleet, LOCAL, refreshFleet } from "./servers.svelte.js";
+  import { fleet, LOCAL, localName, refreshFleet } from "./servers.svelte.js";
   import { t } from "./i18n.svelte.js";
   import { transportLabel, usedPorts, randomPort } from "./view.js";
 
@@ -34,7 +34,7 @@
 
   /** Servers an end can go on: this one and the joined servers that are online. */
   const places = $derived([
-    { id: LOCAL, name: t("thisServerIs", live.snapshot?.host?.hostname ?? ""), address: live.snapshot?.host?.address ?? "", address6: live.snapshot?.host?.address6 ?? "", online: true },
+    { id: LOCAL, name: t("thisServerIs", localName(live.snapshot?.host?.hostname)), address: live.snapshot?.host?.address ?? "", address6: live.snapshot?.host?.address6 ?? "", online: true },
     ...fleet.list.map((s) => ({ id: s.id, name: s.name, address: s.snapshot?.host?.address ?? "", address6: s.snapshot?.host?.address6 ?? "", online: s.online })),
   ]);
   const placeOf = (id) => places.find((p) => p.id === id);

@@ -2,6 +2,8 @@
 use std::sync::atomic::{AtomicU64,Ordering::Relaxed};
 
 pub static GAMING_CHANNELS:AtomicU64=AtomicU64::new(0);
+/// Game datagrams that could not be sent on the game path (see `gaming::send_failed`).
+pub static GAMING_SEND_FAILURES:AtomicU64=AtomicU64::new(0);
 pub static GAMING_MIGRATIONS:AtomicU64=AtomicU64::new(0);
 pub static GAMING_TX:AtomicU64=AtomicU64::new(0);
 pub static GAMING_RX:AtomicU64=AtomicU64::new(0);
@@ -16,7 +18,7 @@ pub static HOP_CHANGES:AtomicU64=AtomicU64::new(0);
 pub static HOP_RX:AtomicU64=AtomicU64::new(0);
 
 pub fn snapshot()->serde_json::Value {
-    serde_json::json!({"gaming_channels_validated":GAMING_CHANNELS.load(Relaxed),
+    serde_json::json!({"gaming_channels_validated":GAMING_CHANNELS.load(Relaxed),"gaming_send_failures":GAMING_SEND_FAILURES.load(Relaxed),
         "gaming_flow_migrations":GAMING_MIGRATIONS.load(Relaxed),"gaming_packets_sent":GAMING_TX.load(Relaxed),
         "gaming_packets_received":GAMING_RX.load(Relaxed),"gaming_packets_rejected":GAMING_REJECTED.load(Relaxed),
         "gaming_fragments_reassembled":GAMING_FRAGMENTS.load(Relaxed),

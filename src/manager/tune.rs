@@ -1047,8 +1047,8 @@ pub fn tune_config(config: &Value) -> Result<Option<Value>> {
         });
         let single = is_raw(transport) || edited["tun"].is_object();
         let pool_row = (dials && !single).then(|| {
-            let pool = edited[entry_key][0]["connection_pool"].as_u64().unwrap_or(1);
-            let value = if pool == 1 { "1".to_string() } else { ui::yellow(&pool.to_string()) };
+            let pool = super::plan::pool_now(&edited[entry_key][0], transport);
+            let value = if pool == transport.auto_pool() as u64 { format!("{pool} (automatic)") } else { ui::yellow(&pool.to_string()) };
             row(&mut labels, "Parallel connections (pool)", value)
         });
         let speed_row = speed::applies(transport, scope.parallax_packet).then(|| {
@@ -1193,7 +1193,7 @@ pub fn tune_config(config: &Value) -> Result<Option<Value>> {
                 return Ok(());
             }
             if Some(choice) == pool_row {
-                let current = edited[entry_key][0]["connection_pool"].as_u64().unwrap_or(1);
+                let current = super::plan::pool_now(&edited[entry_key][0], transport);
                 ui::note("Parallel tunnel connections this side opens. More spread users and limit the effect of one dropping.");
                 let text = ui::ask(
                     "Parallel connections between the servers",
@@ -1204,14 +1204,7 @@ pub fn tune_config(config: &Value) -> Result<Option<Value>> {
                     },
                 )?;
                 let pool: u64 = text.parse()?;
-                let entry = &mut edited[entry_key][0];
-                if pool == 1 {
-                    if let Some(object) = entry.as_object_mut() {
-                        object.remove("connection_pool");
-                    }
-                } else {
-                    entry["connection_pool"] = pool.into();
-                }
+                super::plan::set_pool(&mut edited[entry_key][0], transport, pool);
                 return Ok(());
             }
             if Some(choice) == local_row {

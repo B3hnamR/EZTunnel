@@ -6,11 +6,11 @@
   import { serverTool, getReleases, checkRelease, fetchRelease, uploadProgram, installOn, getBackups, backupNow, deleteBackup, restoreBackup, saveSettings } from "../lib/api.js";
   import { say, ask } from "../lib/actions.svelte.js";
   import { live } from "../lib/live.svelte.js";
-  import { fleet, LOCAL } from "../lib/servers.svelte.js";
+  import { fleet, LOCAL, localName } from "../lib/servers.svelte.js";
   import { t, num, amount } from "../lib/i18n.svelte.js";
 
   const places = $derived([
-    { id: LOCAL, name: t("thisServerIs", live.snapshot?.host?.hostname ?? ""), online: true },
+    { id: LOCAL, name: t("thisServerIs", localName(live.snapshot?.host?.hostname)), online: true },
     ...fleet.list.map((s) => ({ id: s.id, name: s.name, online: s.online })),
   ]);
   const nameOf = (id) => places.find((p) => p.id === id)?.name ?? id;
