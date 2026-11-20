@@ -508,7 +508,7 @@ it. See [the dashboard guide](docs/dashboard.md).
 
 | In the manager | What you can do |
 |---|---|
-| **Manage tunnels** | Live status, traffic, latency, reconnects, logs, start/stop/restart, ports, settings, speed tests, delete |
+| **Manage tunnels** | Live status, traffic, latency, reconnects, logs, start/stop/restart, ports, settings, presets, speed tests, delete |
 | **All tunnels** | Start, stop or change settings on many tunnels at once |
 | **Tools → Web dashboard** | Set up, run and manage the optional browser dashboard, or join this server to one |
 | **Tools → Transport checker** | Test which transports work between your servers, then create a tunnel |
@@ -633,18 +633,6 @@ namespaces or VMs. Full details: [build from source](docs/build-from-source.md) 
 | [Transport extensions](docs/transport-upgrade.md) | [Build from source](docs/build-from-source.md) |
 | [Web dashboard](docs/dashboard.md) | [Parallax](docs/parallax.md) |
 | [Game mode](docs/game-mode.md) | |
-
-## Release quality
-
-**v0.11.0** passed 757 tests on each architecture (x86_64 and native ARM64), along with the kernel
-and Mirage runtime checks on both. Live IPv6-only checks held TCP and FEC-UDP for 60 seconds in
-both directions without a failed ping or reconnect. Both release binaries are static musl
-builds from the same source.
-
-Release binaries are signed with the official update key. Use **Tools → Update**, `eztunnel update`,
-or the dashboard's **Update** or **Install** to update a signed installation. If your installed binary
-is unsigned, use the installer first. Signed upgrade from 0.10.0 to 0.11.0 and rollback were verified
-on x86_64, and a fresh signed install was verified on ARM64.
 
 ## License
 
