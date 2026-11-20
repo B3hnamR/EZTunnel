@@ -521,6 +521,70 @@ Each tunnel is one private JSON file in `/etc/eztunnel/tunnels/` and one systemd
 service named `eztunnel-NAME.service`. Keep configs, backups and codes private.
 
 <details>
+<summary><b>Presets: what each one changes</b></summary>
+
+Apply a preset from **Manage tunnels → Apply a preset**, the dashboard's edit screen, or
+`eztunnel preset FILE [NAME] [--write]`. It shows every change before saving. Use the same preset
+on both servers. A preset never changes ports, the traffic limit, the schedule or the traffic shape.
+
+| Preset | Use it when |
+|---|---|
+| **Balanced** (recommended) | Most links. Good speed with default limits. |
+| **Many users** | Many people share the tunnel at once. |
+| **Gaming / low delay** | Steady low delay and fast detection of a dead link matter more than top speed. |
+| **Streaming / big downloads** | A few users need fast single downloads. |
+| **Max capacity** | A dedicated server. Limits follow its memory and CPU cores instead of fixed numbers. |
+
+In the tables, "No preset" is the default and "–" means the preset keeps the default.
+
+**Sessions (connection pool)**
+
+| Transport | No preset | Balanced | Many users | Gaming | Streaming | Max capacity |
+|---|---|---|---|---|---|---|
+| TCP, HTTP(S), WS(S), XHTTP(S) | 6 | 6 | 9 | 4 | 8 | 6–12 (one per core, at least 6) |
+| KCP, FEC-UDP, Parallax | 3 | 3 | 4 | 3 | 4 | 3–6 (one per core, at least 3) |
+| Mirage, FEC-RAW, TUN | 1 | 1 | 1 | 1 | 1 | 1 |
+
+**Settings for every transport**
+
+| Setting | No preset | Balanced | Many users | Gaming | Streaming | Max capacity |
+|---|---|---|---|---|---|---|
+| Stream window (per user connection) | 128 frames (2 MiB) | – | – | **64** (1 MiB) | **256** (4 MiB) | **256** (4 MiB) |
+| User connections in total (`max_streams`) | 1024 | – | **8192** | – | – | **memory in MB × 16** (1024–65536) |
+| User connections per IP | 512 | – | **8192** | – | – | same as in total |
+| Tunnel sessions accepted (`max_connections`) | 16 | – | **64** | – | – | **cores × 16** (16–1024) |
+| Worker threads | 1 | – | **cores** (up to 8) | – | – | **cores** (up to 64) |
+| Session queue | 128 frames | – | **512** | – | – | **1024** |
+| Memory for windows | automatic | – | – | – | – | **half of the memory** |
+| Open files limit | automatic | – | – | – | – | **user connections × 2 + 4096** |
+| Heartbeat | 10 s | – | – | **5 s** | – | – |
+| Dead link after | 40 s | – | – | **20 s** | – | – |
+| No-answer check | 3 s | – | – | **2 s** | – | – |
+
+**Extra settings by transport**
+
+| Transport | Setting | No preset | Balanced | Many users | Gaming | Streaming | Max capacity |
+|---|---|---|---|---|---|---|---|
+| FEC-UDP, FEC-RAW, Mirage, Parallax packet | FEC send / receive window | 1024 / 1024 | **2048 / 2048** | – | – | **2048 / 2048** | **2048 / 2048** |
+| FEC-UDP, FEC-RAW, Mirage, Parallax packet | FEC socket buffer | 4 MiB | – | – | – | – | **8 MiB** |
+| FEC-UDP, FEC-RAW, Mirage, Parallax packet | Peers per IP | 64 | – | **1024** | – | – | **4096** |
+| XHTTP(S) | Upload requests at once | 8 | – | – | – | **16** | **16** |
+| XHTTP(S) | Requests in total / per IP | 256 / 64 | – | **4096 / 4096** | – | – | **= user connections** |
+| XHTTP(S) | Sessions | 64 | – | **512** | – | – | **cores × 64** |
+| KCP | Sessions in total / per IP | 1024 / 64 | – | **8192 / 1024** | – | – | **= user connections** |
+| Parallax (stream mode) | Buffer | 64 KiB | – | – | – | **512 KiB** | – |
+| Parallax (stream mode) | Sessions | 64 | – | **512** | – | – | **4096** |
+
+**Max capacity on two example servers**
+
+| Server | Memory for windows | User connections | Tunnel sessions | Threads |
+|---|---|---|---|---|
+| 2 GB memory, 2 cores | 1024 MiB | 32,768 | 32 | 2 |
+| 8 GB memory, 4 cores | 4096 MiB | 65,536 | 64 | 4 |
+
+</details>
+
+<details>
 <summary><b>Updating to a new version</b></summary>
 
 Run the installer again on each server, or use **Tools → Update** or the dashboard's
