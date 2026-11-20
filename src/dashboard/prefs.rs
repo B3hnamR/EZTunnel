@@ -21,6 +21,8 @@ pub struct Prefs {
     pub telegram: Telegram,
     /// Bearer token for `/metrics`; `None` keeps the endpoint off.
     pub metrics_token: Option<String>,
+    /// Display name of this server on the dashboard; `None` shows its hostname.
+    pub server_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -46,7 +48,7 @@ impl Default for Telegram {
 
 impl Default for Prefs {
     fn default() -> Self {
-        Self { auto_backup_days: 7, proxy: None, telegram: Telegram::default(), metrics_token: None }
+        Self { auto_backup_days: 7, proxy: None, telegram: Telegram::default(), metrics_token: None, server_name: None }
     }
 }
 

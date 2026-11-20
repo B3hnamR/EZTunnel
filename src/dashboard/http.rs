@@ -129,6 +129,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/join-codes", post(join_code))
         .route("/api/servers/{id}", axum::routing::delete(remove_server))
         .route("/api/servers/{id}/restart-all", post(server_restart_all))
+        .route("/api/servers/{id}/name", post(server_rename))
         .route("/api/servers/{id}/tunnels/{name}/logs", get(server_logs))
         .route("/api/servers/{id}/tunnels/{name}/logs/follow", get(server_follow))
         .route("/api/servers/{id}/tunnels/{name}/{action}", post(server_act))
@@ -145,6 +146,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/mirage-test/stop", post(mirage_stop))
         .route("/api/ssh-key", get(ssh_key))
         .route("/api/pathfinder", post(pathfinder))
+        .route("/api/pathfinder/cancel", post(pathfinder_cancel))
         .route("/api/servers/ssh", post(ssh_add))
         .route("/api/releases", get(releases))
         .route("/api/alerts", get(alerts_list))
@@ -438,6 +440,21 @@ fn error(status: StatusCode, word: &str) -> Response {
     (status, Json(json!({"error": word}))).into_response()
 }
 
+/// A failed request's answer. A failure with a code (`ops::code_of`, also from a joined server)
+/// gets its own status and word; any other keeps `otherwise` and "failed", as before. The
+/// message is always in `detail`.
+fn failure_response(failure: &anyhow::Error, otherwise: StatusCode) -> Response {
+    let (status, word) = match ops::code_of(failure) {
+        Some("unknown_tunnel") => (StatusCode::NOT_FOUND, "unknown_tunnel"),
+        Some("busy") => (StatusCode::CONFLICT, "busy"),
+        Some("pair_changed") => (StatusCode::CONFLICT, "pair_changed"),
+        Some("offline") => (StatusCode::BAD_GATEWAY, "offline"),
+        Some("timeout") => (StatusCode::GATEWAY_TIMEOUT, "timeout"),
+        _ => (otherwise, "failed"),
+    };
+    (status, Json(json!({"error": word, "detail": format!("{failure:#}")}))).into_response()
+}
+
 /// The tunnel names that exist, read off the async threads.
 async fn tunnel_names(state: &Arc<AppState>) -> Vec<String> {
     let ops = state.ops.clone();
@@ -526,17 +543,7 @@ async fn act(
         Ok(Ok(Err(failure))) => {
             let detail = format!("{failure:#}");
             state.audit.record(ip, "action_failed", &format!("{word} {name}: {detail}"));
-            let (status, code) =
-                if failure.downcast_ref::<crate::manager::store::ChangeLockBusy>().is_some() {
-                    (StatusCode::CONFLICT, "busy")
-                } else if failure.downcast_ref::<ops::PairMismatch>().is_some() {
-                    (StatusCode::CONFLICT, "pair_mismatch")
-                } else if failure.downcast_ref::<ops::UnknownTunnel>().is_some() {
-                    (StatusCode::NOT_FOUND, "unknown_tunnel")
-                } else {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "failed")
-                };
-            (status, Json(json!({"error": code, "detail": detail}))).into_response()
+            failure_response(&failure, StatusCode::INTERNAL_SERVER_ERROR)
         }
         Ok(Err(_)) => error(StatusCode::INTERNAL_SERVER_ERROR, "failed"),
         Err(_) => error(StatusCode::GATEWAY_TIMEOUT, "timeout"),
@@ -776,7 +783,65 @@ async fn servers(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Resp
         Some(fleet) => fleet.servers(),
         None => demo_servers(state.live.latest().as_deref()),
     };
-    Json(json!({"servers": list, "offline_after": super::fleet::OFFLINE_AFTER})).into_response()
+    let local_name = super::prefs::load(&state.state_dir).server_name;
+    Json(json!({"servers": list, "offline_after": super::fleet::OFFLINE_AFTER, "local_name": local_name})).into_response()
+}
+
+/// A display name typed on the dashboard: trimmed, 1..=40 characters of letters, digits, spaces
+/// and `-_.()#`. Empty means "go back to the server's own name". Anything else is refused, so a
+/// name is safe in alerts, metrics labels and the page.
+fn server_label(text: &str) -> Result<Option<String>, ()> {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let fine = text.chars().count() <= 40 && text.chars().all(|c| c.is_alphanumeric() || c == ' ' || "-_.()#".contains(c));
+    if fine { Ok(Some(text)) } else { Err(()) }
+}
+
+/// The name this server is shown under: the one set on the dashboard, else its hostname.
+fn local_name(state: &AppState, hostname: &str) -> String {
+    super::prefs::load(&state.state_dir).server_name.unwrap_or_else(|| hostname.to_string())
+}
+
+/// Renames a server on the dashboard (`local` is this server). Only the display name changes:
+/// the server's hostname, id and tunnels are not touched.
+async fn server_rename(State(state): State<Arc<AppState>>, Path(id): Path<String>, request: Request) -> Response {
+    if !state.signed_in(request.headers()) {
+        return unauthorized();
+    }
+    let ip = client_ip(&request);
+    let Ok(body) = axum::body::to_bytes(request.into_body(), 4096).await else {
+        return error(StatusCode::BAD_REQUEST, "bad_request");
+    };
+    let Some(given) = serde_json::from_slice::<Value>(&body).ok().and_then(|v| v["name"].as_str().map(str::to_string)) else {
+        return error(StatusCode::BAD_REQUEST, "bad_request");
+    };
+    let Ok(label) = server_label(&given) else {
+        return error(StatusCode::BAD_REQUEST, "bad_name");
+    };
+    let shown = label.clone().unwrap_or_default();
+    if id == "local" {
+        let saved = super::prefs::change_and_save(&state.state_dir, |prefs| {
+            prefs.server_name = label.clone();
+            Ok(None)
+        });
+        if saved.is_err() {
+            return error(StatusCode::INTERNAL_SERVER_ERROR, "failed");
+        }
+    } else {
+        let Some(fleet) = &state.fleet else {
+            return Json(json!({"ok": true, "name": label})).into_response();
+        };
+        match fleet.rename(&id, label.clone()) {
+            Ok(true) => {}
+            Ok(false) => return error(StatusCode::NOT_FOUND, "unknown_server"),
+            Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "failed"),
+        }
+    }
+    let detail = if shown.is_empty() { format!("{id}: back to its own name") } else { format!("{id}: {shown}") };
+    state.audit.record(ip, "server_renamed", &detail);
+    Json(json!({"ok": true, "name": label})).into_response()
 }
 
 /// A one-time join command for another server.
@@ -816,31 +881,6 @@ async fn remove_server(State(state): State<Arc<AppState>>, Path(id): Path<String
         Ok(false) => error(StatusCode::NOT_FOUND, "unknown_server"),
         Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "failed"),
     }
-}
-
-/// Normalize only typed Agent/transport failures. An older Agent's untyped message
-/// remains an internal error; never guess its meaning from human-readable prose.
-fn remote_request_status(failure: &anyhow::Error) -> (StatusCode, &'static str) {
-    use super::fleet::RequestFailure;
-    match failure.downcast_ref::<RequestFailure>() {
-        Some(RequestFailure::NotConnected | RequestFailure::Disconnected) => {
-            (StatusCode::BAD_GATEWAY, "remote_offline")
-        }
-        Some(RequestFailure::TimedOut) => (StatusCode::GATEWAY_TIMEOUT, "remote_timeout"),
-        Some(RequestFailure::Agent { code: Some(code), .. }) => match code.as_str() {
-            "unknown_tunnel" => (StatusCode::NOT_FOUND, "unknown_tunnel"),
-            "invalid_input" => (StatusCode::BAD_REQUEST, "invalid_input"),
-            "busy" => (StatusCode::CONFLICT, "busy"),
-            "pair_mismatch" => (StatusCode::CONFLICT, "pair_mismatch"),
-            _ => (StatusCode::INTERNAL_SERVER_ERROR, "failed"),
-        },
-        _ => (StatusCode::INTERNAL_SERVER_ERROR, "failed"),
-    }
-}
-
-fn remote_request_failed(failure: &anyhow::Error) -> Response {
-    let (status, code) = remote_request_status(failure);
-    (status, Json(json!({"error": code, "detail": format!("{failure:#}")}))).into_response()
 }
 
 /// Start, stop or restart a tunnel on another server.
@@ -888,7 +928,7 @@ async fn server_act(
         Err(failure) => {
             let detail = format!("{failure:#}");
             state.audit.record(ip, "action_failed", &format!("{word} {name} on {id}: {detail}"));
-            remote_request_failed(&failure)
+            failure_response(&failure, StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 }
@@ -919,7 +959,7 @@ async fn editable_answer(state: Arc<AppState>, server: String, name: String, hea
     }
     match run_edit(&state, &server, &name, json!({"op": "editable"})).await {
         Ok(screen) => Json(screen).into_response(),
-        Err(failure) => (StatusCode::BAD_REQUEST, Json(json!({"error": "failed", "detail": format!("{failure:#}")}))).into_response(),
+        Err(failure) => failure_response(&failure, StatusCode::BAD_REQUEST),
     }
 }
 
@@ -969,7 +1009,7 @@ async fn change_answer_owned(state: Arc<AppState>, server: String, name: String,
         Err(failure) => {
             let detail = format!("{failure:#}");
             state.audit.record(ip, "action_failed", &format!("{what} {name}{place}: {detail}"));
-            (StatusCode::BAD_REQUEST, Json(json!({"error": "failed", "detail": detail}))).into_response()
+            failure_response(&failure, StatusCode::BAD_REQUEST)
         }
     }
 }
@@ -1055,7 +1095,7 @@ async fn status_answer(state: Arc<AppState>, server: String, name: String, heade
     }
     match run_on(&state, &server, json!({"op": "status", "name": name}), Duration::from_secs(10)).await {
         Ok(status) => Json(status).into_response(),
-        Err(failure) => (StatusCode::BAD_REQUEST, Json(json!({"error": "failed", "detail": format!("{failure:#}")}))).into_response(),
+        Err(failure) => failure_response(&failure, StatusCode::BAD_REQUEST),
     }
 }
 
@@ -1126,7 +1166,7 @@ async fn tool_answer_owned(state: Arc<AppState>, server: String, name: String, o
         Err(failure) => {
             let detail = format!("{failure:#}");
             state.audit.record(ip, "action_failed", &format!("{what} {name}{place}: {detail}"));
-            (StatusCode::BAD_REQUEST, Json(json!({"error": "failed", "detail": detail}))).into_response()
+            failure_response(&failure, StatusCode::BAD_REQUEST)
         }
     }
 }
@@ -1201,7 +1241,7 @@ async fn server_tool_answer_owned(State(state): State<Arc<AppState>>, Path((id, 
             if changes {
                 state.audit.record(ip, "action_failed", &format!("{what}{place}: {detail}"));
             }
-            (StatusCode::BAD_REQUEST, Json(json!({"error": "failed", "detail": detail}))).into_response()
+            failure_response(&failure, StatusCode::BAD_REQUEST)
         }
     }
 }
@@ -1212,7 +1252,7 @@ fn current_problems(state: &AppState) -> Vec<super::alerts::Problem> {
     let mut found = Vec::new();
     if let Some(snapshot) = state.live.latest() {
         let value = serde_json::to_value(&*snapshot).unwrap_or_default();
-        let name = value["host"]["hostname"].as_str().unwrap_or("this server").to_string();
+        let name = local_name(state, value["host"]["hostname"].as_str().unwrap_or("this server"));
         found.extend(problems_of("local", &name, &value));
     }
     let servers = match &state.fleet {
@@ -1450,7 +1490,7 @@ async fn metrics(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Resp
     let mut servers = Vec::new();
     if let Some(snapshot) = state.live.latest() {
         let value = serde_json::to_value(&*snapshot).unwrap_or_default();
-        let name = value["host"]["hostname"].as_str().unwrap_or("").to_string();
+        let name = local_name(&state, value["host"]["hostname"].as_str().unwrap_or(""));
         servers.push(("local".to_string(), name, value));
     }
     if let Some(fleet) = &state.fleet {
@@ -1996,6 +2036,21 @@ fn online_servers(state: &AppState) -> Vec<(String, String, String)> {
 
 /// One path search at a time: two would open their echo and relay ports on the same numbers.
 static PATH_SEARCH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// Cancel (`POST /api/pathfinder/cancel`) wakes the search running now.
+static PATH_CANCEL: std::sync::LazyLock<tokio::sync::Notify> = std::sync::LazyLock::new(tokio::sync::Notify::new);
+
+/// Stops the path search that is running, if one is. Its test ports are closed on every server.
+async fn pathfinder_cancel(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if !state.signed_in(&headers) {
+        return unauthorized();
+    }
+    if PATH_SEARCH.try_lock().is_ok() {
+        return Json(json!({"ok": true, "running": false})).into_response();
+    }
+    state.audit.record(None, "action", "cancel the path search");
+    PATH_CANCEL.notify_waiters();
+    Json(json!({"ok": true, "running": true})).into_response()
+}
 
 /// Finds a way between two servers: the direct path both ways, what the Iran server reaches
 /// abroad, and every other managed server tried as a relay (a temporary forwarder there, checked
@@ -2042,6 +2097,11 @@ async fn pathfinder(State(state): State<Arc<AppState>>, request: Request) -> Res
         let state = state.clone();
         async move { run_on(&state, &server, json!({"op": "server", "tool": "path", "path": step}), Duration::from_secs(40)).await.unwrap_or_else(|e| json!({"ok": false, "error": format!("{e:#}")})) }
     };
+    // Cancel may come at any step: listen for it from the start.
+    let cancelled = PATH_CANCEL.notified();
+    tokio::pin!(cancelled);
+    cancelled.as_mut().enable();
+    let scan = async {
     let mut out = serde_json::Map::new();
     out.insert("from_iran".into(), path(iran.clone(), json!({"step": "probe", "host": foreign_ip.to_string(), "ports": [ECHO]})).await);
     out.insert("known".into(), path(iran.clone(), json!({"step": "known"})).await["known"].clone());
@@ -2094,6 +2154,21 @@ async fn pathfinder(State(state): State<Arc<AppState>>, request: Request) -> Res
     out.insert("relays".into(), json!(relays));
     out.insert("foreign_asked".into(), json!(foreign_online));
     Json(Value::Object(out)).into_response()
+    };
+    tokio::select! {
+        response = scan => response,
+        () = &mut cancelled => {
+            // Whatever the search had opened goes now: the echo on each end, the relay forwarders.
+            if foreign_online {
+                path(foreign.clone(), json!({"step": "close", "port": ECHO})).await;
+            }
+            path(iran.clone(), json!({"step": "close", "port": BACK})).await;
+            for (id, _, _) in online.iter().filter(|(id, _, _)| *id != iran && *id != foreign) {
+                path(id.clone(), json!({"step": "close", "port": RELAY})).await;
+            }
+            Json(json!({"cancelled": true})).into_response()
+        }
+    }
 }
 
 /// The dashboard's public SSH key, for adding servers over SSH.
@@ -2345,19 +2420,18 @@ async fn delete_answer(
         return unauthorized();
     }
     let ip = client_ip(&request);
-    let expected_pair = match read_body(request, MAX_BODY).await {
+    // Optional `{"pair": ...}`: the fingerprint the tunnel was chosen by, checked on its server
+    // under the tunnel's lock. A page from before it sends no body and deletes by name.
+    let pair = match read_body(request, MAX_BODY).await {
         Ok(bytes) if bytes.is_empty() => None,
-        Ok(bytes) => {
-            let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
-                return error(StatusCode::BAD_REQUEST, "bad_request");
-            };
-            match value.get("expect_pair") {
-                Some(Value::String(pair)) if ops::valid_pair(pair) => Some(pair.to_owned()),
-                Some(_) => return error(StatusCode::BAD_REQUEST, "invalid_pair"),
-                None if value.is_object() => None,
-                None => return error(StatusCode::BAD_REQUEST, "bad_request"),
-            }
-        }
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(body) if body.is_object() => match body.get("pair") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(pair)) if ops::valid_pair(pair) => Some(pair.to_ascii_lowercase()),
+                Some(_) => return error(StatusCode::BAD_REQUEST, "bad_pair"),
+            },
+            _ => return error(StatusCode::BAD_REQUEST, "bad_request"),
+        },
         Err(response) => return response,
     };
     let local = server == "local";
@@ -2383,11 +2457,11 @@ async fn delete_answer(
     let answer: Result<()> = if local {
         let ops = state.ops.clone();
         let task_name = name.clone();
-        let expected = expected_pair.clone();
+        let task_pair = pair.clone();
         // The guard moves into the task, so a slow delete keeps the tunnel marked busy.
         let task = tokio::task::spawn_blocking(move || {
             let _busy = busy;
-            match expected {
+            match task_pair {
                 Some(pair) => ops.delete_pair(&task_name, &pair),
                 None => ops.delete(&task_name),
             }
@@ -2401,8 +2475,11 @@ async fn delete_answer(
         let Some(fleet) = state.fleet.clone() else {
             return error(StatusCode::NOT_FOUND, "unknown_server");
         };
+        // Guarded removal is an explicit Agent operation: older Agents without it reject
+        // the request rather than ignore a fingerprint and delete a replacement tunnel.
+        let op = if pair.is_some() { "delete_pair" } else { "delete" };
         let answer = fleet.request_held(&server,
-            json!({"op": if expected_pair.is_some() { "delete_pair" } else { "delete" }, "name": name, "expect_pair": expected_pair}),
+            json!({"op": op, "name": name, "expect_pair": pair}),
             ACTION_TIMEOUT, busy.clone()).await.map(|_| ());
         drop(busy);
         answer
@@ -2412,21 +2489,8 @@ async fn delete_answer(
         Ok(()) => Json(json!({"ok": true})).into_response(),
         Err(failure) => {
             let detail = format!("{failure:#}");
-            state.audit.record(
-                ip,
-                "action_failed",
-                &format!("delete {name}{place}: {detail}"),
-            );
-            let (status, code) = if failure.downcast_ref::<ops::PairMismatch>().is_some() {
-                (StatusCode::CONFLICT, "pair_mismatch")
-            } else if failure.downcast_ref::<ops::UnknownTunnel>().is_some() {
-                (StatusCode::NOT_FOUND, "unknown_tunnel")
-            } else if !local {
-                remote_request_status(&failure)
-            } else {
-                (StatusCode::INTERNAL_SERVER_ERROR, "failed")
-            };
-            (status, Json(json!({"error": code, "detail": detail}))).into_response()
+            state.audit.record(ip, "action_failed", &format!("delete {name}{place}: {detail}"));
+            failure_response(&failure, StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 }
@@ -2472,7 +2536,7 @@ async fn server_restart_all(State(state): State<Arc<AppState>>, Path(id): Path<S
         Err(failure) => {
             let detail = format!("{failure:#}");
             state.audit.record(ip, "action_failed", &format!("restart all on {id}: {detail}"));
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "failed", "detail": detail}))).into_response()
+            failure_response(&failure, StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 }
@@ -2496,7 +2560,7 @@ async fn server_logs(
         // An agent from before the cursor sends the lines alone.
         Ok(lines) if lines.is_array() => Json(json!({"lines": lines})).into_response(),
         Ok(tail) => Json(tail).into_response(),
-        Err(failure) => remote_request_failed(&failure),
+        Err(failure) => failure_response(&failure, StatusCode::BAD_GATEWAY),
     }
 }
 
@@ -2523,7 +2587,7 @@ async fn server_follow(
     };
     match fleet.follow(&id, &name, after).await {
         Ok(follow) => sse_lines(state, token, permit, LineSource::Remote(follow)),
-        Err(failure) => (StatusCode::BAD_GATEWAY, Json(json!({"error": "failed", "detail": format!("{failure:#}")}))).into_response(),
+        Err(failure) => failure_response(&failure, StatusCode::BAD_GATEWAY),
     }
 }
 
@@ -2637,24 +2701,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn agent_and_link_failures_have_stable_http_codes() {
-        use super::super::fleet::RequestFailure;
-        let cases = [
-            (RequestFailure::NotConnected, StatusCode::BAD_GATEWAY, "remote_offline"),
-            (RequestFailure::Disconnected, StatusCode::BAD_GATEWAY, "remote_offline"),
-            (RequestFailure::TimedOut, StatusCode::GATEWAY_TIMEOUT, "remote_timeout"),
-            (RequestFailure::Agent { code: Some("unknown_tunnel".into()), detail: "missing".into() }, StatusCode::NOT_FOUND, "unknown_tunnel"),
-            (RequestFailure::Agent { code: Some("busy".into()), detail: "busy".into() }, StatusCode::CONFLICT, "busy"),
-            (RequestFailure::Agent { code: Some("invalid_input".into()), detail: "invalid".into() }, StatusCode::BAD_REQUEST, "invalid_input"),
-            (RequestFailure::Agent { code: None, detail: "no tunnel named x".into() }, StatusCode::INTERNAL_SERVER_ERROR, "failed"),
-            (RequestFailure::Agent { code: Some("arbitrary".into()), detail: "x".into() }, StatusCode::INTERNAL_SERVER_ERROR, "failed"),
-        ];
-        for (failure, status, code) in cases {
-            assert_eq!(remote_request_status(&failure.into()), (status, code));
-        }
-    }
 
     #[tokio::test]
     async fn unfinished_bodies_time_out_and_oversized_bodies_are_rejected() {
@@ -2803,6 +2849,51 @@ mod tests {
         drop(held);
     }
 
+    /// Cancel needs a session; with no search running it says so and changes nothing.
+    #[tokio::test]
+    async fn the_path_search_can_be_cancelled() {
+        let (app, _) = app().await;
+        let cookie = signed_in(&app).await;
+        assert_eq!(call(&app, post("/api/pathfinder/cancel", "{}", true)).await.status(), StatusCode::UNAUTHORIZED);
+        let idle = json_of(call(&app, with_cookie(post("/api/pathfinder/cancel", "{}", true), &cookie)).await).await;
+        assert_eq!(idle, json!({"ok": true, "running": false}));
+        // A search that is waiting is woken by Cancel.
+        let waiting = PATH_CANCEL.notified();
+        tokio::pin!(waiting);
+        waiting.as_mut().enable();
+        PATH_CANCEL.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(1), waiting).await.expect("Cancel reaches the search");
+    }
+
+    /// Only safe display names are kept; empty means the server's own name again.
+    #[test]
+    fn server_names_are_checked() {
+        assert_eq!(server_label("  Tehran   game (2) "), Ok(Some("Tehran game (2)".into())));
+        assert_eq!(server_label("سرور ایران"), Ok(Some("سرور ایران".into())));
+        assert_eq!(server_label("   "), Ok(None));
+        for bad in ["<b>x</b>", "a\"b", "a\\b", "x&y", "line\u{7}", &"n".repeat(41)] {
+            assert_eq!(server_label(bad), Err(()), "{bad:?}");
+        }
+    }
+
+    /// Renaming needs a session, refuses bad names and unknown servers, and shows the new name.
+    #[tokio::test]
+    async fn this_server_can_be_renamed() {
+        let (app, _) = app().await;
+        let cookie = signed_in(&app).await;
+        let rename = |id: &str, body: &str| post(&format!("/api/servers/{id}/name"), body, true);
+        assert_eq!(call(&app, rename("local", r#"{"name":"x"}"#)).await.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(call(&app, with_cookie(rename("local", r#"{"name":"<x>"}"#), &cookie)).await.status(), StatusCode::BAD_REQUEST);
+        let renamed = json_of(call(&app, with_cookie(rename("local", r#"{"name":"Iran edge"}"#), &cookie)).await).await;
+        assert_eq!(renamed, json!({"ok": true, "name": "Iran edge"}));
+        let listed = json_of(call(&app, with_cookie(hyper::Request::get("/api/servers").body(Body::empty()).unwrap(), &cookie)).await).await;
+        assert_eq!(listed["local_name"], "Iran edge");
+        let cleared = json_of(call(&app, with_cookie(rename("local", r#"{"name":""}"#), &cookie)).await).await;
+        assert_eq!(cleared, json!({"ok": true, "name": null}));
+        let listed = json_of(call(&app, with_cookie(hyper::Request::get("/api/servers").body(Body::empty()).unwrap(), &cookie)).await).await;
+        assert_eq!(listed["local_name"], Value::Null);
+    }
+
     #[tokio::test]
     async fn stop_and_start_report_what_they_did() {
         let (app, state) = app().await;
@@ -2895,6 +2986,50 @@ mod tests {
         assert!(events.iter().any(|e| e["detail"] == "delete backup-tcp"), "{events:?}");
         let unsigned = hyper::Request::delete("/api/tunnels/game-fec").header(CSRF_HEADER, "1").body(Body::empty()).unwrap();
         assert_eq!(call(&app, unsigned).await.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_delete_with_a_pair_spares_a_tunnel_made_again_under_its_name() {
+        let (app, state) = app().await;
+        let cookie = signed_in(&app).await;
+        let form = json!({"name": "web", "transport": "tcp", "address": "192.0.2.1", "ports": "8080"});
+        let first = super::super::wizard::build(&form).unwrap().foreign;
+        let second = super::super::wizard::build(&form).unwrap().foreign;
+        let (old, new) = (super::super::data::pair_of(&first).unwrap(), super::super::data::pair_of(&second).unwrap());
+        state.ops.create("web", &first).unwrap();
+        state.ops.delete("web").unwrap();
+        state.ops.create("web", &second).unwrap();
+        let delete = |body: &str| {
+            let request = hyper::Request::delete("/api/tunnels/web").header(CSRF_HEADER, "1").header(header::CONTENT_TYPE, "application/json");
+            with_cookie(request.body(Body::from(body.to_string())).unwrap(), &cookie)
+        };
+        let refused = call(&app, delete(&json!({"pair": old}).to_string())).await;
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
+        assert_eq!(json_of(refused).await["error"], "pair_changed");
+        for bad in [r#"{"pair": "zz"}"#, r#"{"pair": 5}"#, "[1]", "not json"] {
+            assert_eq!(call(&app, delete(bad)).await.status(), StatusCode::BAD_REQUEST, "{bad}");
+        }
+        assert!(tunnel_names(&state).await.contains(&"web".to_string()), "nothing was deleted");
+        let answer = call(&app, delete(&json!({"pair": new.to_uppercase()}).to_string())).await;
+        assert_eq!(answer.status(), StatusCode::OK);
+        assert!(!tunnel_names(&state).await.contains(&"web".to_string()));
+    }
+
+    #[test]
+    fn coded_failures_get_their_own_status_and_others_keep_theirs() {
+        let cases = [
+            ("unknown_tunnel", StatusCode::NOT_FOUND),
+            ("busy", StatusCode::CONFLICT),
+            ("pair_changed", StatusCode::CONFLICT),
+            ("offline", StatusCode::BAD_GATEWAY),
+            ("timeout", StatusCode::GATEWAY_TIMEOUT),
+        ];
+        for (code, status) in cases {
+            assert_eq!(failure_response(&ops::refused(code, "words"), StatusCode::BAD_REQUEST).status(), status, "{code}");
+        }
+        let busy = anyhow::Error::from(crate::manager::store::Busy("t".into())).context("nothing was changed");
+        assert_eq!(failure_response(&busy, StatusCode::BAD_REQUEST).status(), StatusCode::CONFLICT);
+        assert_eq!(failure_response(&anyhow::anyhow!("plain"), StatusCode::BAD_REQUEST).status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

@@ -34,7 +34,7 @@ const BAD_LOSS_PERCENT: f64 = 10.;
 const SOME_LOSS_PERCENT: f64 = 1.;
 /// Path MTU below this is penalised; the sizes of the UDP carriers' defaults are quoted in advice.
 const SMALL_PATH_MTU: usize = 1400;
-const KCP_DEFAULT_MTU: usize = 1400;
+const KCP_DEFAULT_MTU: usize = 1350;
 const FEC_DEFAULT_MTU: usize = 1350;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -658,7 +658,7 @@ mod tests {
         let v = assess(&r);
         let t = text(&v);
         assert!(
-            t.contains("kcp.mtu (default 1400) and fec.mtu (default 1350) to 1280"),
+            t.contains("kcp.mtu (default 1350) and fec.mtu (default 1350) to 1280"),
             "{t}"
         );
         assert!(

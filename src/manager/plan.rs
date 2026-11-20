@@ -313,6 +313,22 @@ pub fn game_port(tunnel_port: u16) -> u16 {
     if tunnel_port == u16::MAX { tunnel_port - 1 } else { tunnel_port + 1 }
 }
 
+/// The pool a listener or path entry has: its `connection_pool`, or the transport's automatic one.
+pub fn pool_now(entry: &Value, transport: Transport) -> u64 {
+    entry["connection_pool"].as_u64().filter(|pool| *pool > 0).unwrap_or(transport.auto_pool() as u64)
+}
+
+/// Sets an entry's pool; the automatic size is left unwritten so it follows the program.
+pub fn set_pool(entry: &mut Value, transport: Transport, pool: u64) {
+    if pool == transport.auto_pool() as u64 {
+        if let Some(object) = entry.as_object_mut() {
+            object.remove("connection_pool");
+        }
+    } else {
+        entry["connection_pool"] = json!(pool);
+    }
+}
+
 pub fn is_raw(transport: Transport) -> bool {
     matches!(
         transport,
@@ -601,7 +617,7 @@ impl Plan {
             entry.insert("raw".into(), Value::Object(options));
         }
         let single = is_raw(self.transport) || self.carry.uses_tun();
-        if dials && !single && self.pool != 1 {
+        if dials && !single && self.pool != self.transport.auto_pool() {
             entry.insert("connection_pool".into(), json!(self.pool));
         }
         let mut root = Map::new();
@@ -721,45 +737,18 @@ impl Profile {
             Profile::General => "good speed for most links (recommended)",
             Profile::ManyUsers => "more connections and room for many users at once",
             Profile::Gaming => "Game mode: game UDP on its own fast path, in 3 copies; small queues (FEC-RAW: low-delay tuning)",
-            Profile::Streaming => "the largest window for fast single downloads",
+            Profile::Streaming => "bigger windows for fast single downloads",
         }
     }
 
-    /// (pool, settings by name)
-    fn values(self) -> (usize, &'static [(&'static str, u64)]) {
+    /// The preset with the same values; the wizard and later changes share one set of numbers.
+    fn preset(self) -> super::presets::Preset {
+        use super::presets::Preset;
         match self {
-            Profile::General => (4, &[("stream_window", 256)]),
-            Profile::ManyUsers => (
-                8,
-                &[
-                    ("stream_window", 128),
-                    ("max_streams", 4096),
-                    ("max_connections", 32),
-                ],
-            ),
-            Profile::Gaming => (
-                4,
-                &[
-                    ("stream_window", 64),
-                    ("heartbeat_sec", 5),
-                    ("dead_timeout_sec", 20),
-                ],
-            ),
-            // The UDP carriers cap one connection at window x packet size per round trip
-            // (about 100 Mbit/s at 90 ms with the default 1024 packets); their buffers must
-            // hold the larger window.
-            Profile::Streaming => (
-                8,
-                &[
-                    ("stream_window", 512),
-                    ("kcp.send_window", 4096),
-                    ("kcp.recv_window", 4096),
-                    ("kcp.socket_buf_bytes", 16_777_216),
-                    ("fec.sndwnd", 4096),
-                    ("fec.rcvwnd", 4096),
-                    ("fec.socket_buf_bytes", 16_777_216),
-                ],
-            ),
+            Profile::General => Preset::Balanced,
+            Profile::ManyUsers => Preset::ManyUsers,
+            Profile::Gaming => Preset::Gaming,
+            Profile::Streaming => Preset::Streaming,
         }
     }
 }
@@ -767,8 +756,12 @@ impl Profile {
 impl Plan {
     /// Applies a profile, replacing earlier values of the same settings.
     pub fn apply_profile(&mut self, profile: Profile) {
-        let (pool, values) = profile.values();
-        self.pool = pool;
+        let scope = super::scope::Scope::of_plan(self);
+        let (pool, values) =
+            super::presets::for_plan(profile.preset(), &scope, self.tun.is_some(), super::presets::Capacity::here());
+        self.pool = pool as usize;
+        // A profile owns the same settings as a preset: switching profiles leaves nothing behind.
+        self.tuned.retain(|(s, _)| !super::presets::MANAGED.contains(&s.name));
         // The gaming profile is the one-click choice for games: it also turns Game mode on.
         // A foreign server of a direct tunnel does not know the Iran address the control connects
         // to; there Customize offers Game mode and asks for it. Raw carriers keep their own path.
@@ -791,9 +784,9 @@ impl Plan {
         self.low_delay = profile == Profile::Gaming && self.transport == Transport::FecRaw;
         let available = super::scope::relevant(&super::scope::Scope::of_plan(self));
         for (name, value) in values {
-            if let Some(setting) = available.iter().find(|s| s.name == *name) {
-                self.tuned.retain(|(s, _)| s.name != *name);
-                self.tuned.push((setting.clone(), *value));
+            if let Some(setting) = available.iter().find(|s| s.name == name) {
+                self.tuned.retain(|(s, _)| s.name != name);
+                self.tuned.push((setting.clone(), value));
             }
         }
     }
@@ -1283,24 +1276,20 @@ mod tests {
                 .find(|(setting, _)| setting.name == name)
                 .map(|(_, value)| *value)
         };
-        for (transport, window, buffer) in [
-            (Transport::FecUdp, "fec.sndwnd", "fec.socket_buf_bytes"),
-            (Transport::Kcp, "kcp.send_window", "kcp.socket_buf_bytes"),
-        ] {
-            let mut streaming = plan(Side::Iran, Direction::Reverse, transport, Carry::Ports);
-            streaming.apply_profile(Profile::Streaming);
-            assert_eq!(value(&streaming, window), Some(4096), "{transport:?}");
-            // The buffer must hold the larger window.
-            assert_eq!(value(&streaming, buffer), Some(16_777_216), "{transport:?}");
-            let mut general = plan(Side::Iran, Direction::Reverse, transport, Carry::Ports);
-            general.apply_profile(Profile::General);
-            assert_eq!(value(&general, window), None, "{transport:?}");
-        }
+        // FEC gets 2048-packet windows; KCP keeps its own (bigger KCP windows built up delay).
+        let mut fec = plan(Side::Iran, Direction::Reverse, Transport::FecUdp, Carry::Ports);
+        fec.apply_profile(Profile::Streaming);
+        assert_eq!(value(&fec, "fec.sndwnd"), Some(2048));
+        fec.apply_profile(Profile::Gaming);
+        assert_eq!(value(&fec, "fec.sndwnd"), None, "switching profiles leaves nothing behind");
+        let mut kcp = plan(Side::Iran, Direction::Reverse, Transport::Kcp, Carry::Ports);
+        kcp.apply_profile(Profile::Streaming);
+        assert_eq!(value(&kcp, "kcp.send_window"), None);
         let mut tcp = plan(Side::Iran, Direction::Reverse, Transport::Tcp, Carry::Ports);
         tcp.apply_profile(Profile::Streaming);
         assert_eq!(value(&tcp, "fec.sndwnd"), None);
         assert_eq!(value(&tcp, "kcp.send_window"), None);
-        assert_eq!(value(&tcp, "stream_window"), Some(512));
+        assert_eq!(value(&tcp, "stream_window"), Some(256));
     }
 
     #[test]

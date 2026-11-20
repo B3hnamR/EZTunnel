@@ -96,6 +96,11 @@ pub fn automatic_budget_mb(total_memory_mb: Option<u64>) -> u64 {
     total_memory_mb.map_or(256, |total| (total / 4).clamp(64, 1024))
 }
 
+/// The memory this process can use, in MiB (see `total_memory_mb`), for sizing presets.
+pub fn usable_memory_mb() -> Option<u64> {
+    total_memory_mb()
+}
+
 /// The memory this process can really use, in MiB: the machine's, or the smaller limit of the
 /// container or service it runs in (cgroup), which is what decides when it gets killed.
 fn total_memory_mb() -> Option<u64> {

@@ -18,17 +18,17 @@ pub struct ChangeLock {
     _file: fs::File,
 }
 
-/// A contended nonblocking lock, distinct from an I/O or permissions failure.
+/// The change lock is held elsewhere: the tunnel is being changed right now.
 #[derive(Debug)]
-pub struct ChangeLockBusy(pub String);
+pub struct Busy(pub String);
 
-impl std::fmt::Display for ChangeLockBusy {
+impl std::fmt::Display for Busy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} is being changed elsewhere (in the terminal manager or the dashboard); try again in a moment", self.0)
     }
 }
 
-impl std::error::Error for ChangeLockBusy {}
+impl std::error::Error for Busy {}
 
 pub struct Store {
     root: PathBuf,
@@ -174,7 +174,7 @@ impl Store {
         }
     }
 
-    /// Takes the change lock of a tunnel. `wait` blocks until it is free (the terminal manager);
+    /// Takes the change lock of a tunnel (held elsewhere: a [`Busy`] error). `wait` blocks until it is free (the terminal manager);
     /// otherwise a tunnel being changed elsewhere is an error (the dashboard answers at once).
     pub fn lock(&self, name: &str, wait: bool) -> Result<ChangeLock> {
         check_name(name)?;
@@ -192,13 +192,19 @@ impl Store {
         {
             use std::os::fd::AsRawFd;
             let flags = libc::LOCK_EX | if wait { 0 } else { libc::LOCK_NB };
-            // SAFETY: flock on a descriptor this function owns; it is released when the file closes.
-            if unsafe { libc::flock(file.as_raw_fd(), flags) } != 0 {
-                let failure = std::io::Error::last_os_error();
-                if failure.kind() == std::io::ErrorKind::WouldBlock {
-                    return Err(ChangeLockBusy(name.to_owned()).into());
+            loop {
+                // SAFETY: flock on a descriptor this function owns; it is released when the file closes.
+                if unsafe { libc::flock(file.as_raw_fd(), flags) } == 0 {
+                    break;
                 }
-                return Err(failure).with_context(|| format!("lock {}", path.display()));
+                let failure = std::io::Error::last_os_error();
+                match failure.kind() {
+                    // A signal while waiting: wait again.
+                    std::io::ErrorKind::Interrupted => continue,
+                    // Only this means someone else holds it; any other failure says what it is.
+                    std::io::ErrorKind::WouldBlock => return Err(Busy(name.to_string()).into()),
+                    _ => return Err(failure).with_context(|| format!("lock {}", path.display())),
+                }
             }
         }
         Ok(ChangeLock { _file: file })
@@ -358,6 +364,18 @@ mod tests {
         (directory, store)
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_held_elsewhere_is_busy_and_free_again_once_released() {
+        let (_directory, store) = store();
+        let held = store.lock("alpha", false).unwrap();
+        let error = store.lock("alpha", false).err().unwrap();
+        assert_eq!(error.downcast_ref::<Busy>().unwrap().0, "alpha");
+        assert!(format!("{error:#}").contains("is being changed elsewhere"), "same words as before");
+        drop(held);
+        assert!(store.lock("alpha", false).is_ok());
+    }
+
     #[test]
     fn deleting_a_tunnel_deletes_its_unfinished_edit_with_the_key() {
         let (_directory, store) = store();
@@ -483,7 +501,7 @@ mod tests {
         let (_directory, store) = store();
         let first = store.lock("qa", false).unwrap();
         let error = store.lock("qa", false).err().unwrap();
-        assert_eq!(error.downcast_ref::<ChangeLockBusy>().unwrap().0, "qa");
+        assert_eq!(error.downcast_ref::<Busy>().unwrap().0, "qa");
         drop(first);
         assert!(store.lock("qa", false).is_ok());
     }

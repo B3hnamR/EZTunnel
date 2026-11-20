@@ -710,13 +710,20 @@ async fn receive_uploads<W: AsyncWrite + Unpin>(
 }
 
 async fn write_chunk<W: AsyncWrite + Unpin>(stream: &mut W, body: &[u8]) -> Result<()> {
-    stream
-        .write_all(format!("{:x}\r\n", body.len()).as_bytes())
-        .await?;
-    stream.write_all(body).await?;
-    stream.write_all(b"\r\n").await?;
+    stream.write_all(&chunk_bytes(body)).await?;
     stream.flush().await?;
     Ok(())
+}
+
+/// One HTTP chunk (size line, data, CRLF) as one buffer, so it goes out in one write: written in
+/// three parts on a socket without Nagle, every chunk became three packets, two of them tiny.
+pub(crate) fn chunk_bytes(body: &[u8]) -> Vec<u8> {
+    let size = format!("{:x}\r\n", body.len());
+    let mut chunk = Vec::with_capacity(size.len() + body.len() + 2);
+    chunk.extend_from_slice(size.as_bytes());
+    chunk.extend_from_slice(body);
+    chunk.extend_from_slice(b"\r\n");
+    chunk
 }
 
 async fn read_chunk<R: AsyncRead + Unpin>(stream: &mut R, max: usize) -> Result<Option<Vec<u8>>> {
@@ -978,7 +985,9 @@ async fn packet_upload<R: AsyncRead + Unpin>(
     path: &ClientPath,
     id: &str,
 ) -> Result<()> {
-    let (sender, receiver) = mpsc::channel(path.xhttp.up_concurrency);
+    // A queue of one: data waits here, not in the channel, while every worker is busy, so it can
+    // be combined into one request (see `producer`).
+    let (sender, receiver) = mpsc::channel(1);
     let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
     let mut workers = JoinSet::new();
     for _ in 0..path.xhttp.up_concurrency {
@@ -986,21 +995,40 @@ async fn packet_upload<R: AsyncRead + Unpin>(
         workers.spawn(packet_worker(receiver, path, id));
     }
     let producer = async move {
+        let max = path.xhttp.up_max_bytes;
         let mut sequence = 0;
+        let mut body = Vec::with_capacity(max);
+        let mut more = vec![0; max];
+        let mut eof = false;
         loop {
-            let mut body = vec![0; path.xhttp.up_max_bytes];
-            let count = reader.read(&mut body).await?;
-            body.truncate(count);
-            sender
-                .send(Packet { sequence, body })
-                .await
-                .context("XHTTP upload workers stopped")?;
-            if count == 0 {
-                return anyhow::Ok(());
+            if body.is_empty() && !eof {
+                let count = reader.read(&mut more).await?;
+                body.extend_from_slice(&more[..count]);
+                eof = count == 0;
             }
-            sequence = sequence
-                .checked_add(1)
-                .context("XHTTP upload sequence exhausted")?;
+            // Until a worker is free, keep reading: small writes (acknowledgements of the
+            // download, interactive traffic) then share one request instead of each taking a
+            // whole round trip of a worker. Both branches are cancel-safe.
+            let room = max - body.len();
+            tokio::select! {
+                biased;
+                permit = sender.reserve() => {
+                    let permit = permit.context("XHTTP upload workers stopped")?;
+                    let last = body.is_empty();
+                    permit.send(Packet { sequence, body: std::mem::replace(&mut body, Vec::with_capacity(max)) });
+                    if last {
+                        return anyhow::Ok(());
+                    }
+                    sequence = sequence
+                        .checked_add(1)
+                        .context("XHTTP upload sequence exhausted")?;
+                }
+                count = reader.read(&mut more[..room]), if room > 0 && !eof => {
+                    let count = count?;
+                    body.extend_from_slice(&more[..count]);
+                    eof = count == 0;
+                }
+            }
         }
     };
     let completion = async {

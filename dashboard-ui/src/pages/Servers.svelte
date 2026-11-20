@@ -3,8 +3,8 @@
   import { onDestroy } from "svelte";
   import Icon from "../lib/Icon.svelte";
   import { live } from "../lib/live.svelte.js";
-  import { fleet, refreshFleet } from "../lib/servers.svelte.js";
-  import { createJoinCode, removeServer } from "../lib/api.js";
+  import { fleet, refreshFleet, localName, LOCAL } from "../lib/servers.svelte.js";
+  import { createJoinCode, removeServer, renameServer } from "../lib/api.js";
   import SshAdd from "../lib/SshAdd.svelte";
   import { ask, say } from "../lib/actions.svelte.js";
   import { t, num, pct, duration, clock, rate } from "../lib/i18n.svelte.js";
@@ -60,6 +60,42 @@
       } catch { say(t("slowShort"), true); }
     });
   }
+
+  // Renaming: which card is being renamed, and the text typed so far.
+  let naming = $state(null);
+  let nameText = $state("");
+  let nameBad = $state(false);
+  let saving = $state(false);
+  const NAME_OK = /^[\p{L}\p{N} ()#._-]{0,40}$/u;
+
+  function startRename(id, current) {
+    naming = id;
+    nameText = current;
+    nameBad = false;
+  }
+
+  async function saveName(id, own) {
+    const text = nameText.trim().replace(/\s+/g, " ");
+    if (!NAME_OK.test(text)) return (nameBad = true);
+    saving = true;
+    try {
+      const { status } = await renameServer(id, text === own ? "" : text);
+      if (status === 200) {
+        naming = null;
+        say(text && text !== own ? t("renamedT", text) : t("renameResetT", own));
+        refreshFleet();
+      } else if (status === 400) nameBad = true;
+      else say(t("renameFail"), true);
+    } catch { say(t("slowShort"), true); }
+    finally { saving = false; }
+  }
+
+  function nameKeys(event, id, own) {
+    if (event.key === "Enter") { event.preventDefault(); saveName(id, own); }
+    else if (event.key === "Escape") naming = null;
+  }
+
+  function focus(node) { node.focus(); node.select(); }
 
   function summary(snapshot) {
     const tunnels = snapshot?.tunnels ?? [];
@@ -118,7 +154,12 @@
     <article class="panel tcard" aria-labelledby="srv-local">
       <div class="hd">
         <div class="grow">
-          <div class="title"><h2 id="srv-local" class="ltr">{live.snapshot.host?.hostname}</h2><span class="code-chip">{t("thisServer")}</span></div>
+          {#if naming === LOCAL}
+            {@render nameForm(LOCAL, live.snapshot.host?.hostname ?? "")}
+          {:else}
+            <div class="title"><h2 id="srv-local" class="ltr">{localName(live.snapshot.host?.hostname)}</h2><span class="code-chip">{t("thisServer")}</span>{@render renameButton(LOCAL, localName(live.snapshot.host?.hostname))}</div>
+            {#if fleet.localName}<div class="meta"><span class="ltr">{t("ownName", live.snapshot.host?.hostname ?? "")}</span></div>{/if}
+          {/if}
           <div class="meta"><span class="ltr mono">{live.snapshot.host?.address ?? ""}</span>{#if live.snapshot.host?.address6}<span aria-hidden="true">·</span><span class="ltr mono">{live.snapshot.host.address6}</span>{/if}<span aria-hidden="true">·</span><span class="ltr">{live.snapshot.version}</span></div>
         </div>
         <span class="pill ok">{t("online")}</span>
@@ -133,7 +174,12 @@
     <article class="panel tcard" aria-labelledby="srv-{i}">
       <div class="hd">
         <div class="grow">
-          <div class="title"><h2 id="srv-{i}" class="ltr">{server.name}</h2>{#if server.hello?.arch}<span class="code-chip">{server.hello.arch}</span>{/if}</div>
+          {#if naming === server.id}
+            {@render nameForm(server.id, server.joined_name ?? server.name)}
+          {:else}
+            <div class="title"><h2 id="srv-{i}" class="ltr">{server.name}</h2>{#if server.hello?.arch}<span class="code-chip">{server.hello.arch}</span>{/if}{@render renameButton(server.id, server.name)}</div>
+            {#if server.joined_name && server.joined_name !== server.name}<div class="meta"><span class="ltr">{t("ownName", server.joined_name)}</span></div>{/if}
+          {/if}
           <div class="meta">
             {#if server.snapshot?.host?.address}<span class="ltr mono">{server.snapshot.host.address}</span>{/if}
             {#if server.snapshot?.host?.address6}<span aria-hidden="true">·</span><span class="ltr mono">{server.snapshot.host.address6}</span>{/if}
@@ -163,6 +209,22 @@
 {#if fleet.loaded && fleet.list.length === 0}
   <p class="muted mt16">{t("noServers")}</p>
 {/if}
+
+{#snippet renameButton(id, current)}
+  <button class="btn ghost icon sm rename-btn" onclick={() => startRename(id, current)} title={t("renameSrv")} aria-label={t("renameSrv")}><Icon name="edit" /></button>
+{/snippet}
+
+{#snippet nameForm(id, own)}
+  <form class="rename" onsubmit={(e) => { e.preventDefault(); saveName(id, own); }}>
+    <label class="sr" for="rename-{id}">{t("renameSrv")}</label>
+    <input id="rename-{id}" class="input" maxlength="40" bind:value={nameText} use:focus onkeydown={(e) => nameKeys(e, id, own)} aria-invalid={nameBad} aria-describedby="rename-hint-{id}" placeholder={own} />
+    <div class="row-flex">
+      <button class="btn primary sm" type="submit" disabled={saving} aria-busy={saving}><Icon name="check" />{t("save")}</button>
+      <button class="btn ghost sm" type="button" onclick={() => (naming = null)}>{t("cancel")}</button>
+    </div>
+    <p id="rename-hint-{id}" class="small m0" class:muted={!nameBad} class:bad-text={nameBad}>{nameBad ? t("renameBad") : t("renameHint", own)}</p>
+  </form>
+{/snippet}
 
 {#snippet load(host, key)}
   <div class="srv-load">

@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.12.0 (2026-11-20)
+
+- Added **presets** for every transport: **Balanced** (recommended), **Many users**,
+  **Gaming / low delay**, **Streaming / big downloads** and **Max capacity**. Max capacity sizes
+  its limits to the server's memory and CPU cores instead of fixed caps. A preset shows every
+  value it changes before saving and changes only the settings it manages (sessions, windows,
+  buffers, connection limits, worker threads, keepalive); ports, the traffic limit, the schedule
+  and the traffic shape stay as they are. Choosing another preset puts back what the previous one
+  changed. Available from **Manage tunnels → Apply a preset**, the dashboard's edit screen, and
+  `eztunnel preset FILE [NAME] [--write]`. Set the same preset on both servers.
+  See [docs/configuration.md](docs/configuration.md).
+- The connection pool is now automatic by default: 6 sessions for TCP, HTTP(S), WS(S) and
+  XHTTP(S), 3 for KCP, FEC-UDP and Parallax, 1 for raw carriers and TUN. Under load the pool
+  grows while every session answers and carries 32 or more user connections on average, up to
+  the new `connection_pool_max` (default 16, or 8 for packet carriers) and `max_connections`.
+  Extra sessions close after 3 idle minutes. The peer needs no change. `listeners[]` with
+  `server_dials` also accept `connection_pool_max`. An explicit `connection_pool` keeps its value.
+- Raised the default `stream_window` from 64 to 128 frames (2 MiB in flight per user
+  connection, about 22 MB/s at 90 ms).
+- Changed the default `kcp.mtu` from 1400 to 1350 bytes, the same as `fec.mtu`. Update both
+  ends of a KCP tunnel together, or set `kcp.mtu` on both.
+- XHTTP: each HTTP chunk now goes out in a single write instead of three, and packet-up mode
+  batches small uploads. The bytes on the wire are unchanged.
+- Game mode: game datagrams that cannot be sent are now counted in the status, and the reason is
+  logged at a limited rate.
+- Dashboard: servers can be renamed on the dashboard (display name only; the hostname and tunnels
+  are not touched). Path Finder can cancel a running search and closes its test ports on every
+  server. Connection-test results can be filtered by outcome and transport and searched. The
+  edit screen lists the presets with what each would change.
+- Dashboard: deleting a tunnel on both servers now checks that each end still belongs to the same
+  pair, so a tunnel created again under the same name is left alone. Failed actions now report
+  their cause (unknown tunnel, busy, pair changed, server offline, timed out) with a matching
+  HTTP status, and a tunnel is reported as busy only when another change actually holds it.
+- Dashboard: the Alerts history shows one row per problem per day, with how many times it fired,
+  the longest time it lasted and each occurrence, and lists the last 3 days with older days on
+  request. Dates and times follow the selected language.
+- The installer shows each step, a download progress bar and the installed or updated version,
+  keeps the previous program as a backup, and opens the manager afterwards when run from a
+  terminal (`--no-menu` or `EZTUNNEL_NO_MENU=1` skips it).
+
 ## 0.11.0 (2026-11-18)
 
 - Added **GAME**, a FEC-UDP preset that sends game UDP as authenticated datagrams over multiple

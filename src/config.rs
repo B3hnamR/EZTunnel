@@ -50,6 +50,32 @@ pub enum Transport {
 }
 
 impl Transport {
+    /// Tunnel sessions the dialing side keeps open when `connection_pool` is not set. Several
+    /// sessions spread the users, so one slow or blocked connection does not stall everyone and
+    /// one TCP window does not cap the whole tunnel. Packet carriers already spread their load
+    /// over many packets and need fewer; raw carriers and TUN have exactly one.
+    pub fn auto_pool(self) -> usize {
+        match self {
+            Self::Tcp | Self::Tcp6 | Self::Http | Self::Https | Self::Ws | Self::Wss | Self::Xhttp | Self::Xhttps => 6,
+            Self::Kcp | Self::FecUdp | Self::Parallax => 3,
+            Self::Mirage | Self::FecRaw | Self::FecRawGaming | Self::Tun => 1,
+        }
+    }
+
+    /// How far the pool may grow under load when `connection_pool_max` is not set.
+    pub fn auto_pool_max(self) -> usize {
+        match self {
+            Self::Tcp | Self::Tcp6 | Self::Http | Self::Https | Self::Ws | Self::Wss | Self::Xhttp | Self::Xhttps => 16,
+            Self::Kcp | Self::FecUdp | Self::Parallax => 8,
+            Self::Mirage | Self::FecRaw | Self::FecRawGaming | Self::Tun => 1,
+        }
+    }
+
+    /// One session per peer only: raw packet carriers and TUN.
+    pub fn single_session(self) -> bool {
+        matches!(self, Self::Mirage | Self::FecRaw | Self::FecRawGaming | Self::Tun)
+    }
+
     pub fn uses_tls(self) -> bool {
         matches!(self, Self::Https | Self::Wss | Self::Xhttps)
     }
@@ -252,7 +278,9 @@ pub struct KcpOptions {
 impl Default for KcpOptions {
     fn default() -> Self {
         Self {
-            mtu: 1400,
+            // 1350 like the FEC carriers: a 1400-byte UDP packet plus tunnel and PPPoE or VPN
+            // headers on the way is fragmented or dropped on many routes.
+            mtu: 1350,
             send_window: 1024,
             recv_window: 1024,
             session_expire_sec: 60,
@@ -589,6 +617,7 @@ impl Listener {
             wire: self.wire.clone(),
             server_public_key: String::new(),
             connection_pool: self.connection_pool,
+            connection_pool_max: self.connection_pool_max,
             retry_interval: 1,
             dial_timeout,
             local_address: self.local_address.clone(),
@@ -609,6 +638,7 @@ impl ClientPath {
             ca_file: None,
             server_name: None,
             connection_pool: 1,
+            connection_pool_max: 1,
             xhttp: self.xhttp.clone(),
             fec: self.fec.clone(),
             kcp: self.kcp.clone(),
@@ -656,8 +686,12 @@ pub struct Listener {
     pub ca_file: Option<PathBuf>,
     #[serde(default)]
     pub server_name: Option<String>,
-    #[serde(default = "one")]
+    /// With `server_dials`: sessions this server keeps open (0 = automatic).
+    #[serde(default)]
     pub connection_pool: usize,
+    /// With `server_dials`: most sessions under load (0 = automatic).
+    #[serde(default)]
+    pub connection_pool_max: usize,
     #[serde(default)]
     pub xhttp: XhttpOptions,
     #[serde(default)]
@@ -738,8 +772,13 @@ pub struct ClientPath {
     /// Derived from `tunnel_key` when that is used.
     #[serde(default)]
     pub server_public_key: String,
-    #[serde(default = "one")]
+    /// Sessions kept open; 0 (or absent) = automatic, see `Transport::auto_pool`.
+    #[serde(default)]
     pub connection_pool: usize,
+    /// Most sessions under load (the pool grows when its sessions are busy and shrinks again
+    /// when the extra ones are idle); 0 (or absent) = automatic. Equal to the pool: no growth.
+    #[serde(default)]
+    pub connection_pool_max: usize,
     #[serde(default = "one_u64")]
     pub retry_interval: u64,
     #[serde(default = "ten")]
@@ -934,8 +973,37 @@ fn crypto_one() -> u8 {
     1
 }
 
-fn one() -> usize {
-    1
+/// The sessions to keep and the most under load, for a pool setting pair on `transport`.
+/// `single` is a side that must have exactly one session (raw carrier, TUN, a listening client).
+/// An automatic pool never goes above `share`, this entry's part of `max_connections`.
+pub fn pool_sizes(set: usize, set_max: usize, transport: Transport, single: bool, share: usize) -> (usize, usize) {
+    let pool = match set {
+        0 if single || transport.single_session() => 1,
+        0 => transport.auto_pool().min(share.max(1)),
+        set => set,
+    };
+    let most = match set_max {
+        _ if pool == 1 && (single || transport.single_session()) => 1,
+        0 => pool.max(transport.auto_pool_max()),
+        set => set.max(pool),
+    };
+    (pool, most)
+}
+
+impl Config {
+    /// (sessions kept, most under load) for one of this client's paths.
+    pub fn path_pool(&self, path: &ClientPath) -> (usize, usize) {
+        let share = self.max_connections / self.paths.len().max(1);
+        let single = self.tun.is_some() || self.server_dials || path.raw.is_some();
+        pool_sizes(path.connection_pool, path.connection_pool_max, path.transport, single, share)
+    }
+
+    /// (sessions kept, most under load) for one of this server's listeners when it dials.
+    pub fn listener_pool(&self, listener: &Listener) -> (usize, usize) {
+        let share = self.max_connections / self.listeners.len().max(1);
+        let single = self.tun.is_some() || listener.raw.is_some();
+        pool_sizes(listener.connection_pool, listener.connection_pool_max, listener.transport, single, share)
+    }
 }
 
 fn fragment_is_default(value: &crate::fragment::TlsFragment) -> bool {
@@ -1078,7 +1146,7 @@ fn default_true() -> bool {
 }
 
 fn stream_window() -> usize {
-    64
+    128
 }
 fn connections() -> usize {
     16
@@ -1897,11 +1965,11 @@ impl Config {
             }
             match self.mode {
                 Mode::Server => ensure!(
-                    self.listeners.len() == 1 && self.listeners[0].connection_pool == 1,
+                    self.listeners.len() == 1 && self.listener_pool(&self.listeners[0]).0 == 1,
                     "TUN server requires exactly one listener with connection_pool 1"
                 ),
                 Mode::Client => ensure!(
-                    self.paths.len() == 1 && self.paths[0].connection_pool == 1,
+                    self.paths.len() == 1 && self.path_pool(&self.paths[0]).0 == 1,
                     "TUN client requires exactly one path with connection_pool 1"
                 ),
             }
@@ -1930,7 +1998,7 @@ impl Config {
                     let total = self
                         .listeners
                         .iter()
-                        .try_fold(0usize, |n, l| n.checked_add(l.connection_pool))
+                        .try_fold(0usize, |n, l| n.checked_add(self.listener_pool(l).0))
                         .context("reverse connection pool total overflow")?;
                     ensure!(
                         total <= self.max_connections,
@@ -1955,7 +2023,7 @@ impl Config {
                     )?;
                     if listener.raw.is_some() {
                         ensure!(
-                            listener.connection_pool == 1,
+                            self.listener_pool(listener).0 == 1,
                             "raw carriers require one connection per configured peer"
                         );
                     }
@@ -1971,8 +2039,12 @@ impl Config {
                     listener.tls_fragment.validate()?;
                     validate_tcp_congestion_override(listener.tcp_congestion.as_deref())?;
                     ensure!(
-                        (1..=self.max_connections).contains(&listener.connection_pool),
+                        (1..=self.max_connections).contains(&self.listener_pool(listener).0),
                         "listener connection_pool exceeds max_connections"
+                    );
+                    ensure!(
+                        listener.connection_pool_max <= 1024,
+                        "connection_pool_max must be 0 (automatic) to 1024"
                     );
                     validate_tls_auto(
                         listener.tls_auto,
@@ -2111,7 +2183,7 @@ impl Config {
                     )?;
                     if path.raw.is_some() {
                         ensure!(
-                            path.connection_pool == 1,
+                            self.path_pool(path).0 == 1,
                             "raw carriers require connection_pool 1 per configured peer"
                         );
                     }
@@ -2146,7 +2218,7 @@ impl Config {
                             "a listening client uses cert_file/key_file (or tls_auto) for TLS"
                         );
                         ensure!(
-                            path.connection_pool == 1,
+                            self.path_pool(path).0 == 1,
                             "with server_dials the client listens; the server's connection_pool sets the number of connections, so keep the client's at 1"
                         );
                         if path.transport.uses_tls() {
@@ -2189,8 +2261,12 @@ impl Config {
                     }
                     decode_key(&path.server_public_key).context("invalid server_public_key")?;
                     ensure!(
-                        (1..=1024).contains(&path.connection_pool),
-                        "connection_pool must be 1..1024"
+                        (0..=1024).contains(&path.connection_pool),
+                        "connection_pool must be 0 (automatic) to 1024"
+                    );
+                    ensure!(
+                        path.connection_pool_max <= 1024,
+                        "connection_pool_max must be 0 (automatic) to 1024"
                     );
                     ensure!(
                         (1..=30).contains(&path.retry_interval)
@@ -2202,7 +2278,7 @@ impl Config {
                         "dial_timeout must be 1..300 seconds"
                     );
                     total = total
-                        .checked_add(path.connection_pool)
+                        .checked_add(self.path_pool(path).0)
                         .context("connection pool total overflow")?;
                 }
                 ensure!(
@@ -2488,7 +2564,7 @@ mod tests {
             ),
             // Windows raised from 128 in 0.5.2: 128 packets capped one connection at about
             // 2 MB/s on a 90 ms link.
-            (1400, 1024, 1024, 60)
+            (1350, 1024, 1024, 60)
         );
         assert!(kcp.nodelay && !kcp.congestion_control);
         assert_eq!((kcp.interval_ms, kcp.resend), (10, 2));

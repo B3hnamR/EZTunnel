@@ -37,6 +37,18 @@ enum Command {
     Menu,
     /// Print a fresh tunnel key to share between the two servers.
     Key,
+    /// Show what each preset (balanced, many-users, gaming, streaming, max-capacity) would change
+    /// in a tunnel configuration, or apply one: the result is printed, or saved with --write
+    /// (restart the tunnel afterwards). Set the same preset on both servers of a tunnel.
+    Preset {
+        /// The tunnel's configuration file.
+        config: PathBuf,
+        /// The preset to apply; without it every preset and its changes are listed.
+        preset: Option<String>,
+        /// Save the result in the configuration file instead of printing it.
+        #[arg(long, requires = "preset")]
+        write: bool,
+    },
     /// Show (or with --apply set) kernel network settings that help long-distance tunnels,
     /// such as BBR. --undo restores the previous values.
     Optimize {
@@ -200,6 +212,18 @@ enum FleetCommand {
         #[arg(long, default_value = "local")]
         server: String,
     },
+    /// Preview or apply a 0.12 performance preset on an enrolled server's tunnel.
+    Preset {
+        name: String,
+        #[arg(long, default_value = "local")]
+        server: String,
+        /// Balanced, many-users, gaming, streaming, or max-capacity.
+        #[arg(long)]
+        preset: String,
+        /// Apply the previewed settings; without this, no tunnel changes are made.
+        #[arg(long)]
+        write: bool,
+    },
     /// Apply a Web-compatible JSON changes file, reverting if the service fails.
     Edit {
         name: String,
@@ -228,6 +252,13 @@ enum FleetCommand {
     },
     /// Generate a single-use Agent enrollment code (secret: protect stdout).
     JoinCode,
+    /// Rename an enrolled server in the central dashboard (display only).
+    RenameServer {
+        id: String,
+        /// Display name; an empty value resets to the server's reported name.
+        #[arg(long)]
+        name: String,
+    },
     /// Forget an enrolled Agent without deleting its tunnels.
     RemoveServer {
         id: String,
@@ -703,6 +734,9 @@ async fn run(cli: Cli) -> Result<()> {
                         server,
                         tunnel: name,
                     },
+                    FleetCommand::Preset { name, server, preset, write } => Operation::Preset {
+                        server, tunnel: name, preset, write,
+                    },
                     FleetCommand::Edit {
                         name,
                         server,
@@ -730,6 +764,9 @@ async fn run(cli: Cli) -> Result<()> {
                         confirm,
                     },
                     FleetCommand::JoinCode => Operation::JoinCode,
+                    FleetCommand::RenameServer { id, name } => Operation::RenameServer {
+                        server: id, name,
+                    },
                     FleetCommand::RemoveServer { id, confirm } => Operation::RemoveServer {
                         server: id,
                         confirm,
@@ -1037,6 +1074,33 @@ async fn run(cli: Cli) -> Result<()> {
                     "{}",
                     serde_json::to_string_pretty(&eztunnel::settings::all())?
                 );
+            }
+            Command::Preset { config, preset, write } => {
+                use eztunnel::manager::presets::{self, Capacity, Preset};
+                let text = std::fs::read_to_string(&config).with_context(|| format!("read {}", config.display()))?;
+                let value: serde_json::Value = serde_json::from_str(&text).context("the configuration is not valid JSON")?;
+                let capacity = Capacity::here();
+                match preset {
+                    None => println!("{}", serde_json::to_string_pretty(&presets::listed(&value, capacity))?),
+                    Some(id) => {
+                        let names = Preset::ALL.map(|p| p.id()).join(", ");
+                        let chosen = Preset::from_id(&id).with_context(|| format!("unknown preset {id}; use one of {names}"))?;
+                        let edited = serde_json::to_string_pretty(&presets::apply(&value, chosen, capacity)?)? + "\n";
+                        if write {
+                            let temporary = config.with_extension("preset-new");
+                            std::fs::write(&temporary, &edited).with_context(|| format!("write {}", temporary.display()))?;
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
+                            }
+                            std::fs::rename(&temporary, &config).with_context(|| format!("replace {}", config.display()))?;
+                            eprintln!("{} saved in {}; restart the tunnel to use it", chosen.label(), config.display());
+                        } else {
+                            print!("{edited}");
+                        }
+                    }
+                }
             }
             Command::Token => {
                 println!("{}", eztunnel::config::generate_token()?);

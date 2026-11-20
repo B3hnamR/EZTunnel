@@ -3,13 +3,13 @@
   // server can reach abroad, and which other managed server could relay between them.
   import { untrack } from "svelte";
   import Icon from "./Icon.svelte";
-  import { findPath } from "./api.js";
+  import { findPath, cancelPath } from "./api.js";
   import { live } from "./live.svelte.js";
-  import { fleet, LOCAL } from "./servers.svelte.js";
+  import { fleet, LOCAL, localName } from "./servers.svelte.js";
   import { t, num, list } from "./i18n.svelte.js";
 
   const places = $derived([
-    { id: LOCAL, name: t("thisServerIs", live.snapshot?.host?.hostname ?? ""), address: live.snapshot?.host?.address ?? "", address6: live.snapshot?.host?.address6 ?? "", online: true },
+    { id: LOCAL, name: t("thisServerIs", localName(live.snapshot?.host?.hostname)), address: live.snapshot?.host?.address ?? "", address6: live.snapshot?.host?.address6 ?? "", online: true },
     ...fleet.list.map((s) => ({ id: s.id, name: s.name, address: s.snapshot?.host?.address ?? "", address6: s.snapshot?.host?.address6 ?? "", online: s.online })),
   ]);
   const placeOf = (id) => places.find((p) => p.id === id);
@@ -47,12 +47,28 @@
       // The servers' IPv6 addresses go along: the direct path is tried over IPv6 as well.
       const { status, data } = await findPath({ iran: f.iran, foreign: f.foreign, iran_ip: f.iranIp.trim(), foreign_ip: f.foreignIp.trim(),
         iran_ip6: placeOf(f.iran)?.address6 || undefined, foreign_ip6: placeOf(f.foreign)?.address6 || undefined });
-      if (status === 200) result = data;
+      if (status === 200 && data?.cancelled) problem = t("pfCancelled");
+      else if (status === 200) result = data;
       else problem = data?.detail ?? t("failedShort");
     } catch {
       problem = t("slowShort");
     } finally {
       running = false;
+    }
+  }
+
+  // Cancel stops the search on the dashboard; its answer then comes back as "cancelled".
+  let cancelling = $state(false);
+  async function cancel() {
+    if (cancelling) return;
+    cancelling = true;
+    try {
+      const { status, data } = await cancelPath();
+      if (status !== 200) problem = data?.detail ?? t("failedShort");
+    } catch {
+      problem = t("slowShort");
+    } finally {
+      cancelling = false;
     }
   }
 
@@ -95,6 +111,7 @@
     <button class="btn primary ct-go" onclick={run} disabled={running || !f.iranIp || !f.foreignIp || f.iran === f.foreign} aria-busy={running}>
       <Icon name="route" />{running ? t("pfRunning") : t("pfStart")}
     </button>
+    {#if running}<button class="btn danger" onclick={cancel} disabled={cancelling} aria-busy={cancelling}><Icon name="stop" />{cancelling ? t("pfCancelling") : t("pfCancel")}</button>{/if}
   </div>
 
   {#if result}

@@ -137,3 +137,25 @@ fn non_fleet_parser_errors_stay_human_readable() {
         );
     }
 }
+
+#[test]
+fn upstream_012_preset_and_rename_cli_shapes_reach_dashboard_client() {
+    // A missing state directory is deliberately used: parse must succeed without
+    // installing, logging in, or touching a tunnel.
+    let prefix = ["fleet", "--state-dir", "/nonexistent/eztunnel-fleet-qa-012"];
+    for suffix in [
+        & ["preset", "qa-tunnel", "--server", "local", "--preset", "gaming"][..],
+        & ["preset", "qa-tunnel", "--preset", "balanced", "--write"][..],
+        & ["rename-server", "local", "--name", "New name"][..],
+        & ["rename-server", "local", "--name", ""][..],
+    ] {
+        let args = prefix.iter().copied().chain(suffix.iter().copied()).collect::<Vec<_>>();
+        let output = run(&args);
+        let body: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(output.status.code(), Some(7), "{args:?}: {body}");
+        assert_eq!(body["error"], "dashboard_not_configured", "{args:?}: {body}");
+        assert!(output.stdout.is_empty());
+    }
+    assert_json_input_error(&["fleet", "preset", "qa-tunnel"]);
+    assert_json_input_error(&["fleet", "rename-server", "local"]);
+}

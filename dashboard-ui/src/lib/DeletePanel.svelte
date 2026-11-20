@@ -67,7 +67,7 @@
 
   function failure(status, data) {
     if (status === 401) return t("signedOutNow");
-    if (data?.error === "pair_mismatch") return t("pairChangedT");
+    if (data?.error === "pair_changed") return t("pairChangedT");
     if (status === 409) return t("busyT");
     return data?.detail ?? "";
   }
@@ -96,7 +96,7 @@
           const { status, data } = await deleteTunnel(target.name, target.server, pair);
           if (status !== 200) {
             failed.push(`${target.name}: ${failure(status, data)}`);
-            if (data?.error === "pair_mismatch") {
+            if (data?.error === "pair_changed") {
               // Remaining targets came from the same stale selection; stop here.
               stalePair = true;
               break;

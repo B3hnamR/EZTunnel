@@ -219,13 +219,118 @@ struct SessionWatch {
     /// `true` while the session is suspect.
     suspect: watch::Sender<bool>,
     heard: Arc<std::sync::atomic::AtomicU64>,
+    /// The dialing pool this session belongs to, which counts how busy its sessions are.
+    load: Option<Arc<PoolLoad>>,
+    /// The session itself once it runs (for the idle check of an extra pool session).
+    current: Arc<Mutex<Weak<Session>>>,
 }
 
 impl SessionWatch {
     fn new() -> Self {
+        Self::with(None)
+    }
+
+    fn with(load: Option<Arc<PoolLoad>>) -> Self {
         Self {
             suspect: watch::channel(false).0,
             heard: Arc::new(std::sync::atomic::AtomicU64::new(clock())),
+            load,
+            current: Arc::new(Mutex::new(Weak::new())),
+        }
+    }
+}
+
+/// The sessions one dialing pool has open, to see how busy they are. The dialing side counts
+/// the user connections on its own sessions, so growing the pool needs nothing from the peer.
+#[derive(Default)]
+struct PoolLoad {
+    sessions: Mutex<Vec<Weak<Session>>>,
+}
+
+impl PoolLoad {
+    fn insert(&self, session: &Arc<Session>) {
+        let mut entries = self.sessions.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        entries.retain(|entry| entry.upgrade().is_some_and(|s| s.alive.load(Ordering::Acquire)));
+        entries.push(Arc::downgrade(session));
+    }
+
+    /// (sessions answering now, user connections on them).
+    fn load(&self) -> (usize, usize) {
+        let entries = self.sessions.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut live = 0;
+        let mut streams = 0;
+        for session in entries.iter().filter_map(Weak::upgrade) {
+            if session.alive.load(Ordering::Acquire) && !session.suspect.load(Ordering::Acquire) {
+                live += 1;
+                streams += session.streams.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).len();
+            }
+        }
+        (live, streams)
+    }
+}
+
+/// A pool adds a session when its sessions carry this many user connections each on average.
+const POOL_BUSY_STREAMS: usize = 32;
+/// How often a pool looks at its load.
+const POOL_CHECK: Duration = Duration::from_secs(5);
+/// An extra session with no user connection for this long is closed again.
+const POOL_IDLE: Duration = Duration::from_secs(180);
+/// After an extra session could not be opened (or closed soon), the pool waits this long.
+const POOL_BACKOFF: Duration = Duration::from_secs(60);
+
+/// Grows a dialing pool from `base` up to `most` sessions while its sessions are busy: one more
+/// session per check, only while every session it already has is answering. Extra sessions
+/// close themselves after `POOL_IDLE` without users (see `run_slot`), which shrinks the pool.
+async fn grow_pool<F, Fut>(load: Arc<PoolLoad>, base: usize, most: usize, extra: F) -> Result<()>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+{
+    if most <= base {
+        return std::future::pending().await;
+    }
+    let mut extras: JoinSet<Duration> = JoinSet::new();
+    let mut tick = time::interval(POOL_CHECK);
+    tick.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    let mut calm_until = Instant::now();
+    loop {
+        tick.tick().await;
+        while let Some(done) = extras.try_join_next() {
+            // An extra that could not connect, or ended within a few minutes, pauses growth.
+            if done.is_err() || done.is_ok_and(|lived| lived < POOL_IDLE) {
+                calm_until = Instant::now() + POOL_BACKOFF;
+            }
+        }
+        let (live, streams) = load.load();
+        let total = base + extras.len();
+        if live >= total && total < most && Instant::now() >= calm_until && streams >= live * POOL_BUSY_STREAMS {
+            let session = extra();
+            extras.spawn(async move {
+                let started = Instant::now();
+                if let Err(error) = session.await {
+                    tracing::debug!(%error, "extra tunnel session ended");
+                }
+                started.elapsed()
+            });
+            tracing::info!(sessions = total + 1, users = streams, "tunnel pool grew under load");
+        }
+    }
+}
+
+/// Waits until the session in `current` has had no user connection for `after`.
+async fn idle_for(current: &Mutex<Weak<Session>>, after: Duration) {
+    let mut since = Instant::now();
+    loop {
+        time::sleep(Duration::from_secs(15)).await;
+        let busy = current
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .upgrade()
+            .is_some_and(|session| !session.streams.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_empty());
+        if busy {
+            since = Instant::now();
+        } else if since.elapsed() >= after {
+            return;
         }
     }
 }
@@ -915,14 +1020,24 @@ pub(crate) async fn run_forwarding(config: Config, stats: Arc<Stats>) -> Result<
                     ));
                     continue;
                 }
-                for _ in 0..path.connection_pool {
+                let (base, most) = config.path_pool(path);
+                let most = most.min(config.max_connections);
+                let load = Arc::new(PoolLoad::default());
+                for _ in 0..base {
                     tasks.spawn(client_path(
                         path.clone(),
                         config.clone(),
                         private.clone(),
                         stats.clone(),
+                        load.clone(),
+                        false,
                     ));
                 }
+                let (path, config, private, stats) = (path.clone(), config.clone(), private.clone(), stats.clone());
+                let pool = load.clone();
+                tasks.spawn(grow_pool(load, base, most, move || {
+                    client_path(path.clone(), config.clone(), private.clone(), stats.clone(), pool.clone(), true)
+                }));
             }
         }
     }
@@ -1004,7 +1119,10 @@ async fn server_listener(
     let mut evict_tick = time::interval(EVICT_SLOW_INTERVAL);
     evict_tick.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
     if config.server_dials {
-        for _ in 0..listener.connection_pool {
+        let (base, most) = config.listener_pool(&listener);
+        let most = most.min(config.max_connections);
+        let load = Arc::new(PoolLoad::default());
+        for _ in 0..base {
             connections.spawn(server_reverse_path(
                 listener.clone(),
                 config.clone(),
@@ -1014,8 +1132,16 @@ async fn server_listener(
                 all.clone(),
                 slots.clone(),
                 stats.clone(),
+                load.clone(),
+                false,
             ));
         }
+        let (listener, config, private, allowed, local, all, slots, stats) =
+            (listener.clone(), config.clone(), private.clone(), allowed.clone(), local.clone(), all.clone(), slots.clone(), stats.clone());
+        let pool = load.clone();
+        connections.spawn(grow_pool(load, base, most, move || {
+            server_reverse_path(listener.clone(), config.clone(), private.clone(), allowed.clone(), local.clone(), all.clone(), slots.clone(), stats.clone(), pool.clone(), true)
+        }));
     }
     tracing::info!(address = %listener.addr, "tunnel listener ready");
     loop {
@@ -1080,11 +1206,15 @@ async fn server_reverse_path(
     all: Arc<Pool>,
     slots: Arc<Semaphore>,
     stats: Arc<Stats>,
+    load: Arc<PoolLoad>,
+    extra: bool,
 ) -> Result<()> {
-    let _permit = slots
-        .acquire_owned()
-        .await
-        .context("connection slots closed")?;
+    let _permit = if extra {
+        // An extra session only uses a free slot; it never waits for one.
+        slots.try_acquire_owned().context("no free connection slot")?
+    } else {
+        slots.acquire_owned().await.context("connection slots closed")?
+    };
     let dead = Duration::from_secs(config.dead_timeout_sec);
     let mut retry = RetryPause::new(1, config.timeouts.retry_max_sec, dead);
     loop {
@@ -1123,6 +1253,8 @@ async fn server_reverse_path(
                         )
                     },
                     Duration::from_secs(1),
+                    Some(load.clone()),
+                    extra.then_some(POOL_IDLE),
                 )
                 .await;
                 if let Err(error) = ended {
@@ -1133,6 +1265,9 @@ async fn server_reverse_path(
                 }
             }
             Err(error) => tracing::debug!(%error, "reverse dial failed"),
+        }
+        if extra {
+            return Ok(());
         }
         time::sleep(jitter(retry.next(started.elapsed(), dead))).await;
     }
@@ -1191,6 +1326,8 @@ async fn client_path(
     config: Arc<Config>,
     private: zeroize::Zeroizing<[u8; 32]>,
     stats: Arc<Stats>,
+    load: Arc<PoolLoad>,
+    extra: bool,
 ) -> Result<()> {
     let dead = Duration::from_secs(config.dead_timeout_sec);
     let mut retry = RetryPause::new(
@@ -1218,6 +1355,8 @@ async fn client_path(
                         )
                     },
                     pause,
+                    Some(load.clone()),
+                    extra.then_some(POOL_IDLE),
                 )
                 .await;
                 if let Err(error) = ended {
@@ -1228,6 +1367,10 @@ async fn client_path(
                 }
             }
             Err(error) => tracing::debug!(address = %path.addr, %error, "tunnel connection failed"),
+        }
+        // An extra session of a grown pool is not kept up: the pool opens another when needed.
+        if extra {
+            return Ok(());
         }
         time::sleep(jitter(retry.next(started.elapsed(), dead))).await;
     }
@@ -1245,6 +1388,8 @@ async fn run_slot<D, DF, R, RF>(
     dial: D,
     run: R,
     pause: Duration,
+    load: Option<Arc<PoolLoad>>,
+    idle: Option<Duration>,
 ) -> Result<()>
 where
     D: Fn() -> DF,
@@ -1254,14 +1399,19 @@ where
 {
     let mut connection = first;
     loop {
-        let watch = SessionWatch::new();
+        let watch = SessionWatch::with(load.clone());
         let mut suspect = watch.suspect.subscribe();
         let heard = watch.heard.clone();
+        let current = watch.current.clone();
         let session = run(connection, watch);
         tokio::pin!(session);
         let replacement = loop {
             tokio::select! {
                 result = &mut session => return result,
+                () = async { match idle { Some(after) => idle_for(&current, after).await, None => std::future::pending().await } } => {
+                    tracing::info!("an extra tunnel session had no users; closed it");
+                    return Ok(());
+                }
                 closed = async { suspect.wait_for(|suspect| *suspect).await.is_err() } => {
                     if closed {
                         // The session is ending; its result follows.
@@ -1400,6 +1550,10 @@ async fn session_body(
     stats.sessions.fetch_add(1, Ordering::Relaxed);
     stats.sessions_total.fetch_add(1, Ordering::Relaxed);
     stats.farewell.register(&session.control);
+    if let Some(load) = &watch.load {
+        load.insert(&session);
+    }
+    *watch.current.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::downgrade(&session);
     let _guard = SessionGuard(session.clone());
     let server = pools.is_some();
     let mut unconfirmed = announce;
@@ -2114,8 +2268,10 @@ async fn udp_map(
                                             // Once a direct flow is established, a missing
                                             // path drops UDP rather than recreating the
                                             // target socket under an unrelated mux flow.
-                                            if hub.send(flow,&target,&data).await.unwrap_or(false){stats.bytes_to_peer.fetch_add(data.len() as u64,Ordering::Relaxed);stats.gaming_datagrams.fetch_add(1,Ordering::Relaxed);}
-                                            else{stats.udp_dropped.fetch_add(1,Ordering::Relaxed);}
+                                            match hub.send(flow,&target,&data).await {
+                                                Ok(true)=>{stats.bytes_to_peer.fetch_add(data.len() as u64,Ordering::Relaxed);stats.gaming_datagrams.fetch_add(1,Ordering::Relaxed);}
+                                                failed=>{crate::gaming::send_failed(&failed);stats.udp_dropped.fetch_add(1,Ordering::Relaxed);}
+                                            }
                                             heard=Instant::now();
                                         }
                                         reply=replies.recv()=>{

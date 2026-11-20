@@ -33,6 +33,8 @@
   let lastLimit = "100";
   let customRestart = $state(false);
   let find = $state("");
+  /** The preset whose values were put into the form, until it is saved or discarded. */
+  let chosen = $state(null);
   let draftInput = $state();
 
   const key = $derived(pendingKey(name, server));
@@ -103,7 +105,18 @@
     draftError = "";
     lastAdded = "";
     problem = null;
+    chosen = null;
   }
+
+  /** Puts a preset's values into the form; nothing is saved until Save. */
+  function pickPreset(p) {
+    for (const c of p.changes) form.values[`${c.place}:${c.name}`] = c.to == null ? "" : String(c.to);
+    if (p.pool != null && form.carrier?.pool != null) form.carrier.pool = String(p.pool);
+    chosen = p.id;
+  }
+  const presetName = (p) => t("presetNames")[p.id] ?? p.label;
+  const presetText = (p) => t("presetTexts")[p.id] ?? p.description;
+  const presetCount = (p) => p.changes.length + (p.pool != null && p.pool !== screen?.carrier?.pool ? 1 : 0);
 
   /** Text with Persian or Arabic digits (and separators) written as plain digits. */
   const plain = (text) =>
@@ -366,6 +379,22 @@
       <div class="note bad" role="alert"><Icon name="warn" /><span>{t("editLoadFail")}{#if loadError}{" "}<span class="ltr">{loadError}</span>{/if}</span></div>
     {:else}
       <fieldset disabled={working}>
+        {#if screen.presets?.presets?.length}
+          <section class="ed-sec" aria-labelledby="ed-presets-h">
+            <header><h3 id="ed-presets-h">{t("edPresets")}</h3>{#if chosen}<span class="dot" title={t("changesN", 1)}></span>{/if}</header>
+            <p class="muted small m0">{t("edPresetsHelp", num(screen.presets.capacity.memory_mb), num(screen.presets.capacity.cores))}</p>
+            <div class="preset-grid mt12" role="group" aria-labelledby="ed-presets-h">
+              {#each screen.presets.presets as p (p.id)}
+                <button type="button" class="preset" aria-pressed={chosen === p.id} disabled={Boolean(p.problem)} title={p.problem ?? ""} onclick={() => pickPreset(p)}>
+                  <span class="preset-h"><b>{presetName(p)}</b>{#if p.active}<span class="pill ok">{t("presetInUse")}</span>{/if}</span>
+                  <span class="muted small">{presetText(p)}</span>
+                  <span class="small preset-n">{p.problem ? t("presetNoFit") : p.active ? t("presetSame") : t("presetChanges", num(presetCount(p)))}</span>
+                </button>
+              {/each}
+            </div>
+            {#if chosen}<p class="small m0 mt8 warn-t">{t("presetChosen")}</p>{/if}
+          </section>
+        {/if}
         {#if screen.carrier && (screen.carrier.parallax_mode != null || screen.carrier.pool != null || speedShown || screen.carrier.tls_profile != null || screen.carrier.game)}
           <section class="ed-sec" aria-labelledby="ed-carrier-h">
             <header><h3 id="ed-carrier-h">{t("edCarrier")} <span class="dlg-sub ltr">{screen.carrier.transport}</span></h3>{#if changes.carrier}<span class="dot" title={t("changesN", 1)}></span>{/if}</header>

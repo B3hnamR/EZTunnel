@@ -602,6 +602,30 @@ impl FleetClient {
         .await
     }
 
+    /// Preview or apply one of the server's own 0.12 presets using its current
+    /// hardware-dependent values. Reuses the existing Dashboard edit/undo path.
+    pub async fn preset(&self, server: &str, tunnel: &str, preset: &str, write: bool) -> Result<Value> {
+        let editable = self.settings(server, tunnel).await?;
+        let changes = preset_changes(&editable, preset)?;
+        let preview = json!({
+            "ok": true, "server": server, "tunnel": tunnel, "preset": preset,
+            "capacity": editable["presets"]["capacity"], "changes": changes,
+        });
+        if !write {
+            return Ok(json!({"preview": true, "plan": preview}));
+        }
+        if changes.as_object().is_some_and(|object| object.is_empty()) {
+            return Ok(json!({"ok": true, "preset": preset, "changed": false, "plan": preview}));
+        }
+        let outcome = self.edit(server, tunnel, changes).await?;
+        Ok(json!({"ok": true, "preset": preset, "plan": preview, "result": outcome}))
+    }
+
+    pub async fn rename_server(&self, server: &str, name: &str) -> Result<Value> {
+        self.api_body(Method::POST, &format!("/api/servers/{}/name", segment(server)),
+            Some(json!({"name":name})), Duration::from_secs(25)).await
+    }
+
     pub async fn undo(&self, server: &str, tunnel: &str) -> Result<Value> {
         self.require_online(server).await?;
         self.api_body(
@@ -631,7 +655,7 @@ impl FleetClient {
             .api_body(
                 Method::DELETE,
                 &Self::tunnel_path(server, tunnel),
-                expected_pair.map(|pair| json!({"expect_pair": pair})),
+                expected_pair.map(|pair| json!({"pair": pair})),
                 Duration::from_secs(55),
             )
             .await?;
@@ -918,6 +942,30 @@ fn segment(value: &str) -> String {
     output
 }
 
+/// Convert the official Dashboard preset preview to the same edit patch used by its Web UI.
+/// All numbers and supported settings come from the selected server, not local assumptions.
+fn preset_changes(editable: &Value, id: &str) -> Result<Value> {
+    let options = editable["presets"]["presets"].as_array()
+        .ok_or_else(|| invalid("this Dashboard does not expose performance presets"))?;
+    let selected = options.iter().find(|p| p["id"] == id)
+        .ok_or_else(|| invalid(format!("unknown performance preset {id}")))?;
+    if let Some(problem) = selected["problem"].as_str() {
+        return Err(invalid(format!("preset {id} cannot be applied here: {problem}")));
+    }
+    let mut changes = json!({});
+    if let Some(list) = selected["changes"].as_array() && !list.is_empty() {
+        changes["settings"] = json!(list.iter().map(|c| json!({
+            "name": c["name"], "place": c["place"], "value": c["to"],
+        })).collect::<Vec<_>>());
+    }
+    if let Some(pool) = selected["pool"].as_u64()
+        && editable["carrier"]["pool"].as_u64() != Some(pool)
+    {
+        changes["carrier"] = json!({"pool": pool});
+    }
+    Ok(changes)
+}
+
 pub enum Operation {
     Servers,
     Tunnels {
@@ -946,6 +994,16 @@ pub enum Operation {
     Settings {
         server: String,
         tunnel: String,
+    },
+    Preset {
+        server: String,
+        tunnel: String,
+        preset: String,
+        write: bool,
+    },
+    RenameServer {
+        server: String,
+        name: String,
     },
     Edit {
         server: String,
@@ -1051,6 +1109,8 @@ pub async fn execute(state_dir: &Path, from_stdin: bool, operation: Operation) -
             lines,
         } => client.logs(&server, &tunnel, lines).await,
         Operation::Settings { server, tunnel } => client.settings(&server, &tunnel).await,
+        Operation::Preset { server, tunnel, preset, write } => client.preset(&server, &tunnel, &preset, write).await,
+        Operation::RenameServer { server, name } => client.rename_server(&server, &name).await,
         Operation::Edit { server, tunnel, .. } => {
             client
                 .edit(&server, &tunnel, form.expect("validated changes"))
@@ -1069,7 +1129,7 @@ pub async fn execute(state_dir: &Path, from_stdin: bool, operation: Operation) -
                     Err(error) => Err(error),
                     Ok(group) if expected_pair.as_deref().is_some_and(|p| !p.eq_ignore_ascii_case(&group.pair)) => {
                         Err(FleetError::new(
-                            "pair_mismatch",
+                            "pair_changed",
                             "the selected tunnel has another pair fingerprint",
                         ))
                     }
@@ -1351,6 +1411,9 @@ async fn menu_edit(client: &FleetClient, server: &str, name: &str) -> AnyResult<
         if ports {
             choices.push("Change forwarded ports".into());
         }
+        if editable["presets"]["presets"].as_array().is_some_and(|list| !list.is_empty()) {
+            choices.push("Apply a performance preset".into());
+        }
         choices.push("Apply JSON changes file (all Web options)".into());
         if editable["can_undo"] == true {
             choices.push("Undo previous change".into());
@@ -1462,6 +1525,32 @@ async fn menu_edit(client: &FleetClient, server: &str, name: &str) -> AnyResult<
                 let choices = ["tcp", "udp", "both"].map(str::to_string);
                 let protocol = choices[ui::choose_required("Protocol", &choices, 0)?].clone();
                 json!({"ports":{"text":text,"protocol":protocol}})
+            }
+            "Apply a performance preset" => {
+                let entries = editable["presets"]["presets"].as_array()
+                    .ok_or_else(|| invalid("no presets available"))?;
+                let labels: Vec<String> = entries.iter().map(|p| {
+                    let label = p["label"].as_str().unwrap_or("preset");
+                    if let Some(problem) = p["problem"].as_str() {
+                        format!("{label} (unavailable: {problem})")
+                    } else if p["active"] == true {
+                        format!("{label} (already active)")
+                    } else {
+                        label.to_string()
+                    }
+                }).collect();
+                let index = ui::choose_required("Performance preset", &labels, 0)?;
+                let id = entries[index]["id"].as_str().ok_or_else(|| invalid("preset has no ID"))?;
+                let preview = client.preset(server, name, id, false).await?;
+                ui::info(&serde_json::to_string_pretty(&preview)?);
+                if confirm_action(ui::confirm(
+                    &format!("Apply {id} preset to {name} on {server}?"), false,
+                ))? {
+                    let outcome = client.preset(server, name, id, true).await?;
+                    ui::info(&serde_json::to_string_pretty(&outcome)?);
+                }
+                ui::pause();
+                continue;
             }
             "Apply JSON changes file (all Web options)" => {
                 let path = menu_text("JSON changes file", None)?;
@@ -1643,6 +1732,7 @@ pub async fn menu(state_dir: &Path, from_stdin: bool) -> AnyResult<()> {
                 [
                     "Create paired tunnel",
                     "Generate Agent join code",
+                    "Rename server display name",
                     "Remove enrolled Agent",
                     "Back",
                 ]
@@ -1663,6 +1753,15 @@ pub async fn menu(state_dir: &Path, from_stdin: bool) -> AnyResult<()> {
                             Ok(())
                         }
                         2 => {
+                            let chosen = ui::choose_required("Server to rename", &ids, 0)?;
+                            let id = &ids[chosen];
+                            let name = ui::ask("Display name (empty resets to the server name)", None,
+                                |_: &String| Ok(()))?;
+                            let value = client.rename_server(id, &name).await?;
+                            ui::info(&serde_json::to_string_pretty(&value)?);
+                            Ok(())
+                        }
+                        3 => {
                             let candidates: Vec<String> = ids.iter().skip(1).cloned().collect();
                             if candidates.is_empty() {
                                 ui::warn("No enrolled agents.");
@@ -1786,6 +1885,32 @@ pub async fn menu(state_dir: &Path, from_stdin: bool) -> AnyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fleet_presets_follow_the_upstream_server_preview_and_edit_model() {
+        let form = json!({"name":"preset-qa", "transport":"tcp", "address":"203.0.113.10", "ports":"9392"});
+        let pair = super::super::wizard::build(&form).unwrap();
+        for config in [&pair.iran, &pair.foreign] {
+            let editable = super::super::edit::editable(config).unwrap();
+            let mut checked = 0;
+            for preset in crate::manager::presets::Preset::ALL {
+                let listed = editable["presets"]["presets"].as_array().unwrap();
+                let entry = listed.iter().find(|p| p["id"] == preset.id()).unwrap();
+                if entry["problem"].as_str().is_some() {
+                    assert!(preset_changes(&editable, preset.id()).is_err());
+                    continue;
+                }
+                let changes = preset_changes(&editable, preset.id()).unwrap();
+                let edited = super::super::edit::apply(config, &changes).unwrap();
+                let direct = crate::manager::presets::apply(config, preset,
+                    crate::manager::presets::Capacity::here()).unwrap();
+                assert_eq!(edited, direct, "{} on {}", preset.id(), config["mode"]);
+                checked += 1;
+            }
+            assert!(checked > 0, "each endpoint should offer a supported performance preset");
+            assert!(preset_changes(&editable, "not-a-preset").is_err());
+        }
+    }
 
     #[tokio::test]
     async fn missing_dashboard_reports_configuration_before_prompting_for_password() {
@@ -2134,11 +2259,7 @@ mod tests {
                     Err(error) => json!({
                         "type":"response","id":request["id"],"ok":false,
                         "error": format!("{error:#}"),
-                        "error_code": if error.downcast_ref::<ops::UnknownTunnel>().is_some() {
-                            Some("unknown_tunnel")
-                        } else if error.downcast_ref::<ops::PairMismatch>().is_some() {
-                            Some("pair_mismatch")
-                        } else { None }
+                        "code": ops::code_of(&error)
                     }),
                 } };
                 writer.send(&response).await.unwrap();
@@ -2500,11 +2621,11 @@ mod tests {
             assert_eq!(error.exit_code(), 8, "{action}");
             let attempted = error.as_json()["report"]["attempts"].as_array().unwrap().clone();
             assert!(attempted.iter().any(|entry| entry["server"] == id_b
-                && entry["error"]["error"] == "pair_mismatch"), "{action}: {attempted:?}");
+                && entry["error"]["error"] == "pair_changed"), "{action}: {attempted:?}");
             assert_eq!(demo_b.overrides.lock().unwrap().get("paired-qa").copied(), before,
                 "{action} mutated replacement B");
             let direct_error = client.action_guarded(&id_b, "paired-qa", action, Some(&pair)).await.unwrap_err();
-            assert_eq!(direct_error.code, "pair_mismatch");
+            assert_eq!(direct_error.code, "pair_changed");
             assert_eq!(direct_error.status, Some(409));
             assert_eq!(demo_b.overrides.lock().unwrap().get("paired-qa").copied(), before);
         }
@@ -2527,7 +2648,7 @@ mod tests {
                 .await
                 .unwrap_err()
                 .code,
-            "pair_mismatch"
+            "pair_changed"
         );
         assert_eq!(
             client.status(&id_a, "paired-qa").await.unwrap()["tunnel"]["pair"],

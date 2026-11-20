@@ -70,6 +70,9 @@ sudo eztunnel fleet status TUNNEL --server SERVER_ID
 sudo eztunnel fleet status TUNNEL --server SERVER_ID --live  # control-socket figures
 sudo eztunnel fleet logs TUNNEL --server SERVER_ID --lines 80
 sudo eztunnel fleet settings TUNNEL --server SERVER_ID
+sudo eztunnel fleet preset TUNNEL --server SERVER_ID --preset gaming       # preview
+sudo eztunnel fleet preset TUNNEL --server SERVER_ID --preset gaming --write # apply
+sudo eztunnel fleet rename-server SERVER_ID --name 'Display name'
 sudo eztunnel fleet health --server SERVER_ID
 sudo eztunnel fleet tool TUNNEL pairing --server SERVER_ID --form /root/pairing-options.json
 sudo eztunnel fleet tool TUNNEL speedtest --server SERVER_ID --form /root/speedtest-options.json
@@ -139,8 +142,13 @@ sudo eztunnel fleet delete site-link --server local --both --confirm site-link
 sudo eztunnel fleet delete site-link --server SERVER_ID --expect-pair PAIR_FINGERPRINT --confirm site-link
 ```
 
-`settings` returns editable fields, types, ranges and whether undo is available. Edit and undo
-reuse the existing validate/apply/restart/revert behavior. A plain deletion requires the exact
+`settings` returns editable fields, types, ranges, the 0.12.0 performance presets with their
+server-specific values, and whether undo is available. `fleet preset` previews the current
+server's numeric and connection-pool changes. `--write` applies them through the existing
+Dashboard edit/undo path; without it, no configuration is changed. Apply the same preset
+separately to both tunnel endpoints, using each server's own hardware-dependent values.
+`fleet rename-server` changes only the Dashboard display name (an empty name resets it).
+Edit and undo reuse the existing validate/apply/restart/revert behavior. A plain deletion requires the exact
 name via `--confirm`; `--both` requires **exactly two visible online endpoints** with the same
 pair fingerprint and consistent roles before modifying either endpoint. Paired start, stop,
 restart and delete report results separately for each side. Starting is listener-first; stopping
@@ -201,12 +209,15 @@ local tunnels without the central Agent fleet.
 | Create/pair/start both ends | Yes | Guided + JSON form | `create --form` | Dashboard wizard-supported carriers only |
 | TCP/UDP, TLS/WSS, Parallax, FEC/KCP, IPv6/Game variants | Yes | Wizard options / JSON file | Same wizard JSON | Not a new transport implementation |
 | Edit / undo tunnel configuration | Yes | Fields + JSON changes file | `settings`, `edit`, `undo` | Side-specific settings are edited per endpoint |
+| 0.12.0 performance presets and automatic pool | Yes | Preview/apply inside Edit settings | `preset --preset NAME [--write]` | Server-specific values; apply on each end |
 | Start/stop/restart one or both matched ends | Yes | Yes | `start/stop/restart [--both]` | Both sides online and identified |
 | Delete both ends, with guarded target identity | Yes (manual pair selection) | Yes | `delete --both --confirm` | Pair guard requires updated Agent |
 | Server health, tunnel speed test / quota / pairing | Yes | Health; settings / operations | `health`, `tool` | Detailed diagnostic views remain Web-first |
 | Enroll / forget Agent | Yes | Code / forget | `join-code`, `remove-server` + `agent join` | SSH auto-install remains Web-only |
+| Rename server display name | Yes | Yes | `rename-server ID --name NAME` | Host identity and tunnels unchanged |
 | Restart every tunnel on a selected server | Yes | Yes | `restart-all` | Sequential; affects multiple services |
 | Backups, restores, binary updates, advanced checks, charts and alert configuration | Yes | Local manager / Web | Dashboard and existing local commands | Not exposed as new Fleet shortcuts |
+| Path Finder cancellation, connection-test filtering, Alerts history (0.12) | Yes | Web Dashboard | Web Dashboard | Browser workflows; not duplicated as terminal screens |
 | Local Raw/TUN, Mirage and specialist CDN setup | Local manager where available | Local manager | Existing local commands | The Dashboard wizard cannot create these centrally |
 
 The matrix distinguishes **practical central parity** from engine support. An operation unavailable
