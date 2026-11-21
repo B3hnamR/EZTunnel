@@ -37,6 +37,11 @@ export function transportLabel(id) {
   return (id || "?").toUpperCase();
 }
 
+/** The transport a tunnel uses now: for a running failover tunnel, the carrier in use. */
+export function shownTransport(x) {
+  return x?.failover?.carrier?.split(" ")[0] || x?.transport;
+}
+
 export function isUp(x) {
   return x.state === "running" || x.state === "starting";
 }
@@ -62,6 +67,8 @@ export function usedPorts(snapshots) {
       }
       // "listen :7000" or "203.0.113.10:2083": the tunnel port.
       for (const n of String(x.link ?? "").match(/:(\d+)/)?.slice(1) ?? []) used.add(+n);
+      // A failover tunnel's other carriers ("wss 0.0.0.0:8443").
+      for (const c of x.failover?.carriers ?? []) for (const n of String(c.carrier ?? "").match(/:(\d+)$/)?.slice(1) ?? []) used.add(+n);
     }
   }
   return used;

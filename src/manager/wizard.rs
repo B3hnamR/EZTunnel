@@ -37,11 +37,31 @@ fn is_ipv6_row(label: &str) -> bool {
     label == IPV6_LABEL
 }
 
+/// The transport list's failover entry: a main transport and 1 to 3 backups behind the same
+/// user ports. It asks for the main transport next and the backups after the forwarded ports.
+const FAILOVER_LABEL: &str =
+    "Failover   2 to 4 transports on the same ports; if one stops working, users move to the next";
+
+fn is_failover_row(label: &str) -> bool {
+    label == FAILOVER_LABEL
+}
+
+/// What a failover tunnel can use: the plain carriers (no raw, TUN, Mirage, IPv6 or GAME entry).
+fn failover_transports() -> Vec<(Transport, &'static str)> {
+    transports()
+        .into_iter()
+        .filter(|(transport, label)| {
+            !is_ipv6_row(label) && !is_game_row(label) && !is_failover_row(label) && !is_raw(*transport)
+                && *transport != Transport::Tun && *transport != Transport::Mirage
+        })
+        .collect()
+}
+
 /// What can run over IPv6: every transport of the list except the raw ones (IPv4 by design).
 fn ipv6_transports() -> Vec<(Transport, &'static str)> {
     transports()
         .into_iter()
-        .filter(|(transport, label)| !is_ipv6_row(label) && !is_raw(*transport) && *transport != Transport::Tun)
+        .filter(|(transport, label)| !is_ipv6_row(label) && !is_failover_row(label) && !is_raw(*transport) && *transport != Transport::Tun)
         .collect()
 }
 
@@ -90,6 +110,7 @@ fn transports() -> Vec<(Transport, &'static str)> {
             Transport::Tun,
             "RAW-TUN    raw IP packets for a TUN tunnel (advanced)",
         ),
+        (Transport::Tcp, FAILOVER_LABEL),
         (
             Transport::FecUdp,
             GAME_LABEL,
@@ -106,7 +127,7 @@ fn transports() -> Vec<(Transport, &'static str)> {
 }
 
 fn transport_label(transport: Transport, label: &str) -> String {
-    if is_game_row(label) {
+    if is_game_row(label) || is_failover_row(label) {
         return console::style(label).for_stderr().green().bold().to_string();
     }
     match transport {
@@ -145,6 +166,20 @@ fn the_game_entry_is_fec_udp_and_listed_once() {
     assert!(list.iter().any(|(t, label)| *t == Transport::FecUdp && !is_game_row(label)));
     // FEC-RAW with the gaming profile replaces the old low-delay raw entry.
     assert!(!list.iter().any(|(t, _)| *t == Transport::FecRawGaming));
+}
+
+#[cfg(test)]
+#[test]
+fn the_failover_entry_is_listed_once_and_offers_only_plain_carriers() {
+    let list = transports();
+    assert_eq!(list.iter().filter(|(_, label)| is_failover_row(label)).count(), 1);
+    let carriers = failover_transports();
+    assert!(carriers.iter().all(|(t, label)| !is_raw(*t) && *t != Transport::Tun && *t != Transport::Mirage
+        && !is_game_row(label) && !is_ipv6_row(label) && !is_failover_row(label)));
+    for wanted in [Transport::Tcp, Transport::Wss, Transport::Xhttps, Transport::Kcp, Transport::FecUdp] {
+        assert!(carriers.iter().any(|(t, _)| *t == wanted), "{wanted:?}");
+    }
+    assert!(!ipv6_transports().iter().any(|(_, label)| is_failover_row(label)), "not an IPv6 carrier");
 }
 
 #[cfg(test)]
@@ -188,6 +223,7 @@ pub fn new_tunnel_with(store: &Store, prefill: Option<Prefill>) -> Result<Option
     loop {
         // The GAME entry of the transport list (a transport check's prefill is never it).
         let mut chosen_game = false;
+        let mut chosen_failover = false;
         let mut chosen_ipv6 = prefill.as_ref().is_some_and(|p| p.ipv6);
         ui::banner("New tunnel");
         let (side, direction, transport) = match &prefill {
@@ -204,9 +240,10 @@ pub fn new_tunnel_with(store: &Store, prefill: Option<Prefill>) -> Result<Option
                 (prefill.side, prefill.direction, prefill.transport)
             }
             None => match first_questions(store, previous)? {
-                First::Answers(side, direction, transport, game, ipv6) => {
+                First::Answers(side, direction, transport, game, ipv6, failover) => {
                     chosen_game = game;
                     chosen_ipv6 = ipv6;
+                    chosen_failover = failover;
                     (side, direction, transport)
                 }
                 First::Pairing(result) => return Ok(result),
@@ -216,7 +253,7 @@ pub fn new_tunnel_with(store: &Store, prefill: Option<Prefill>) -> Result<Option
         if prefill.is_some() && transport == Transport::Mirage && !super::mirage::consent()? {
             return Ok(None);
         }
-        match finish_wizard(store, side, direction, transport, prefill.clone(), chosen_game, chosen_ipv6) {
+        match finish_wizard(store, side, direction, transport, prefill.clone(), chosen_game, chosen_ipv6, chosen_failover) {
             Err(error) if ui::is_back(&error) => {
                 previous = Some((side, direction, transport));
                 prefill = None;
@@ -228,8 +265,9 @@ pub fn new_tunnel_with(store: &Store, prefill: Option<Prefill>) -> Result<Option
 }
 
 enum First {
-    /// The last values: the GAME entry was chosen; the servers talk over IPv6.
-    Answers(Side, Direction, Transport, bool, bool),
+    /// The last values: the GAME entry was chosen; the servers talk over IPv6; the failover
+    /// entry was chosen (the transport is then the main one).
+    Answers(Side, Direction, Transport, bool, bool, bool),
     Pairing(Option<String>),
     Cancelled,
 }
@@ -355,7 +393,18 @@ fn first_questions(store: &Store, previous: Option<(Side, Direction, Transport)>
                 continue;
             };
             let (transport, label) = carriers[pick];
-            return Ok(First::Answers(side, direction, transport, is_game_row(label), true));
+            return Ok(First::Answers(side, direction, transport, is_game_row(label), true, false));
+        }
+        if is_failover_row(list[choice].1) {
+            ui::note(
+                "Failover: one tunnel with a main transport and 1 to 3 backups, all on the same user ports.\nAll of them stay connected; if the main one goes down or works badly, new users move to the\nnext one, and back once the main one has worked for 5 minutes. Choose the main transport first;\nthe backups come after the forwarded ports.",
+            );
+            let carriers = failover_transports();
+            let labels: Vec<String> = carriers.iter().map(|(transport, label)| transport_label(*transport, label)).collect();
+            let Some(pick) = ui::choose("Main transport", &labels, 0)? else {
+                continue;
+            };
+            return Ok(First::Answers(side, direction, carriers[pick].0, false, false, true));
         }
         let transport = list[choice].0;
         let game = is_game_row(list[choice].1);
@@ -375,7 +424,7 @@ fn first_questions(store: &Store, previous: Option<(Side, Direction, Transport)>
             );
             ui::warn("They need root rights and the real IPv4 address of each server.");
         }
-        return Ok(First::Answers(side, direction, transport, game, false));
+        return Ok(First::Answers(side, direction, transport, game, false, false));
     }
 }
 
@@ -388,6 +437,7 @@ fn finish_wizard(
     prefill: Option<Prefill>,
     game: bool,
     ipv6: bool,
+    failover: bool,
 ) -> Result<Option<String>> {
     // 4. Shared tunnel key, with pairing-code import available from the first page.
     let (key, created_key) = {
@@ -488,6 +538,18 @@ fn finish_wizard(
                 if tun.forwarding_port.is_some() {
                     tun.forwarding_port = Some(free_forwarding_port(store));
                 }
+            }
+        }
+
+        // Failover: the backup carriers behind the same user ports.
+        if failover {
+            match failover_backups(&mut plan) {
+                Ok(()) => {}
+                Err(error) if ui::is_back(&error) => {
+                    page = 1;
+                    continue;
+                }
+                Err(error) => return Err(error),
             }
         }
 
@@ -661,20 +723,7 @@ fn import_pairing(store: &Store) -> Result<Option<String>> {
         if plan.carry == Carry::Socks {
             match plan.side {
                 Side::Iran => {
-                    plan.socks_bind =
-                        ui::ask("SOCKS5 address", Some("127.0.0.1:1080"), |text: &String| {
-                            text.parse::<std::net::SocketAddr>()
-                                .map(|_| ())
-                                .map_err(|_| "use IP:port, for example 127.0.0.1:1080".to_string())
-                        })?;
-                    if let Ok(bind) = plan.socks_bind.parse::<std::net::SocketAddr>()
-                        && service::port_busy(bind.port(), "tcp")
-                    {
-                        ui::warn(&format!(
-                            "Port {} is already in use on this server; the tunnel cannot use it until it is free.",
-                            bind.port()
-                        ));
-                    }
+                    plan.socks_bind = ask_socks_bind()?;
                 }
                 Side::Foreign => {
                     // Otherwise it keeps the plan's port-forwarding default (127.0.0.1 only), which
@@ -1161,33 +1210,47 @@ fn carry(plan: &mut Plan) -> Result<bool> {
                 // The tunnel's own port cannot also be a forwarded port on a listening server.
                 let reserved = (!plan.dials() && !super::plan::uses_udp(plan.transport))
                     .then_some(plan.tunnel_port);
-                let text = ui::ask("Ports to forward", Some("443"), |text: &String| {
-                    let rules = parse_ports(text).map_err(|e| e.to_string())?;
-                    match reserved {
-                        Some(port) if rules.iter().any(|r| r.listen == port) => Err(format!(
-                            "port {port} is the tunnel port; choose other ports"
-                        )),
-                        _ => Ok(()),
-                    }
-                })?;
-                plan.ports = parse_ports(&text)?;
-                let protocols = [Protocol::Tcp, Protocol::Udp, Protocol::Both];
-                let labels: Vec<String> = protocols.iter().map(|p| p.label().to_string()).collect();
-                plan.protocol = protocols[ui::choose_required("Protocol", &labels, protocols.iter().position(|p| *p == plan.protocol).unwrap_or(0))?];
-                for rule in &plan.ports {
-                    let busy = match plan.protocol {
-                        Protocol::Udp => service::port_busy(rule.listen, "udp"),
-                        Protocol::Tcp => service::port_busy(rule.listen, "tcp"),
-                        Protocol::Both => {
-                            service::port_busy(rule.listen, "tcp")
-                                || service::port_busy(rule.listen, "udp")
+                let mut suggested = "443".to_string();
+                loop {
+                    let text = ui::ask("Ports to forward", Some(&suggested), |text: &String| {
+                        let rules = parse_ports(text).map_err(|e| e.to_string())?;
+                        match reserved {
+                            Some(port) if rules.iter().any(|r| r.listen == port) => Err(format!(
+                                "port {port} is the tunnel port; choose other ports"
+                            )),
+                            _ => Ok(()),
                         }
+                    })?;
+                    plan.ports = parse_ports(&text)?;
+                    let protocols = [Protocol::Tcp, Protocol::Udp, Protocol::Both];
+                    let labels: Vec<String> = protocols.iter().map(|p| p.label().to_string()).collect();
+                    plan.protocol = protocols[ui::choose_required("Protocol", &labels, protocols.iter().position(|p| *p == plan.protocol).unwrap_or(0))?];
+                    let words: &[&str] = match plan.protocol {
+                        Protocol::Udp => &["udp"],
+                        Protocol::Tcp => &["tcp"],
+                        Protocol::Both => &["tcp", "udp"],
                     };
-                    if busy {
-                        ui::warn(&format!(
-                            "Port {} is already in use on this server; the tunnel cannot use it until it is free.",
-                            rule.listen
-                        ));
+                    let busy = |port: u16| words.iter().any(|protocol| service::port_busy(port, protocol));
+                    let taken: Vec<u16> = plan.ports.iter().map(|rule| rule.listen).filter(|port| busy(*port)).collect();
+                    if taken.is_empty() {
+                        break;
+                    }
+                    let list: Vec<String> = taken.iter().map(u16::to_string).collect();
+                    ui::warn(&format!(
+                        "Already in use on this server: {}. The tunnel cannot use a port another program holds.",
+                        list.join(", ")
+                    ));
+                    // The same rules with every taken port moved to the next free one.
+                    let mut moved = plan.ports.clone();
+                    let mut used: Vec<u16> = moved.iter().map(|rule| rule.listen).collect();
+                    for rule in moved.iter_mut().filter(|rule| taken.contains(&rule.listen)) {
+                        let free = next_free_port(rule.listen, &|port| busy(port) || used.contains(&port) || Some(port) == reserved);
+                        used.push(free);
+                        rule.listen = free;
+                    }
+                    suggested = format_ports(&moved);
+                    if !ui::confirm("Choose other ports? (the suggestion uses free ones)", true)? {
+                        break;
                     }
                 }
             }
@@ -1195,20 +1258,7 @@ fn carry(plan: &mut Plan) -> Result<bool> {
                 ui::note(
                     "The proxy has no password. 127.0.0.1 keeps it on this server only;\n0.0.0.0 opens it to everyone (protect it with a firewall).",
                 );
-                plan.socks_bind =
-                    ui::ask("SOCKS5 address", Some("127.0.0.1:1080"), |text: &String| {
-                        text.parse::<std::net::SocketAddr>()
-                            .map(|_| ())
-                            .map_err(|_| "use IP:port, for example 127.0.0.1:1080".to_string())
-                    })?;
-                if let Ok(bind) = plan.socks_bind.parse::<std::net::SocketAddr>()
-                    && service::port_busy(bind.port(), "tcp")
-                {
-                    ui::warn(&format!(
-                        "Port {} is already in use on this server; the tunnel cannot use it until it is free.",
-                        bind.port()
-                    ));
-                }
+                plan.socks_bind = ask_socks_bind()?;
             }
             Carry::Tun => {}
         },
@@ -1302,6 +1352,73 @@ fn check_host(text: &str, transport: Transport) -> std::result::Result<(), Strin
     }
 }
 
+/// Most backup carriers the manager offers after the main one.
+const FAILOVER_BACKUPS: usize = 3;
+
+/// Asks whether the tunnel should have backup carriers (failover), and which, in order.
+fn failover_backups(plan: &mut Plan) -> Result<()> {
+    ui::heading("Failover · backup transports", "in the order they take over");
+    ui::note(
+        "Both servers need the same backups in the same order; the pairing code carries them.\nOpen each backup's tunnel port on the listening server's firewall too.",
+    );
+    plan.backups.clear();
+    let mut offered: Vec<Transport> = Vec::new();
+    for (transport, _) in failover_transports() {
+        if !offered.contains(&transport) {
+            offered.push(transport);
+        }
+    }
+    while plan.backups.len() < FAILOVER_BACKUPS {
+        let available: Vec<Transport> = offered
+            .iter()
+            .copied()
+            .filter(|t| *t != plan.transport && !plan.backups.iter().any(|(b, _)| b == t))
+            .collect();
+        let described = failover_transports();
+        let mut labels: Vec<String> = available
+            .iter()
+            .map(|t| described.iter().find(|(d, _)| d == t).map_or_else(|| transport_name(*t).to_uppercase(), |(_, label)| label.to_string()))
+            .collect();
+        if !plan.backups.is_empty() {
+            labels.push(format!("{}  {}", ui::bold("No more backups"), ui::dim("continue with these")));
+        }
+        let pick = ui::choose_required(&format!("Backup transport {}", plan.backups.len() + 1), &labels, 0)?;
+        if pick >= available.len() {
+            break;
+        }
+        let transport = available[pick];
+        let listens = !plan.dials();
+        let protocol = if super::plan::uses_udp(transport) { "udp" } else { "tcp" };
+        let clashes = |port: u16| {
+            port == plan.tunnel_port
+                || plan.backups.iter().any(|(_, used)| *used == port)
+                || plan.ports.iter().any(|rule| rule.listen == port)
+                || (listens && service::port_busy(port, protocol))
+        };
+        let default = next_free_port(super::plan::default_tunnel_port(transport), &clashes);
+        let prompt = format!("Tunnel port for {} (same on both servers)", transport_name(transport).to_uppercase());
+        let port = loop {
+            let port = if plan.dials() {
+                ask_port(&prompt, default)?
+            } else {
+                ask_free_port(&prompt, default, &[if super::plan::uses_udp(transport) { "udp" } else { "tcp" }])?
+            };
+            if port == plan.tunnel_port || plan.backups.iter().any(|(_, used)| *used == port) || plan.ports.iter().any(|rule| rule.listen == port) {
+                ui::warn("Each transport needs its own tunnel port, apart from the forwarded ports.");
+                continue;
+            }
+            break port;
+        };
+        plan.backups.push((transport, port));
+    }
+    let order: Vec<String> = std::iter::once((plan.transport, plan.tunnel_port))
+        .chain(plan.backups.iter().copied())
+        .map(|(t, p)| format!("{} :{p}", transport_name(t).to_uppercase()))
+        .collect();
+    ui::ok(&format!("Failover order: {}", order.join("  >  ")));
+    Ok(())
+}
+
 fn ask_port(prompt: &str, default: u16) -> Result<u16> {
     let text = ui::ask(
         prompt,
@@ -1316,18 +1433,63 @@ fn ask_port(prompt: &str, default: u16) -> Result<u16> {
 
 /// Like `ask_port`, but warns and asks again (offering what was just entered as the new default)
 /// for as long as the answer is already in use for any of `protocols` ("tcp", "udp", or both).
-fn ask_free_port(prompt: &str, mut default: u16, protocols: &[&str]) -> Result<u16> {
+/// The suggestion is always a free port: when the usual one is taken, the next free one after it
+/// is offered (and said so), so pressing Enter just works.
+fn ask_free_port(prompt: &str, default: u16, protocols: &[&str]) -> Result<u16> {
+    let busy = |port: u16| protocols.iter().any(|protocol| service::port_busy(port, protocol));
+    let mut default = next_free_port(default, &busy);
     loop {
         let port = ask_port(prompt, default)?;
-        if !protocols
-            .iter()
-            .any(|protocol| service::port_busy(port, protocol))
-        {
+        if !busy(port) {
             return Ok(port);
         }
-        ui::warn(&format!("Port {port} is already in use on this server."));
-        default = port;
+        default = next_free_port(port, &busy);
+        ui::warn(&format!("Port {port} is already in use on this server; {default} is free."));
     }
+}
+
+/// The SOCKS5 address, suggested on a free port (1080, or the next free one) and asked again
+/// while the port typed is taken by another program.
+fn ask_socks_bind() -> Result<String> {
+    let busy = |port: u16| service::port_busy(port, "tcp");
+    let mut suggested = format!("127.0.0.1:{}", next_free_port(1080, &busy));
+    loop {
+        let text = ui::ask("SOCKS5 address", Some(&suggested), |text: &String| {
+            text.parse::<std::net::SocketAddr>()
+                .map(|_| ())
+                .map_err(|_| "use IP:port, for example 127.0.0.1:1080".to_string())
+        })?;
+        let bind: std::net::SocketAddr = text.parse()?;
+        if !busy(bind.port()) {
+            return Ok(text);
+        }
+        let free = next_free_port(bind.port(), &busy);
+        ui::warn(&format!("Port {} is already in use on this server; {free} is free.", bind.port()));
+        suggested = std::net::SocketAddr::new(bind.ip(), free).to_string();
+    }
+}
+
+/// `port` when it is free, otherwise the first free one after it (wrapping to 1024).
+fn next_free_port(port: u16, busy: &dyn Fn(u16) -> bool) -> u16 {
+    let mut candidate = port.max(1);
+    for _ in 0..2000 {
+        if !busy(candidate) {
+            return candidate;
+        }
+        candidate = if candidate == u16::MAX { 1024 } else { candidate + 1 };
+    }
+    port
+}
+
+#[cfg(test)]
+#[test]
+fn a_taken_port_is_replaced_by_the_next_free_one() {
+    let taken = [7000u16, 7001, 7003];
+    let busy = |port: u16| taken.contains(&port);
+    assert_eq!(next_free_port(7000, &busy), 7002);
+    assert_eq!(next_free_port(7002, &busy), 7002);
+    assert_eq!(next_free_port(7003, &busy), 7004);
+    assert_eq!(next_free_port(u16::MAX, &|port| port == u16::MAX), 1024);
 }
 
 fn suggest_name(store: &Store, plan: &Plan) -> String {
@@ -1392,6 +1554,10 @@ pub fn summary_lines(plan: &Plan) -> Vec<String> {
         format!("waits for the {other} on port {}", plan.tunnel_port)
     };
     lines.push(format!("{}  {link}", ui::dim("Connection   ")));
+    if !plan.backups.is_empty() {
+        let backups: Vec<String> = plan.backups.iter().map(|(t, p)| format!("{} :{p}", transport_name(*t))).collect();
+        lines.push(format!("{}  backups in order: {}", ui::dim("Failover     "), backups.join(" > ")));
+    }
     if let Some(mirage) = plan.raw.as_ref().and_then(|raw| raw.mirage.as_ref()) {
         lines.push(format!(
             "Mirage source {} -> destination {} (experimental)",

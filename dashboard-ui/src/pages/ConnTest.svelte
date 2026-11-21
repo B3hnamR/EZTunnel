@@ -299,6 +299,30 @@
     }
     creating = true;
   }
+  // A failover tunnel from the results: the best transports that worked in the same direction,
+  // each once and on the port it was tested with, best first (2 to 3 of them).
+  const failoverPick = $derived.by(() => {
+    const first = best[0];
+    if (!first || first.spec.ipv6 || running) return [];
+    const candidates = [...best, ...rows.filter(usable).sort((a, b) => (speedOf(b.download) ?? 0) - (speedOf(a.download) ?? 0))];
+    const picked = [];
+    for (const r of candidates) {
+      if (picked.length === 3) break;
+      if (!canCreate(r) || r.spec.ipv6 || r.spec.dialer !== first.spec.dialer || (r.spec.variant ?? "plain") === "game") continue;
+      if (picked.some((p) => p.spec.transport === r.spec.transport || (r.port && p.port === r.port))) continue;
+      picked.push(r);
+    }
+    return picked.length >= 2 ? picked : [];
+  });
+  function createFailover() {
+    const first = failoverPick[0];
+    createFrom(first);
+    prefill = {
+      iran: prefill.iran, foreign: prefill.foreign, direction: prefill.direction, address: prefill.address,
+      mode: "failover",
+      carriers: failoverPick.map((r) => ({ transport: r.spec.transport, port: r.port ? String(r.port) : "", touched: Boolean(r.port) })),
+    };
+  }
   const usable = (r) => ["works", "reachable", "slow", "unstable"].includes(r.verdict);
   // Every option a case tests can be set from the dashboard, except the raw TUN fragmentation.
   const canCreate = (r) => creatable.includes(r.spec.transport) && r.spec.variant !== "fragment" && usable(r);
@@ -454,6 +478,12 @@
         </div>
         {#if canCreate(best[0])}<button class="btn primary" onclick={() => createFrom(best[0])}><Icon name="plus" />{t("ctCreate")}</button>{/if}
       </div>
+      {#if failoverPick.length}
+        <div class="row-flex mb16 ct-tunebest">
+          <button class="btn" onclick={createFailover}><Icon name="plus" />{t("ctFailover", list(failoverPick.map((r) => transportLabel(r.spec.transport))))}</button>
+          <span class="muted small">{t("ctFailoverHelp")}</span>
+        </div>
+      {/if}
       {#if terminalOnly(best[0])}<p class="muted small mt-n8 mb16">{t("ctTerminalOnly", name(best[0]))}</p>{/if}
       {#if state?.mode !== "tune" && state?.tune_best?.length}
         <div class="row-flex mb16 ct-tunebest">

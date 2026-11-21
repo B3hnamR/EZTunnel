@@ -187,6 +187,12 @@ fn admit_channel(channels:&mut HashMap<[u8;16],Arc<Channel>>,peer:[u8;32]) {
 struct Flow {
     generation:u64,replay:Replay,touched:Instant,target:String,
     address:SocketAddr,
+    /// The channel this flow's latest datagram came in on. Its replies may go back on it even
+    /// before this side's own challenge on it is answered: the datagram was authenticated and
+    /// came from the peer's negotiated address. Without it, the first replies after a new
+    /// channel (start, renewal, the peer moving to a new port) were dropped, or sent to the
+    /// peer's old address on an older channel.
+    channel:Arc<Channel>,
     instance:[u8;16],
     sender:mpsc::Sender<Queued>,
 }
@@ -467,14 +473,14 @@ impl Hub {
             ensure!(channel.address==entry.address||channel.migrate,"gaming migration not mutually enabled");
             ensure!(entry.replay.commit(sequence),"duplicate migrated gaming datagram");
             if generation>entry.generation {crate::transport_metrics::GAMING_MIGRATIONS.fetch_add(1,std::sync::atomic::Ordering::Relaxed);}
-            entry.generation=generation;entry.address=channel.address;entry.touched=Instant::now();let _=entry.sender.try_send(Queued{bytes:payload,_permit:permit});return Ok(());
+            entry.generation=generation;entry.address=channel.address;entry.channel=channel.clone();entry.touched=Instant::now();let _=entry.sender.try_send(Queued{bytes:payload,_permit:permit});return Ok(());
         }
         ensure!(flows.len()<self.options.max_flows,"gaming target flow limit");
         // Target validation precedes socket creation; bounded DNS/connect outside
         // the packet receiver lock is handled by the owned per-flow task.
         let(tx,mut rx)=mpsc::channel::<Queued>(QUEUE);let mut replay=Replay::default();replay.commit(sequence);
         let instance=random()?;
-        flows.insert(key,Flow{generation,replay,touched:Instant::now(),target:target.clone(),address:channel.address,instance,sender:tx.clone()});drop(flows);
+        flows.insert(key,Flow{generation,replay,touched:Instant::now(),target:target.clone(),address:channel.address,channel:channel.clone(),instance,sender:tx.clone()});drop(flows);
         tx.try_send(Queued{bytes:payload,_permit:permit}).map_err(|_|anyhow::anyhow!("gaming initial queue"))?;
         let weak=Arc::downgrade(self);let peer=channel.peer;
         let task=tokio::spawn(async move {
@@ -489,8 +495,18 @@ impl Hub {
                     tokio::select! {
                         packet=rx.recv()=>{let Some(packet)=packet else{break;};socket.send(&packet.bytes).await?;}
                         result=socket.recv(&mut bytes)=>{
-                            let size=result?;let Some(hub)=weak.upgrade()else{break;};let Some(channel)=hub.latest(Some(peer)).await else{continue;};
-                            let generation={let mut flows=hub.flows.lock().await;let Some(entry)=flows.get_mut(&key).filter(|entry|entry.instance==instance)else{break;};entry.touched=Instant::now();entry.generation};
+                            let size=result?;let Some(hub)=weak.upgrade()else{break;};
+                            let(generation,inbound)={let mut flows=hub.flows.lock().await;let Some(entry)=flows.get_mut(&key).filter(|entry|entry.instance==instance)else{break;};entry.touched=Instant::now();(entry.generation,entry.channel.clone())};
+                            // The newest of: a ready channel to the peer, and the one its last
+                            // datagram came in on (still in use and not expired).
+                            let inbound_id=inbound.codec.lock().await.id;
+                            let inbound=(inbound.created.elapsed()<Duration::from_secs(350)&&hub.channels.lock().await.contains_key(&inbound_id)).then_some(inbound);
+                            let channel=match(hub.latest(Some(peer)).await,inbound){
+                                (Some(ready),Some(inbound)) if inbound.generation>ready.generation=>inbound,
+                                (Some(ready),_)=>ready,
+                                (None,Some(inbound))=>inbound,
+                                (None,None)=>continue,
+                            };
                             let message=Message::Data{flow,generation,sequence:hub.sequence.fetch_add(1,std::sync::atomic::Ordering::Relaxed),target:String::new(),payload:bytes[..size].to_vec()};
                             let _=hub.transmit(&channel,&message).await;
                         }

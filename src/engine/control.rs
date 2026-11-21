@@ -231,7 +231,7 @@ fn status(stats: &Stats, server: bool) -> Value {
         .into_iter()
         .map(|micros| micros as f64 / 1000.0)
         .collect();
-    json!({
+    let mut answer = json!({
         "ok": true,
         "version": env!("CARGO_PKG_VERSION"),
         "role": if server { "server" } else { "client" },
@@ -255,7 +255,11 @@ fn status(stats: &Stats, server: bool) -> Value {
         "transport_extensions":crate::transport_metrics::snapshot(),
         "gaming_ready": stats.gaming_ready.load(Relaxed),
         "gaming_datagrams": stats.gaming_datagrams.load(Relaxed),
-    })
+    });
+    if let Some(failover) = stats.failover() {
+        answer["failover"] = failover;
+    }
+    answer
 }
 
 /// Tells a client that all places are taken. The request it already sent is read (and thrown away)

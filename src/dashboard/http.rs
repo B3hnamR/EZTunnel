@@ -2208,7 +2208,7 @@ async fn new_tunnel_options(State(state): State<Arc<AppState>>, headers: HeaderM
         "options": super::wizard::options_of(crate::config::Transport::Tcp)}));
     transports.push(json!({"name": "game", "port": crate::manager::plan::default_tunnel_port(crate::config::Transport::FecUdp),
         "udp": true, "game": true, "options": super::wizard::options_of(crate::config::Transport::FecUdp)}));
-    Json(json!({"transports": transports})).into_response()
+    Json(json!({"transports": transports, "failover_most": super::wizard::FAILOVER_MOST})).into_response()
 }
 
 /// Builds both ends of a new tunnel and starts them: the listening end first, then the dialing
@@ -2240,7 +2240,9 @@ async fn new_tunnel_owned(State(state): State<Arc<AppState>>, request: Request) 
             return failed(StatusCode::BAD_REQUEST, format!("server {at} is not connected"));
         }
     }
-    let built = match super::wizard::build(&form) {
+    // A failover tunnel lists its carriers; any other names one transport.
+    let failover = form["carriers"].is_array();
+    let built = match if failover { super::wizard::build_failover(&form) } else { super::wizard::build(&form) } {
         Ok(built) => built,
         Err(problem) => return failed(StatusCode::BAD_REQUEST, format!("{problem:#}")),
     };
@@ -2266,7 +2268,12 @@ async fn new_tunnel_owned(State(state): State<Arc<AppState>>, request: Request) 
             Err(problem) => return failed(StatusCode::BAD_GATEWAY, format!("{problem:#}")),
         }
     }
-    let transport = form["transport"].as_str().unwrap_or("");
+    let transport = if failover {
+        let order: Vec<&str> = form["carriers"].as_array().into_iter().flatten().filter_map(|c| c["transport"].as_str()).collect();
+        format!("failover {}", order.join(" > "))
+    } else {
+        form["transport"].as_str().unwrap_or("").to_string()
+    };
     state.audit.record(ip, "action", &format!("create {name} ({transport}; Iran end on {iran_at}, foreign end on {foreign_at})"));
     let (first, second) = match built.listening {
         crate::manager::plan::Side::Iran => ((&iran_at, &built.iran, "iran"), (&foreign_at, &built.foreign, "foreign")),

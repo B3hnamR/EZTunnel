@@ -86,6 +86,19 @@ enum Command {
         #[arg(long)]
         no_restart: bool,
     },
+    /// Download the newest official release (or --version) for this CPU from GitHub, check it and
+    /// install it: running tunnels restart and go back by themselves if one does not stay up.
+    Upgrade {
+        /// A release to install instead of the newest one, for example 0.13.0.
+        #[arg(long)]
+        version: Option<String>,
+        /// Download through this proxy, for example socks5h://127.0.0.1:1080.
+        #[arg(long)]
+        proxy: Option<String>,
+        /// Install even when the installed version is newer or the same.
+        #[arg(long)]
+        allow_downgrade: bool,
+    },
     /// Go back to the program that was installed before the last update.
     Rollback {
         #[arg(long, default_value = eztunnel::manager::update::INSTALLED)]
@@ -741,6 +754,12 @@ async fn run(cli: Cli) -> Result<()> {
                     no_restart,
                 },
             )?,
+            #[cfg(feature = "dashboard")]
+            Command::Upgrade { version, proxy, allow_downgrade } => {
+                eztunnel::manager::update::run_upgrade(version.as_deref(), proxy.as_deref(), allow_downgrade)?
+            }
+            #[cfg(not(feature = "dashboard"))]
+            Command::Upgrade { .. } => anyhow::bail!("this build cannot download releases; download one and run `eztunnel update` with it"),
             Command::Rollback { target, no_restart } => eztunnel::manager::update::run_rollback(
                 &target,
                 &eztunnel::manager::update::Options {

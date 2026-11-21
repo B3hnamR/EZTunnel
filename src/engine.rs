@@ -26,6 +26,7 @@ use tokio::{
 };
 
 mod control;
+mod failover;
 mod quality;
 mod socks_udp;
 
@@ -212,6 +213,18 @@ struct Session {
     slow_mark: AtomicU64,
     slow_strikes: AtomicU32,
     quality: Mutex<quality::Quality>,
+    /// Counters failover judges a carrier by (see `failover`).
+    counts: SessionCounts,
+}
+
+/// Running counts of one session, read by failover to judge its carrier.
+#[derive(Default)]
+struct SessionCounts {
+    /// Heartbeats sent, and heartbeats answered.
+    heartbeats: AtomicU64,
+    answers: AtomicU64,
+    /// User connections this side opened on the session.
+    opens: AtomicU64,
 }
 
 /// What the dialing loop watches of a session it runs (see `run_slot`).
@@ -425,6 +438,9 @@ impl Session {
         );
         self.stats.streams.fetch_add(1, Ordering::Relaxed);
         self.stats.streams_total.fetch_add(1, Ordering::Relaxed);
+        if requested.is_none() {
+            self.counts.opens.fetch_add(1, Ordering::Relaxed);
+        }
         Ok((id, rx))
     }
 
@@ -870,6 +886,38 @@ impl Pool {
     }
 }
 
+/// Where the user ports find a session: one pool, or the active carrier of a failover tunnel.
+#[derive(Clone)]
+enum Sessions {
+    Pool(Arc<Pool>),
+    Failover(Arc<failover::Failover>),
+}
+
+impl Sessions {
+    fn pick(&self) -> Option<Arc<Session>> {
+        match self {
+            Sessions::Pool(pool) => pool.pick(),
+            Sessions::Failover(failover) => failover.pick(),
+        }
+    }
+
+    fn crowded(&self) -> bool {
+        match self {
+            Sessions::Pool(pool) => pool.crowded(),
+            Sessions::Failover(failover) => failover.crowded(),
+        }
+    }
+}
+
+/// A carrier for people: its transport and address, e.g. "wss 0.0.0.0:8443".
+fn carrier_label(transport: crate::config::Transport, addr: &str) -> String {
+    let name = serde_json::to_value(transport)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_default();
+    format!("{name} {addr}")
+}
+
 /// How often `Pool::evict_slow` judges a listener's pooled sessions.
 const EVICT_SLOW_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -974,12 +1022,50 @@ pub(crate) async fn run_forwarding(config: Config, stats: Arc<Stats>) -> Result<
                 let gaming=gaming.clone();
                 tasks.spawn(async move { control::serve(&path, Some(all), stats, tuning,gaming).await });
             }
-            for listener in config.listeners.clone() {
+            let fresh_ms = config.heartbeat_sec.saturating_mul(3000).max(1000);
+            let locals: Vec<Arc<Pool>> = config
+                .listeners
+                .iter()
+                .map(|_| {
+                    Arc::new(Pool {
+                        quality_steering: config.path_quality_steering,
+                        quality_fresh_ms: fresh_ms,
+                        ..Pool::default()
+                    })
+                })
+                .collect();
+            // Failover: every listener is one carrier, in order of preference, and the user
+            // ports (on the first listener) and SOCKS5 go to whichever carrier is active.
+            let failover = config.failover.enabled.then(|| {
+                let carriers = config
+                    .listeners
+                    .iter()
+                    .zip(&locals)
+                    .map(|(listener, pool)| failover::Carrier {
+                        label: carrier_label(listener.transport, &listener.addr),
+                        pool: pool.clone(),
+                    })
+                    .collect();
+                Arc::new(failover::Failover::new(carriers, config.failover.clone()))
+            });
+            if let Some(failover) = &failover {
+                let order: Vec<String> =
+                    config.listeners.iter().map(|l| carrier_label(l.transport, &l.addr)).collect();
+                tracing::info!(carriers = %order.join(" > "), "failover: carriers in order of preference");
+                tasks.spawn(failover.clone().watch(stats.clone(), fresh_ms));
+            }
+            for (listener, local) in config.listeners.clone().into_iter().zip(locals) {
+                let front = match &failover {
+                    Some(failover) => Sessions::Failover(failover.clone()),
+                    None => Sessions::Pool(local.clone()),
+                };
                 tasks.spawn(server_listener(
                     listener,
                     config.clone(),
                     private.clone(),
                     all.clone(),
+                    local,
+                    front,
                     slots.clone(),
                     pending.clone(),
                     users.clone(),
@@ -990,7 +1076,10 @@ pub(crate) async fn run_forwarding(config: Config, stats: Arc<Stats>) -> Result<
             if let Some(addr) = &config.socks5 {
                 tasks.spawn(socks_listener(
                     addr.clone(),
-                    all,
+                    match &failover {
+                        Some(failover) => Sessions::Failover(failover.clone()),
+                        None => Sessions::Pool(all),
+                    },
                     users.clone(),
                     config.max_streams,
                     Tuning::from_config(&config),
@@ -1055,6 +1144,8 @@ async fn server_listener(
     config: Arc<Config>,
     private: zeroize::Zeroizing<[u8; 32]>,
     all: Arc<Pool>,
+    local: Arc<Pool>,
+    front: Sessions,
     slots: Arc<Semaphore>,
     pending: Arc<PendingLimiter>,
     users: Arc<PendingLimiter>,
@@ -1076,11 +1167,6 @@ async fn server_listener(
         .map(|key| decode_key(key))
         .collect::<Result<_>>()?;
     let allowed = Arc::new(allowed);
-    let local = Arc::new(Pool {
-        quality_steering: config.path_quality_steering,
-        quality_fresh_ms: config.heartbeat_sec.saturating_mul(3000).max(1000),
-        ..Pool::default()
-    });
     let mut maps = JoinSet::new();
     for map in listener.maps.clone() {
         match map.kind {
@@ -1089,7 +1175,7 @@ async fn server_listener(
                     map.bind,
                     map.target,
                     map.proxy_protocol,
-                    local.clone(),
+                    front.clone(),
                     users.clone(),
                     config.max_streams,
                     Tuning::from_config(&config),
@@ -1100,7 +1186,7 @@ async fn server_listener(
                 maps.spawn(udp_map(
                     map.bind,
                     map.target,
-                    local.clone(),
+                    front.clone(),
                     users.clone(),
                     config.max_streams,
                     Tuning::from_config(&config),
@@ -1546,6 +1632,7 @@ async fn session_body(
         slow_mark: AtomicU64::new(0),
         slow_strikes: AtomicU32::new(0),
         quality: Mutex::new(quality::Quality::default()),
+        counts: SessionCounts::default(),
     });
     stats.sessions.fetch_add(1, Ordering::Relaxed);
     stats.sessions_total.fetch_add(1, Ordering::Relaxed);
@@ -1671,6 +1758,7 @@ async fn session_body(
                                 if ping.counted_lost {
                                     session.stats.pings_lost.fetch_sub(1, Ordering::Relaxed);
                                 }
+                                session.counts.answers.fetch_add(1, Ordering::Relaxed);
                                 session.stats.record_rtt(ping.sent_at.elapsed());
                                 session.quality.lock().unwrap_or_else(|e|e.into_inner()).observe(ping.sent_at.elapsed(),clock());
                             }
@@ -1878,6 +1966,7 @@ fn send_heartbeat(
             sent_at: Instant::now(),
             counted_lost: false,
         });
+        session.counts.heartbeats.fetch_add(1, Ordering::Relaxed);
         session.stats.pings.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -2136,7 +2225,7 @@ async fn tcp_map(
     bind: String,
     target: String,
     proxy_version: Option<u8>,
-    pool: Arc<Pool>,
+    pool: Sessions,
     users: Arc<PendingLimiter>,
     limit: usize,
     tuning: Tuning,
@@ -2202,7 +2291,7 @@ fn log_forward_result(result: Option<std::result::Result<Result<()>, tokio::task
 async fn udp_map(
     bind: String,
     target: String,
-    pool: Arc<Pool>,
+    pool: Sessions,
     users: Arc<PendingLimiter>,
     limit: usize,
     tuning: Tuning,
@@ -2361,7 +2450,7 @@ async fn udp_map(
 
 async fn socks_listener(
     bind: String,
-    pool: Arc<Pool>,
+    pool: Sessions,
     users: Arc<PendingLimiter>,
     limit: usize,
     tuning: Tuning,
@@ -2482,7 +2571,7 @@ async fn socks_reply(socket: &mut TcpStream, status: u8) -> Result<()> {
 
 async fn socks_stream(
     mut socket: TcpStream,
-    pool: Arc<Pool>,
+    pool: Sessions,
     users: Arc<PendingLimiter>,
     limit: usize,
     tuning: Tuning,
@@ -2633,6 +2722,7 @@ mod tests {
             slow_mark: AtomicU64::new(0),
             slow_strikes: AtomicU32::new(0),
             quality: Mutex::new(quality::Quality::default()),
+            counts: SessionCounts::default(),
         };
         (session, credits)
     }

@@ -246,6 +246,25 @@ fn live_status(store: &Store, name: &str, config: &Value) -> Result<()> {
                 ),
             ],
         );
+        // Failover: every carrier in order, which one new users go to, and how each is doing.
+        if let Some(carriers) = status["failover"]["carriers"].as_array() {
+            let lines: Vec<String> = carriers
+                .iter()
+                .map(|carrier| {
+                    let state = carrier["state"].as_str().unwrap_or("?");
+                    let why = carrier["why"].as_str().filter(|w| !w.is_empty()).map(|w| format!(", {w}")).unwrap_or_default();
+                    format!(
+                        "{} {:<28} {}{}{}",
+                        ui::dim(&format!("{}.", carrier["order"])),
+                        carrier["carrier"].as_str().unwrap_or(""),
+                        state,
+                        why,
+                        if carrier["active"] == true { format!("  {}", ui::accent("in use")) } else { String::new() }
+                    )
+                })
+                .collect();
+            ui::boxed(&format!("Failover · {} switch(es)", status["failover"]["switches"]), &lines);
+        }
         ui::note(
             "Download and upload are what users receive and send. Ping comes from the\nheartbeats between the servers. Press Enter to return.",
         );
@@ -437,6 +456,21 @@ fn tunnel(store: &Store, name: &str) -> Result<()> {
                     link_label(store, name, state)
                 ),
             ];
+            // Failover: the backups in order and, while it runs, the carrier in use.
+            let backups = super::pairing::backups_of(&config);
+            if !backups.is_empty() {
+                let order: Vec<String> = backups.iter().map(|(t, p)| format!("{} :{p}", super::plan::transport_name(*t))).collect();
+                let active = matches!(state, State::Running | State::Starting)
+                    .then(|| service::control(name, &json!({"cmd": "status"}), std::time::Duration::from_millis(800)).ok())
+                    .flatten()
+                    .and_then(|status| status["failover"]["carrier"].as_str().map(str::to_string));
+                lines.push(format!(
+                    "{}  backups {}{}",
+                    ui::dim("Failover  "),
+                    order.join(" > "),
+                    active.map(|carrier| format!("; in use: {}", ui::accent(&carrier))).unwrap_or_default()
+                ));
+            }
             if let Some(quota) = quota_line(name, &config) {
                 lines.push(format!("{}  {}", ui::dim("Quota     "), quota));
             }

@@ -828,6 +828,57 @@ fn default_tun_mtu() -> u16 {
     1400
 }
 
+/// Failover between the carriers of one tunnel. The server (the side with the user ports) keeps
+/// every carrier connected and sends new users to the first one, in the order of `listeners`,
+/// that is healthy. A carrier that stops answering is left at once; one that answers badly
+/// (lost heartbeats, a round trip far above its usual one, or users that get no data) is left for
+/// a healthy one. A preferred carrier takes the users back after `return_after_sec` of good
+/// health. The client keeps every one of its `paths` connected; it decides nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Failover {
+    pub enabled: bool,
+    /// A preferred carrier must stay healthy this long before new users go back to it.
+    pub return_after_sec: u64,
+    /// A carrier with no session that answers for this long is down.
+    pub down_after_sec: u64,
+}
+
+impl Default for Failover {
+    fn default() -> Self {
+        Self { enabled: false, return_after_sec: 300, down_after_sec: 10 }
+    }
+}
+
+impl Failover {
+    pub fn is_off(&self) -> bool {
+        !self.enabled
+    }
+
+    fn validate(&self, config: &Config) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        ensure!((30..=86_400).contains(&self.return_after_sec), "failover.return_after_sec must be 30..86400");
+        ensure!((5..=3600).contains(&self.down_after_sec), "failover.down_after_sec must be 5..3600");
+        ensure!(config.tun.is_none(), "failover is for forwarding tunnels, not TUN");
+        let carriers = match config.mode {
+            Mode::Server => config.listeners.len(),
+            Mode::Client => config.paths.len(),
+        };
+        ensure!((2..=8).contains(&carriers), "failover needs 2 to 8 carriers (listeners on the server, paths on the client)");
+        if config.mode == Mode::Server {
+            // The user ports belong to the tunnel, not to one carrier: they are kept on the first
+            // listener and served by whichever carrier is active.
+            ensure!(
+                config.listeners.iter().skip(1).all(|listener| listener.maps.is_empty()),
+                "with failover the port maps belong on the first listener only"
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -897,6 +948,11 @@ pub struct Config {
     /// Prefer healthy measured sessions for new streams only. Off preserves round-robin.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub path_quality_steering: bool,
+    /// Several carriers in order of preference (`listeners` on the server, `paths` on the
+    /// client) behind the same user ports: new users go to the first healthy carrier, and come
+    /// back to a preferred one once it has stayed healthy for a while (see `Failover`).
+    #[serde(default, skip_serializing_if = "Failover::is_off")]
+    pub failover: Failover,
     /// Server: connections still waiting to finish the key handshake, over all listeners.
     #[serde(default = "pending_handshakes")]
     pub max_pending_handshakes: usize,
@@ -1705,6 +1761,7 @@ impl Config {
 
     pub fn validate(&self) -> Result<()> {
         self.gaming.validate()?;
+        self.failover.validate(self)?;
         let shared_key=self.tunnel_key.is_some()||self.tunnel_key_file.is_some();
         ensure!(!self.gaming.enabled()||shared_key,"direct gaming requires tunnel_key or tunnel_key_file for the configured peer identity set");
         ensure!(!self.gaming.enabled() || self.tun.is_none(),"direct gaming currently requires forwarding mode, not TUN");

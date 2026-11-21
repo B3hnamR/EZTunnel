@@ -1046,6 +1046,8 @@ hr.sep{border:0;border-top:1px solid var(--line);margin:16px 0}
 /* A field with a small action inside it at the end (random port) */
 .dice-in{position:relative}
 .dice-in .input{padding-inline-end:44px}
+/* A left-to-right field (ports, addresses) on a Persian page: the button sits on the left. */
+[dir="rtl"] .dice-in .input.ltr{padding-right:12px;padding-left:44px}
 .dice{position:absolute;inset-inline-end:4px;top:50%;transform:translateY(-50%);display:grid;place-items:center;width:32px;height:30px;border:0;border-radius:7px;background:transparent;color:var(--text-3);transition:color .16s var(--ease),background-color .16s var(--ease),transform .2s var(--spring)}
 .dice:hover{color:var(--accent);background:var(--accent-soft)}
 .dice:active{transform:translateY(-50%) rotate(90deg) scale(.92)}
@@ -1184,3 +1186,21 @@ label.btn:has(> input.sr:focus-visible){outline:2px solid var(--accent);outline-
 
 /* Which address family and direction worked, above the transport rows. */
 .ct-paths{display:flex;flex-wrap:wrap;gap:8px}
+
+/* Failover: the carriers of a tunnel, in order (the new-tunnel form and the tunnel page). */
+.fo-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:8px}
+.fo-row{display:flex;align-items:flex-end;gap:10px;flex-wrap:wrap}
+.fo-row .grow{min-width:140px}
+.fo-live{align-items:center;padding:8px 10px;border:1px solid var(--line);border-radius:10px}
+.fo-live.fo-on{border-color:var(--ok)}
+.fo-live .code-chip{margin-inline-start:8px}
+.fo-n{flex:none;display:grid;place-items:center;width:24px;height:24px;border-radius:50%;background:var(--fill);color:var(--on-fill);font-size:12px;font-weight:600;align-self:center}
+.fo-act{display:flex;gap:2px}
+/* Phones: the transport takes the whole line, the port and the order buttons share the next. */
+@media (max-width:640px){
+  .fo-row:not(.fo-live){padding:10px;border:1px solid var(--line);border-radius:10px;align-items:center}
+  .fo-row:not(.fo-live) .grow{flex:1 1 calc(100% - 40px)}
+  .fo-row:not(.fo-live) .eproto{flex:1 1 0;min-width:0}
+  .fo-row:not(.fo-live) .fo-act{align-self:flex-end}
+}
+.mb12{margin-bottom:12px}

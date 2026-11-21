@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.13.0 (2026-11-21)
+
+- Added **failover**: one tunnel with several transports in order behind the same user ports and
+  SOCKS5. Every transport stays connected. The server judges each one every second: it is down
+  when none of its sessions answers for `failover.down_after_sec` (default 10), and degraded when
+  over a minute 30% of its heartbeats are lost, its round trip stays far above its usual one, or
+  users opened on it get no data. New users go to the first healthy transport, and back to a
+  preferred one once it has been healthy for `failover.return_after_sec` (default 300), in one
+  step. Users already on a transport stay on it. Nothing changes on the wire; both servers need
+  this version. See [docs/configuration.md](docs/configuration.md#failover).
+- Failover setup: **Failover** in the transport list of the terminal manager (a main transport,
+  then 1 to 3 backups; the pairing code carries them), **New tunnel → Failover** in the dashboard
+  (2 to 4 transports, each on its own port), and **Create a failover tunnel** from the best results
+  of a connection test.
+- The status (`{"cmd":"status"}`) of a failover tunnel reports the transport in use, the number of
+  switches and every transport's state; the status line ends with `carrier=`, and every switch is
+  logged. The dashboard shows the transports on the tunnel's page and the one in use in the tunnel
+  lists, and raises an alert, also on Telegram, while a backup is in use or a transport is down.
+  The manager's tunnel screen and live status show them too.
+- Every port the manager suggests is free: the tunnel port, failover ports and the SOCKS5 address
+  move on to the next free port when the usual one is taken, a taken port that is typed is named
+  with a free one to use instead, and taken forwarded ports are offered again on free ports. The
+  dashboard's tunnel ports skip those its tunnels already use, and it warns about a forwarded port
+  another tunnel on the Iran server uses.
+- Added **Update** to the manager's main menu (and Tools → Update to the latest version) and the
+  `eztunnel upgrade` command: they find the newest release on GitHub, download the program for
+  this server's CPU, check it against SHA256SUMS and the official signature, and install it the
+  way `eztunnel update` does. `--version` picks a release and `--proxy` downloads through a proxy.
+- After an update from the manager, the dashboard or `eztunnel update`, the dashboard and the
+  agent restart a few seconds later and run the new version. Before, they kept running (and
+  showing) the old one until restarted by hand. The installer restarts them too when it updates.
+- Dashboard: in Persian the port fields no longer hide their first digit behind the dice button.
+- Game mode: the first replies from the game server are no longer lost right after the datagram
+  path starts, is renewed or moves to a new port. The foreign server now answers on the path the
+  game's datagram came in on, instead of waiting until its own check of that path was answered or
+  sending to the Iran server's previous port.
+
 ## 0.12.0 (2026-11-20)
 
 - Added **presets** for every transport: **Balanced** (recommended), **Many users**,

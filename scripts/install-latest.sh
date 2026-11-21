@@ -165,9 +165,19 @@ else
   ok "Updated $old_version → $c_bold$new_version$c_reset at $destination/eztunnel"
 fi
 [[ -z $backup ]] || note "Previous program kept as $backup"
+# The dashboard and the agent are EZTunnel's own services, not tunnels: after an update they
+# restart so they run (and show) the new version instead of the one still in memory.
+if [[ -n $old_version && $destination == /usr/local/bin ]] && command -v systemctl >/dev/null 2>&1; then
+  for unit in eztunnel-dashboard.service eztunnel-agent.service; do
+    if systemctl is-active --quiet "$unit" 2>/dev/null && systemctl restart "$unit" 2>/dev/null; then
+      ok "Restarted ${unit%.service} so it runs $new_version"
+    fi
+  done
+fi
 rule
-note 'Tunnel settings, keys, firewall rules and services were not changed.'
-[[ -z $old_version ]] || note 'Running tunnels keep their current program until you restart them.'
+note 'Tunnel settings, keys, firewall rules and tunnel services were not changed.'
+[[ -z $old_version ]] || note 'Running tunnels keep their current program until you restart them (Manage tunnels → All tunnels → Restart).'
+[[ -z $old_version ]] || note 'Next time: sudo eztunnel upgrade, or Update in the manager, does it all in one step.'
 note 'Checksums catch corruption; HTTPS and the GitHub release are the trust boundary.'
 
 menu_command="sudo $destination/eztunnel"

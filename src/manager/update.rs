@@ -855,6 +855,39 @@ fn ensure_signed_bytes(bytes: &[u8]) -> Result<()> {
 }
 
 
+/// EZTunnel's own services (not tunnels) that must run the new program after an update.
+const OWN_SERVICES: [&str; 2] = ["eztunnel-dashboard.service", "eztunnel-agent.service"];
+
+/// Restarts the dashboard and the agent, when they run, a few seconds from now in a job of its own.
+/// Either one may be what asked for this update (the dashboard's Update button runs it, on its own
+/// server or through an agent), and restarting it directly would cut the update and its answer
+/// short. Without this they kept running the old program, and showing the old version, until
+/// someone restarted them by hand.
+fn restart_own_services_soon() -> Vec<&'static str> {
+    let mut scheduled = Vec::new();
+    let quiet = |args: &[&str]| Command::new(args[0]).args(&args[1..]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success());
+    for unit in OWN_SERVICES {
+        if !quiet(&["systemctl", "is-active", "--quiet", unit]) {
+            continue;
+        }
+        // One named job per service: the program that runs the update and the new program both
+        // ask for it (an older new program does not), and the second ask finds it pending.
+        let job = format!("eztunnel-after-update-{}", unit.trim_end_matches(".service").trim_start_matches("eztunnel-"));
+        let ok = quiet(&["systemctl", "is-active", "--quiet", &format!("{job}.timer")])
+            || quiet(&["systemd-run", "--quiet", "--collect", &format!("--unit={job}"), "--on-active=5", "systemctl", "restart", unit]);
+        if ok {
+            scheduled.push(unit);
+        } else {
+            say(&format!("Could not schedule a restart of {unit}; restart it yourself to use the new version."));
+        }
+    }
+    if !scheduled.is_empty() {
+        let names: Vec<&str> = scheduled.iter().map(|unit| unit.trim_end_matches(".service")).collect();
+        say(&format!("{} restart in a few seconds to run the new version.", names.join(" and ")));
+    }
+    scheduled
+}
+
 /// `eztunnel update`: this program file installs itself.
 pub fn run_update(target: &Path, options: &Options) -> Result<()> {
     ensure!(
@@ -886,6 +919,9 @@ fn update_here(target: &Path, options: &Options) -> Result<()> {
                 "The old program is kept as {}; `eztunnel rollback` goes back.",
                 previous_path(target).display()
             ));
+            if !options.no_restart && target == Path::new(INSTALLED) {
+                restart_own_services_soon();
+            }
             Ok(())
         }
         Outcome::RolledBack { failed } => bail!(
@@ -912,6 +948,9 @@ fn rollback_here(target: &Path, options: &Options) -> Result<()> {
                 "Now running {to}; {} tunnel(s) restarted.",
                 restarted.len()
             ));
+            if !options.no_restart && target == Path::new(INSTALLED) {
+                restart_own_services_soon();
+            }
             Ok(())
         }
         Outcome::RolledBack { failed } => bail!(
@@ -975,6 +1014,7 @@ pub fn update_screen() -> Result<()> {
     let status =
         ui::with_interrupt_for_children(|| command.status()).context("run the new program")?;
     if status.success() {
+        restart_own_services_soon();
         ui::ok("Updated. Open the manager again to use the new version.");
         ui::pause();
         std::process::exit(0);
@@ -1012,7 +1052,130 @@ pub(crate) fn install_signed(bytes: &[u8], allow_downgrade: bool) -> Result<Stri
     let output = command.stdin(std::process::Stdio::null()).output().context("run the new program")?;
     let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
     ensure!(output.status.success(), "the update did not finish: {}", text.trim());
+    // A new program from before 0.13.0 does not restart the dashboard and the agent itself.
+    restart_own_services_soon();
     Ok(text)
+}
+
+/// The version the installed program reports, if it runs.
+fn installed_version() -> Option<String> {
+    let output = Command::new(INSTALLED).arg("--version").stdin(std::process::Stdio::null()).output().ok()?;
+    String::from_utf8_lossy(&output.stdout).trim().strip_prefix("eztunnel ").map(str::to_string)
+}
+
+/// Where a downloaded release waits until it is installed (root only, emptied afterwards).
+#[cfg(feature = "dashboard")]
+const DOWNLOAD_DIR: &str = "/var/lib/eztunnel-update";
+
+/// What the newest official release is, for this server: (installed version, newest version,
+/// whether the newest one is newer).
+#[cfg(feature = "dashboard")]
+pub fn check_latest(proxy: Option<&str>) -> Result<(String, String, bool)> {
+    let release = crate::dashboard::maintain::latest(proxy).context("could not reach the release page on GitHub")?;
+    let newest = release["version"].as_str().context("the release has no version")?.to_string();
+    let installed = installed_version().unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+    let newer = matches!((parse_version(&installed), parse_version(&newest)), (Some(have), Some(new)) if new > have);
+    Ok((installed, newest, newer))
+}
+
+/// Downloads an official release for this CPU from GitHub (`version`, or "latest"), checks it the
+/// way the installer does (SHA256SUMS, the program inside the archive, its CPU and its release
+/// signature) and installs it like `eztunnel update`: the running tunnels restart and go back by
+/// themselves if one does not stay up, and the dashboard and the agent restart to run it.
+#[cfg(feature = "dashboard")]
+pub fn download_and_install(version: &str, proxy: Option<&str>, allow_downgrade: bool) -> Result<String> {
+    ensure!(super::store::is_root(), "updating changes system files: run it as root");
+    let dir = Path::new(DOWNLOAD_DIR);
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir).context("make the download folder")?;
+    let meta = crate::dashboard::maintain::fetch(version, std::env::consts::ARCH, dir, proxy)?;
+    let file = meta["file"].as_str().context("the download was not kept")?.to_string();
+    let bytes = crate::dashboard::maintain::read_kept(dir, &file);
+    let _ = std::fs::remove_file(dir.join(&file));
+    let _ = std::fs::remove_file(dir.join(&file).with_extension("json"));
+    install_signed(&bytes?, allow_downgrade)
+}
+
+/// `eztunnel upgrade`: the newest release (or `version`) from GitHub, installed in one step.
+#[cfg(feature = "dashboard")]
+pub fn run_upgrade(version: Option<&str>, proxy: Option<&str>, allow_downgrade: bool) -> Result<()> {
+    ensure!(super::store::is_root(), "updating changes system files: run it as root");
+    let wanted = match version {
+        Some(version) => version.trim_start_matches('v').to_string(),
+        None => {
+            let (installed, newest, newer) = check_latest(proxy)?;
+            if !newer && !allow_downgrade {
+                say(&format!("EZTunnel {installed} is the newest version; nothing to do."));
+                return Ok(());
+            }
+            say(&format!("Updating {installed} → {newest} from GitHub…"));
+            newest
+        }
+    };
+    let output = download_and_install(&wanted, proxy, allow_downgrade)?;
+    print!("{output}");
+    Ok(())
+}
+
+/// Tools → Update to the latest version (and the main menu's Update): finds the newest official
+/// release on GitHub, says what changes, and installs it after one question.
+#[cfg(feature = "dashboard")]
+pub fn upgrade_screen() -> Result<()> {
+    ui::banner("Update EZTunnel");
+    let mut proxy: Option<String> = None;
+    let (installed, newest, newer) = loop {
+        ui::info("Looking for the newest release on GitHub…");
+        match check_latest(proxy.as_deref()) {
+            Ok(found) => break found,
+            Err(error) => {
+                ui::fail(&format!("{error:#}"));
+                ui::note("Servers in Iran often cannot reach GitHub directly. A proxy helps, for example a SOCKS5\ntunnel on this server: socks5h://127.0.0.1:1080");
+                let choices = ["Try again through a proxy".to_string(), "Back".to_string()];
+                if ui::choose_required("What now?", &choices, 0)? != 0 {
+                    return Ok(());
+                }
+                let text = ui::ask("Proxy", proxy.as_deref().or(Some("socks5h://127.0.0.1:1080")), |text: &String| {
+                    let ok = ["http://", "https://", "socks5://", "socks5h://"].iter().any(|scheme| text.trim().starts_with(scheme));
+                    if ok { Ok(()) } else { Err("start it with socks5h://, socks5://, http:// or https://".to_string()) }
+                })?;
+                proxy = Some(text.trim().to_string());
+            }
+        }
+    };
+    if !newer {
+        ui::ok(&format!("You have the newest version: {installed}."));
+        ui::pause();
+        return Ok(());
+    }
+    ui::boxed("Update available", &[
+        format!("{}  {installed}", ui::dim("Installed")),
+        format!("{}  {}", ui::dim("Newest   "), ui::accent(&newest)),
+    ]);
+    ui::note("The new program is downloaded from GitHub and checked against its published checksum and\nofficial signature. Running tunnels restart for a moment; if one does not stay up, the\ncurrent version comes back by itself. The dashboard and the agent restart too.");
+    if !ui::confirm(&format!("Update to {newest} now?"), true)? {
+        return Ok(());
+    }
+    match ui::with_interrupt_for_children(|| download_and_install(&newest, proxy.as_deref(), false)) {
+        Ok(output) => {
+            for line in output.lines().filter(|line| !line.trim().is_empty()) {
+                ui::info(line);
+            }
+            ui::ok(&format!("Updated to {newest}. Open the manager again to use the new version."));
+            ui::pause();
+            std::process::exit(0);
+        }
+        Err(error) => {
+            ui::fail(&format!("The update did not finish: {error:#}"));
+            ui::pause();
+            Ok(())
+        }
+    }
 }
 
 /// Tools → Roll back.

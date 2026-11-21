@@ -26,7 +26,8 @@ pub struct Problem {
     pub key: String,
     pub server: String,
     pub server_name: String,
-    /// failed, not_connected, silent, no_traffic, quota, loss, udp_drops, offline, disk, cert.
+    /// failed, not_connected, silent, no_traffic, quota, loss, udp_drops, failover_backup,
+    /// carrier_down, offline, disk, cert.
     pub kind: String,
     pub subject: String,
     /// "bad" or "warn".
@@ -219,6 +220,8 @@ fn words(lang: &str, kind: &str) -> &'static str {
         "quota" => if fa { "سقف ترافیک پر شد" } else { "traffic limit used up" },
         "loss" => if fa { "افت بسته بالاست" } else { "high packet loss" },
         "udp_drops" => if fa { "بسته‌های UDP دور ریخته می‌شوند" } else { "UDP datagrams are being dropped" },
+        "failover_backup" => if fa { "تونل روی ترنسپورت پشتیبان کار می‌کند" } else { "tunnel runs on a backup carrier" },
+        "carrier_down" => if fa { "یکی از ترنسپورت‌های فیل‌اور از کار افتاده" } else { "a failover carrier is down" },
         "offline" => if fa { "سرور از داشبورد قطع است" } else { "server is offline" },
         "disk" => if fa { "دیسک تقریباً پر است" } else { "disk almost full" },
         "cert" => if fa { "اعتبار سرتیفیکیت داشبورد به‌زودی تمام می‌شود" } else { "dashboard certificate expires soon" },
@@ -241,7 +244,7 @@ fn digits(lang: &str, text: String) -> String {
 
 /// Problems that belong to one tunnel; the others are about the whole server.
 fn about_tunnel(kind: &str) -> bool {
-    matches!(kind, "failed" | "not_connected" | "silent" | "no_traffic" | "quota" | "loss" | "udp_drops")
+    matches!(kind, "failed" | "not_connected" | "silent" | "no_traffic" | "quota" | "loss" | "udp_drops" | "failover_backup" | "carrier_down")
 }
 
 /// The Telegram message for an alert that fired or cleared (HTML mode): a coloured mark and the

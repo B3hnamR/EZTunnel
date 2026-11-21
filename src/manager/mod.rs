@@ -130,6 +130,11 @@ pub fn run() -> Result<()> {
             ),
             format!(
                 "{}  {}",
+                ui::bold("Update         "),
+                ui::dim("get the newest version of EZTunnel from GitHub")
+            ),
+            format!(
+                "{}  {}",
                 ui::bold("Uninstall      "),
                 ui::dim("remove EZTunnel from this server")
             ),
@@ -140,7 +145,8 @@ pub fn run() -> Result<()> {
             Some(0) => wizard::new_tunnel(&store).map(|_| ()),
             Some(1) => manage::manage(&store),
             Some(2) => tools(&store),
-            Some(3) => uninstall(&store),
+            Some(3) => upgrade_menu(),
+            Some(4) => uninstall(&store),
             _ => {
                 eprintln!();
                 return Ok(());
@@ -152,6 +158,18 @@ pub fn run() -> Result<()> {
                 ui::pause();
             }
         }
+    }
+}
+
+/// Update to the newest release from GitHub (a build without the download code points to the file update).
+fn upgrade_menu() -> Result<()> {
+    #[cfg(feature = "dashboard")]
+    {
+        update::upgrade_screen()
+    }
+    #[cfg(not(feature = "dashboard"))]
+    {
+        update::update_screen()
     }
 }
 
@@ -221,8 +239,8 @@ fn optimize_screen() -> Result<()> {
 }
 
 #[derive(Debug,Clone,Copy,PartialEq,Eq)]
-enum ToolAction{Dashboard,Checker,Optimize,Undo,Key,CheckConfigs,Export,Import,Update,Rollback,LinkTest,Mirage}
-const TOOLS:[ToolAction;12]=[ToolAction::Dashboard,ToolAction::Checker,ToolAction::Optimize,ToolAction::Undo,ToolAction::Key,ToolAction::CheckConfigs,ToolAction::Export,ToolAction::Import,ToolAction::Update,ToolAction::Rollback,ToolAction::LinkTest,ToolAction::Mirage];
+enum ToolAction{Dashboard,Checker,Optimize,Undo,Key,CheckConfigs,Export,Import,Upgrade,Update,Rollback,LinkTest,Mirage}
+const TOOLS:[ToolAction;13]=[ToolAction::Dashboard,ToolAction::Checker,ToolAction::Optimize,ToolAction::Undo,ToolAction::Key,ToolAction::CheckConfigs,ToolAction::Export,ToolAction::Import,ToolAction::Upgrade,ToolAction::Update,ToolAction::Rollback,ToolAction::LinkTest,ToolAction::Mirage];
 fn tool_label(action:ToolAction)->String{
     use console::style;
     let(category,title,description,color)=match action{
@@ -236,6 +254,7 @@ fn tool_label(action:ToolAction)->String{
         ToolAction::CheckConfigs=>("FILES","Check every tunnel's configuration","validate saved files without starting",4),
         ToolAction::Export=>("FILES","Export all tunnels to a file (backup)","private configuration backup",4),
         ToolAction::Import=>("FILES","Import tunnels from a file","restore a private backup",4),
+        ToolAction::Upgrade=>("RELEASE","Update to the latest version","download from GitHub, verify and install",3),
         ToolAction::Update=>("RELEASE","Update EZTunnel from a downloaded file","verify and install an official release",3),
         ToolAction::Rollback=>("RELEASE","Roll back to the previous version","restore the recorded previous release",3),
     };
@@ -290,6 +309,7 @@ fn tools(store: &Store) -> Result<()> {
                 }
                 ToolAction::Export => export_screen(store)?,
                 ToolAction::Import => import_screen(store)?,
+                ToolAction::Upgrade => upgrade_menu()?,
                 ToolAction::Update => update::update_screen()?,
                 ToolAction::Rollback => update::rollback_screen()?,
                 ToolAction::LinkTest => link_test_menu()?,
@@ -662,7 +682,9 @@ fd000000000000000000000000000001 02 40 00 80     eth0
         let mut seen=std::collections::HashSet::new();
         for action in TOOLS{assert!(seen.insert(format!("{action:?}")));let label=tool_label(action);assert!(!console::strip_ansi_codes(&label).is_empty());}
         assert_eq!(TOOLS.iter().filter(|action|**action==ToolAction::LinkTest).count(),1);
-        assert_eq!(TOOLS.len(),12);
+        assert_eq!(TOOLS.len(),13);
+        // Updating from GitHub comes first among the release tools.
+        assert!(TOOLS.iter().position(|a|*a==ToolAction::Upgrade)<TOOLS.iter().position(|a|*a==ToolAction::Update));
     }
 
     #[test]

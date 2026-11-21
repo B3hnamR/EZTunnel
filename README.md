@@ -1,9 +1,9 @@
 <p align="center">
-  <img src="docs/assets/banner.svg?v=0.12.0" alt="EZTunnel: encrypted tunnels, made simple" width="100%">
+  <img src="docs/assets/banner.svg?v=0.13.0" alt="EZTunnel: encrypted tunnels, made simple" width="100%">
 </p>
 
 <p align="center">
-  <a href="https://github.com/B3hnamR/EZTunnel/releases/latest"><img src="https://img.shields.io/badge/release-v0.12.0-00afff?style=for-the-badge" alt="Release v0.12.0"></a>
+  <a href="https://github.com/B3hnamR/EZTunnel/releases/latest"><img src="https://img.shields.io/badge/release-v0.13.0-00afff?style=for-the-badge" alt="Release v0.13.0"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-875fff?style=for-the-badge" alt="License: AGPL-3.0"></a>
   <img src="https://img.shields.io/badge/built_with-Rust-dea584?style=for-the-badge&logo=rust&logoColor=white" alt="Built with Rust">
   <img src="https://img.shields.io/badge/Linux-x86__64%20%7C%20ARM64-0087ff?style=for-the-badge&logo=linux&logoColor=white" alt="Linux x86_64 and ARM64">
@@ -35,18 +35,20 @@ config files to write.
 - **Yours:** open source and self-hosted, with no telemetry. It only talks to the
   servers you configure.
 
-## What's new in 0.12.0
+## What's new in 0.13.0
 
-- **Presets** for every transport: Balanced, Many users, Gaming / low delay, Streaming / big
-  downloads and Max capacity. Apply one from the manager, the dashboard or `eztunnel preset`, and
-  see every value it changes first. [Configuration guide](docs/configuration.md)
-- **Automatic connection pool**: each tunnel opens several sessions by default and adds more
-  under load, up to `connection_pool_max`. The peer needs no change.
-- **Faster defaults**: a larger stream window, single-write XHTTP chunks and batched packet-up
-  uploads. The default `kcp.mtu` is now 1350, so update both ends of a KCP tunnel together.
-- **Dashboard**: rename servers, cancel Path Finder, filter connection-test results, safer
-  two-server deletes, clearer error causes and a compact Alerts history.
-  [Dashboard guide](docs/dashboard.md)
+- **Failover**: one tunnel with 2 to 4 transports behind the same user ports, for example TCP,
+  then WSS, then XHTTPS. All of them stay connected; if the one in use goes down or works badly,
+  new users move to the next one within about 20 seconds, and back once the first one has worked
+  for 5 minutes. Pick **Failover** in the transport list of the manager or the dashboard, or create
+  one from the best results of a connection test. [Failover](docs/configuration.md#failover)
+- **Alerts and status** show which transport a failover tunnel uses and when one goes down, also
+  on Telegram.
+- **One-step updates**: **Update** in the manager's main menu, or `sudo eztunnel upgrade`, gets the
+  newest release from GitHub, checks it and installs it. The dashboard and the agent now restart
+  after every update, so they show and run the new version.
+- **Free ports everywhere**: every port the manager and the dashboard suggest is free, and a port
+  already in use is named with a free one to take instead.
 
 Earlier releases are listed in the [changelog](CHANGELOG.md).
 
@@ -88,7 +90,7 @@ never starts, stops or changes existing tunnels.
 curl -fsSLo install-eztunnel.sh https://raw.githubusercontent.com/B3hnamR/EZTunnel/main/scripts/install-latest.sh
 less install-eztunnel.sh
 sudo bash install-eztunnel.sh                      # latest release
-sudo bash install-eztunnel.sh --version v0.12.0    # a specific release
+sudo bash install-eztunnel.sh --version v0.13.0    # a specific release
 sudo bash install-eztunnel.sh --no-menu            # install only, do not open the manager
 ```
 
@@ -587,9 +589,21 @@ In the tables, "No preset" is the default and "–" means the preset keeps the d
 <details>
 <summary><b>Updating to a new version</b></summary>
 
-Run the installer again on each server, or use **Tools → Update** or the dashboard's
-**Maintenance** page. The installer replaces the program file but **does not restart** running
-tunnels, so they keep the old version until you restart them:
+The easiest way is **Update** in the manager's main menu, or one command:
+
+```bash
+sudo eztunnel upgrade
+```
+
+It downloads the newest release for this server's CPU from GitHub, checks it against the published
+checksum and the official signature, installs it, restarts the running tunnels (and puts the old
+version back by itself if one does not stay up), and restarts the dashboard and the agent so they
+run the new version. If the server cannot reach GitHub, use a proxy:
+`sudo eztunnel upgrade --proxy socks5h://127.0.0.1:1080`. The dashboard's **Maintenance** page
+updates every server from one place.
+
+Running the installer again also updates the program file and restarts the dashboard and the
+agent, but **not** the tunnels, which keep the old version until you restart them:
 
 ```bash
 sudo systemctl restart eztunnel-NAME.service
@@ -624,7 +638,6 @@ Coming next to EZTunnel:
 
 | Feature | What it brings |
 |---|---|
-| **Seamless failover** | Give a tunnel backup routes: another transport, or another foreign server. If the main route fails or slows down, traffic moves to a backup automatically and returns when the main route recovers. The user port never changes, open connections pause for a moment and continue instead of dropping, and game traffic keeps its session. |
 | **Three new anti-censorship transports** | New carriers built to get through heavy filtering where today's transports are blocked or throttled. |
 
 Planned features may change before they ship. Follow the [releases](https://github.com/B3hnamR/EZTunnel/releases) to see them land.

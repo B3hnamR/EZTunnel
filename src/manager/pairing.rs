@@ -95,6 +95,29 @@ pub struct Pairing {
     pub low_delay: bool,
     #[serde(rename = "z", default, skip_serializing_if = "BTreeMap::is_empty")]
     pub settings: BTreeMap<String, u64>,
+    /// Failover: the backup carriers after the main one (`t`, `p`), in order, as (transport,
+    /// tunnel port). Empty for a tunnel with one carrier.
+    #[serde(rename = "b", default, skip_serializing_if = "Vec::is_empty")]
+    pub backups: Vec<(Transport, u16)>,
+}
+
+/// A failover tunnel's backup carriers (every one after the first), from its configuration.
+pub fn backups_of(config: &Value) -> Vec<(Transport, u16)> {
+    if config["failover"]["enabled"] != true {
+        return Vec::new();
+    }
+    let key = if config["mode"] == "server" { "listeners" } else { "paths" };
+    config[key]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .skip(1)
+        .filter_map(|entry| {
+            let transport: Transport = serde_json::from_value(entry.get("transport").cloned().unwrap_or(Value::Null)).unwrap_or_default();
+            let port = entry["addr"].as_str()?.rsplit_once(':')?.1.parse().ok()?;
+            Some((transport, port))
+        })
+        .collect()
 }
 
 fn wire_one() -> u8 {
@@ -413,6 +436,7 @@ pub fn from_config(
             .as_u64()
             .map_or(1, |version| version.min(u64::from(u8::MAX)) as u8),
         settings,
+        backups: backups_of(config),
     })
 }
 
@@ -449,6 +473,7 @@ pub fn to_plan(pairing: &Pairing) -> Result<(Plan, Missing)> {
     );
     plan.tunnel_port = pairing.port;
     plan.wire_version = pairing.wire_version;
+    plan.backups = pairing.backups.clone();
     let mut missing = Missing::default();
     if pairing.transport == Transport::Mirage {
         ensure!(
@@ -674,6 +699,33 @@ mod tests {
         assert_eq!(other.wire_version, creator.wire_version);
         assert_ne!(other.dials(), creator.dials());
         other
+    }
+
+    #[test]
+    fn a_failover_tunnel_pairs_with_its_backups_in_order() {
+        for (side, direction) in [(Side::Iran, Direction::Reverse), (Side::Iran, Direction::Direct), (Side::Foreign, Direction::Reverse)] {
+            let mut creator = plan(side, direction, Transport::Tcp);
+            creator.backups = vec![(Transport::Wss, 8443), (Transport::Xhttps, 8181)];
+            let other = round_trip(creator.clone(), Some("203.0.113.9"));
+            assert_eq!(other.backups, creator.backups, "{side:?} {direction:?}");
+            for end in [&creator, &other] {
+                let config = end.to_json().unwrap();
+                let key = if end.mode() == Mode::Server { "listeners" } else { "paths" };
+                let entries = config[key].as_array().unwrap();
+                let order: Vec<&str> = entries.iter().map(|e| e["transport"].as_str().unwrap()).collect();
+                assert_eq!(order, ["tcp", "wss", "xhttps"]);
+                let ports: Vec<&str> = entries.iter().map(|e| e["addr"].as_str().unwrap().rsplit(':').next().unwrap()).collect();
+                assert_eq!(ports[1..], ["8443", "8181"]);
+                assert_eq!(config["failover"]["enabled"], true);
+                assert!(entries[1..].iter().all(|e| e.get("maps").is_none()));
+                assert_eq!(backups_of(&config), creator.backups);
+            }
+        }
+        // A tunnel with one carrier sends no backups.
+        let single = plan(Side::Iran, Direction::Reverse, Transport::Tcp);
+        let code = from_config(&single.to_json().unwrap(), None, None).unwrap();
+        assert!(code.backups.is_empty());
+        assert!(!encode(&code).unwrap().is_empty());
     }
 
     #[cfg(feature = "browser-tls")]

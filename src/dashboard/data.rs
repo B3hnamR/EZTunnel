@@ -116,13 +116,17 @@ pub struct Tunnel {
     /// The same for both ends of one tunnel (from their shared key, which it does not reveal),
     /// so the other end can be found on another managed server.
     pub pair: Option<String>,
+    /// Failover tunnels: the carriers in order and, while it runs on the side with the user
+    /// ports, which one is active and how each one is doing (the tunnel's own status).
+    pub failover: Option<Value>,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct Issue {
     /// "bad" or "warn".
     pub level: &'static str,
-    /// failed, not_connected, silent, no_traffic, quota, loss or udp_drops.
+    /// failed, not_connected, silent, no_traffic, quota, loss, udp_drops, failover_backup or
+    /// carrier_down.
     pub kind: &'static str,
     pub tunnel: Option<String>,
     pub value: Option<f64>,
@@ -189,6 +193,21 @@ pub fn issues(tunnels: &[Tunnel]) -> Vec<Issue> {
             && let Some(dropped) = tunnel.udp_dropped_recent.filter(|d| *d >= UDP_DROP_WARNING)
         {
             add("warn", "udp_drops", tunnel, Some(dropped as f64));
+        }
+        // Failover: users are on a backup carrier, or a carrier is down (the active one included
+        // when nothing better is left).
+        if tunnel.state == "running"
+            && let Some(failover) = &tunnel.failover
+            && let Some(active) = failover["active"].as_u64()
+        {
+            if active > 1 {
+                // Which backup: the second carrier is backup 1.
+                add("warn", "failover_backup", tunnel, Some((active - 1) as f64));
+            }
+            let down = failover["carriers"].as_array().into_iter().flatten().filter(|c| c["state"] == "down").count();
+            if down > 0 {
+                add("warn", "carrier_down", tunnel, Some(down as f64));
+            }
         }
     }
     list.sort_by_key(|issue| issue.level != "bad");
@@ -415,6 +434,26 @@ fn describe(view: &mut Tunnel, config: &Value) {
     }
     view.carry = carry(config);
     view.pair = pair_of(config);
+    view.failover = failover_of(config);
+}
+
+/// A failover tunnel's carriers in order, from its configuration.
+pub fn failover_of(config: &Value) -> Option<Value> {
+    if config["failover"]["enabled"] != true {
+        return None;
+    }
+    let entries = config["listeners"].as_array().filter(|l| !l.is_empty()).or(config["paths"].as_array())?;
+    let carriers: Vec<Value> = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            json!({
+                "order": index + 1,
+                "carrier": format!("{} {}", entry["transport"].as_str().unwrap_or("tcp"), entry["addr"].as_str().unwrap_or("")),
+            })
+        })
+        .collect();
+    Some(json!({"carriers": carriers, "return_after_sec": config["failover"]["return_after_sec"].as_u64().unwrap_or(300)}))
 }
 
 /// A short fingerprint of the tunnel key, equal on both ends of a tunnel.
@@ -474,6 +513,9 @@ fn read_status(view: &mut Tunnel, status: &Value, server: bool, memory: &mut Mem
         }
     }
     memory.counters = Some((down, up, now));
+    if let Some(failover) = status.get("failover").filter(|f| f.is_object()) {
+        view.failover = Some(failover.clone());
+    }
     view.sessions = counter("sessions");
     view.streams = counter("streams");
     view.uptime_sec = counter("uptime_sec");
@@ -665,6 +707,18 @@ impl Source for DemoSource {
                 tunnel.sessions = Some(if unstable { 2 } else { 4 });
                 tunnel.streams = Some(8 + (self.noise() * 20.0) as u64);
                 tunnel.reconnects = Some(if unstable { 7 } else { 0 });
+                // A failover tunnel running on its first backup while its main carrier is down.
+                if name == "web-wss" {
+                    tunnel.failover = Some(json!({
+                        "active": 2, "carrier": "wss 0.0.0.0:443", "switches": 1, "since_sec": 1260 + elapsed as u64,
+                        "last_reason": "the active carrier is down", "return_after_sec": 300,
+                        "carriers": [
+                            {"order": 1, "carrier": "tcp 0.0.0.0:7100", "state": "down", "why": "no session answers", "for_sec": 1260 + elapsed as u64, "sessions": 0, "active": false},
+                            {"order": 2, "carrier": "wss 0.0.0.0:443", "state": "healthy", "why": "", "for_sec": 86_400 + elapsed as u64, "sessions": 4, "active": true},
+                            {"order": 3, "carrier": "xhttps 0.0.0.0:2083", "state": "healthy", "why": "", "for_sec": 86_400 + elapsed as u64, "sessions": 4, "active": false},
+                        ],
+                    }));
+                }
                 if name == "game-fec" {
                     let packets = (elapsed as u64 + 600) * 128;
                     tunnel.game = Some(Game { copies: 3, port: 7001, ready: Some(true), packets_out: packets,

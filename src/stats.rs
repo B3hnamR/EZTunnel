@@ -220,6 +220,8 @@ pub struct Stats {
     pub gaming_datagrams: AtomicU64,
     /// The live sessions, to tell the other server before this one stops.
     pub farewell: crate::farewell::Farewell,
+    /// Failover: the carriers' states for the status, and the active carrier for the log line.
+    failover: Mutex<Option<(serde_json::Value, String)>>,
     /// Heartbeat round trips in microseconds.
     rtt: Mutex<VecDeque<u32>>,
     started: OnceLock<Instant>,
@@ -260,9 +262,23 @@ impl Stats {
             .collect()
     }
 
+    /// Failover keeps its latest state here once a second.
+    pub fn set_failover(&self, snapshot: serde_json::Value, active: &str) {
+        *self.failover.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((snapshot, active.to_owned()));
+    }
+
+    /// The failover state for the status, when the tunnel has failover.
+    pub fn failover(&self) -> Option<serde_json::Value> {
+        self.failover.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_ref().map(|(snapshot, _)| snapshot.clone())
+    }
+
     pub fn summary(&self) -> String {
+        let carrier = match &*self.failover.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
+            Some((_, active)) => format!(" carrier={}", active.replace(' ', "@")),
+            None => String::new(),
+        };
         format!(
-            "sessions={} connects={} streams={} streams_total={} refused={} rejected={} udp_dropped={} sent={} received={}",
+            "sessions={} connects={} streams={} streams_total={} refused={} rejected={} udp_dropped={} sent={} received={}{carrier}",
             self.sessions.load(Relaxed),
             self.sessions_total.load(Relaxed),
             self.streams.load(Relaxed),

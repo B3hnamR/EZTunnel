@@ -9,7 +9,7 @@
 //! conversations, so the far side's `allowed_targets`, the idle timeout and the stream limits all
 //! apply as for any other forwarded UDP. Fragmented SOCKS5 datagrams are not supported.
 use super::{
-    DATA_SIZE, Frame, Pool, StreamGuard, StreamKind, Tuning, await_open, close_stream,
+    DATA_SIZE, Frame, Sessions, StreamGuard, StreamKind, Tuning, await_open, close_stream,
     log_forward_result, session_scope, udp_idle,
 };
 use crate::limits::PendingLimiter;
@@ -112,7 +112,7 @@ fn bound_reply(address: SocketAddr) -> Vec<u8> {
 /// datagram came from.
 pub(super) async fn associate(
     mut control: TcpStream,
-    pool: Arc<Pool>,
+    pool: Sessions,
     users: Arc<PendingLimiter>,
     limit: usize,
     tuning: Tuning,

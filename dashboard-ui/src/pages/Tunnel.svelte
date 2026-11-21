@@ -15,7 +15,7 @@
   import { getStatus, runTool } from "../lib/api.js";
   import { pending, pendingKey, ask, say } from "../lib/actions.svelte.js";
   import { t, num, pct, amount, duration, rate as mbit } from "../lib/i18n.svelte.js";
-  import { tunnelState, transportLabel, isUp, linkState, own } from "../lib/view.js";
+  import { tunnelState, transportLabel, shownTransport, isUp, linkState, own } from "../lib/view.js";
   import LinkLine from "../lib/LinkLine.svelte";
 
   let { name, server = LOCAL } = $props();
@@ -227,7 +227,7 @@
   <section class="panel tcard mb16" aria-labelledby="tp-h">
     <div class="hd">
       <div class="grow">
-        <div class="title"><h2 id="tp-h" class="ltr">{x.name}</h2>{#if x.transport}<span class="code-chip">{transportLabel(x.transport)}</span>{/if}</div>
+        <div class="title"><h2 id="tp-h" class="ltr">{x.name}</h2>{#if x.transport}<span class="code-chip">{transportLabel(shownTransport(x))}</span>{/if}{#if x.failover}<span class="code-chip" title={t("foH")}>{t("foH")}</span>{/if}</div>
         <div class="meta">
           {#if x.direction}<span>{t(x.direction)}</span>{/if}
           {#if remote}{#if x.direction}<span aria-hidden="true">·</span>{/if}<span>{place?.name}</span>{/if}
@@ -245,6 +245,36 @@
       <div><b>{isUp(x) ? rate(x.up_bps) : "-"}</b><span>{t("up")}</span></div>
     </div>
   </section>
+
+  {@const fo = status?.failover ?? x.failover}
+  {#if fo}
+    <section class="panel mb16" aria-labelledby="tp-fo">
+      <div class="row-flex mb12">
+        <h3 id="tp-fo" class="sec-h grow m0">{t("foH")}</h3>
+        {#if fo.switches != null}<span class="muted small">{t("foSwitches", num(fo.switches))}</span>{/if}
+      </div>
+      <ol class="fo-list">
+        {#each fo.carriers ?? [] as c (c.order)}
+          {@const word = c.state === "healthy" ? "ok" : c.state === "down" ? "bad" : c.state ? "warn" : ""}
+          <li class="fo-row fo-live" class:fo-on={c.active}>
+            <span class="fo-n" aria-hidden="true">{num(c.order)}</span>
+            <div class="grow">
+              <b class="ltr">{c.carrier}</b>
+              {#if c.active}<span class="code-chip">{t("foActive")}</span>{/if}
+              {#if c.state}
+                <div class="muted small">
+                  <span class="mark {word}" aria-hidden="true"></span>
+                  {t("foState")[c.state] ?? c.state}{#if c.why}{" · "}{t("foWhy")[c.why] ?? c.why}{/if}{#if c.for_sec != null}{" · "}{t("foFor", duration(Math.max(1, c.for_sec)))}{/if}{#if c.sessions != null}{" · "}{t("foSessions", num(c.sessions))}{/if}
+                </div>
+              {/if}
+            </div>
+          </li>
+        {/each}
+      </ol>
+      {#if fo.active == null}<p class="muted small m0 mt8">{t("foNotLive")}</p>{/if}
+      {#if fo.return_after_sec}<p class="muted small m0 mt8">{t("foReturn", duration(fo.return_after_sec))}</p>{/if}
+    </section>
+  {/if}
 
   <div class="tp-grid">
     <section class="panel" aria-labelledby="tp-now">

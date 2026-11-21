@@ -45,6 +45,27 @@ Strict JSON rejects unknown settings. Bind addresses are literal IP:port, with b
 | `listeners[].tcp_congestion`, `paths[].tcp_congestion` | Both | Optional (0.8.11). Overrides the top-level `tcp_congestion` for this one path/listener's TCP connections only; absent keeps the program-wide setting. Same values, including `system`. |
 | `allowed_targets` | Client | Destinations the server may ask for: `host:port` strings (host names match in any letter case), `host:*` for every port of one host (for example `127.0.0.1:*`), or `"*"` for anything. Empty denies all. |
 | `tun` | Both | Optional layer-3 mode described below. |
+| `failover` | Both | Optional: several carriers behind the same user ports, described below. |
+
+## Failover
+
+A failover tunnel has several carriers, for example TCP, WSS and XHTTPS, behind the same user ports. The server (the side with the user ports) has one `listeners[]` entry per carrier and the client one `paths[]` entry per carrier, in the same order: the first is the main carrier, the others are backups in order of preference. The port maps belong on the first listener only.
+
+```json
+"failover": { "enabled": true, "return_after_sec": 300, "down_after_sec": 10 }
+```
+
+Every carrier stays connected all the time. The server judges each carrier every second from its own sessions and sends **new** users to the first carrier that is healthy:
+
+- **Down:** no session of the carrier answers for `down_after_sec` (default 10, 5..3600), or it never connected within 30 seconds of the start. A session counts as not answering after twice `timeouts.probe_sec` without any frame, so a carrier that dies is left about 20 seconds later. New users move to the next healthy carrier at once; while it is being judged, new users already skip the sessions that do not answer.
+- **Degraded:** over the last minute at least 30% of its heartbeats were lost, or its round trip stayed above three times its usual one (and at least 100 ms above it), or users opened on it got no data at all. New users move to a carrier that has been healthy for at least 10 seconds, at most once a minute.
+- **Return:** once a carrier earlier in the order has been healthy for `return_after_sec` (default 300, 30..86400), new users go back to it, straight to the most preferred healthy one: a carrier in between that is ready a little sooner waits for it (up to a minute), so users move once.
+
+Users already on a carrier stay on it until their connection ends; a connection on a carrier that goes down drops, and the user's next connection goes to the carrier in use. When every carrier is down the tunnel keeps trying the best one it has. Nothing changes on the wire: the client sees sessions on several carriers and needs no decision of its own. Both ends must run a version that knows `failover` (2 to 8 carriers; not for TUN tunnels).
+
+The status (`{"cmd":"status"}`) of the server has a `failover` object: the carrier in use (`active`, counting from 1), the number of `switches`, and for every carrier its `state` (`healthy`, `degraded`, `down` or `starting`), the reason it is degraded or down, and how long it has been in that state. The status line in the journal ends with `carrier=` and the carrier in use, and every change is logged (`failover: new users now go to another carrier`). The dashboard shows the carriers on the tunnel's page and raises an alert while a backup carrier is in use or a carrier is down.
+
+Create one from the dashboard: **New tunnel → Failover**, choose 2 to 4 transports in order and a tunnel port for each. Open every carrier's tunnel port on the listening server's firewall.
 
 ## Carrier settings
 

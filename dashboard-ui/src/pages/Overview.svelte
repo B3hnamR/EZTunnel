@@ -10,7 +10,7 @@
   import State from "./State.svelte";
   import { live } from "../lib/live.svelte.js";
   import { t, ui, num, pct, rate, amount, dateText } from "../lib/i18n.svelte.js";
-  import { tunnelState, transportLabel, isUp, linkState } from "../lib/view.js";
+  import { tunnelState, transportLabel, shownTransport, isUp, linkState } from "../lib/view.js";
   import LinkLine from "../lib/LinkLine.svelte";
   import { fleet } from "../lib/servers.svelte.js";
 
@@ -84,7 +84,8 @@
   function issueText(issue) {
     const text = t("issue")[issue.kind];
     if (typeof text !== "function") return text;
-    return text(issue.kind === "udp_drops" ? num(issue.value ?? 0) : pct(issue.value ?? 0));
+    const counted = ["udp_drops", "failover_backup", "carrier_down"].includes(issue.kind);
+    return text(counted ? num(issue.value ?? 0) : pct(issue.value ?? 0));
   }
 
   function total(x) {
@@ -212,7 +213,7 @@
           {#each tunnels as x (x.name)}
             {@const [mark, label] = tunnelState(x)}
             <tr>
-              <td class="tname"><span class="ltr">{x.name}</span><small><span class="ltr">{transportLabel(x.transport)}</span> · {t(x.direction || "reverse")}</small></td>
+              <td class="tname"><span class="ltr">{x.name}</span><small><span class="ltr">{transportLabel(shownTransport(x))}</span>{#if x.failover} · {t("foH")}{/if} · {t(x.direction || "reverse")}</small></td>
               <td><LinkLine from={t(x.side || "iran")} to={x.link} state={linkState(x)} label={isUp(x) && x.rtt_ms != null ? `${num(x.rtt_ms)} ms` : ""} /></td>
               <td class="num hide-m">{isUp(x) && x.loss_pct != null ? pct(x.loss_pct) : "-"}</td>
               <td class="num hide-m">{total(x)}</td>

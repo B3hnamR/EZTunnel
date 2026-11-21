@@ -7,7 +7,7 @@
   import { say } from "./actions.svelte.js";
   import { live } from "./live.svelte.js";
   import { fleet, LOCAL, localName, refreshFleet } from "./servers.svelte.js";
-  import { t } from "./i18n.svelte.js";
+  import { t, num } from "./i18n.svelte.js";
   import { transportLabel, usedPorts, randomPort } from "./view.js";
 
   /** `prefill`: answers to start from (a connection-test result): iran, foreign, transport,
@@ -29,6 +29,14 @@
     parallax_mode: "stream", speed: "default", tls_profile: "classic", tls_fragment: false, tcp_congestion: "", fec_pacer: false, pool: "4",
     game: false, game_port: "", game_copies: "3", iran_address: "", ipv6_transport: "tcp",
     fromCheck: false,
+    // "one": one transport; "failover": several carriers in order behind the same user ports.
+    mode: "one",
+    // The usual choice: plain TCP first, then two that look like web traffic.
+    carriers: [
+      { transport: "tcp", port: "", touched: false },
+      { transport: "wss", port: "", touched: false },
+      { transport: "xhttps", port: "", touched: false },
+    ],
   });
   let f = $state(blank());
 
@@ -59,7 +67,10 @@
       tried = false;
       dialog.showModal();
       getNewTunnel().then(({ status, data }) => {
-        if (status === 200) transports = data.transports;
+        if (status === 200) {
+          transports = data.transports;
+          failoverMost = data.failover_most ?? 4;
+        }
       });
     }
     if (!open && dialog?.open) dialog.close();
@@ -126,12 +137,70 @@
     }
     return out;
   }
+  // Failover: the plain transports only (not the IPv6 or GAME entries).
+  let failoverMost = $state(4);
+  const plainTransports = $derived(transports.filter((x) => !x.ipv6 && !x.game));
+  const isFailover = $derived(f.mode === "failover");
+  // A carrier follows its transport's usual port until the user types one; when that port is
+  // already taken by an earlier carrier, the next free one is used, so the defaults never clash.
+  $effect(() => {
+    const taken = new Set(untrack(tunnelPorts));
+    for (const c of f.carriers) {
+      const info = transports.find((x) => x.name === c.transport);
+      if (!c.touched && info) {
+        let port = info.port;
+        while (taken.has(port)) port = port >= 65535 ? 1024 : port + 1;
+        if (c.port !== String(port)) c.port = String(port);
+      }
+      if (/^\d+$/.test(plain(c.port))) taken.add(+plain(c.port));
+    }
+  });
+  /** Transports another carrier already uses: each transport once. */
+  const usedElsewhere = (i) => new Set(f.carriers.filter((_, j) => j !== i).map((c) => c.transport));
+  function addCarrier() {
+    if (f.carriers.length >= failoverMost) return;
+    const used = new Set(f.carriers.map((c) => c.transport));
+    const next = plainTransports.find((x) => !used.has(x.name))?.name ?? "tcp";
+    f.carriers.push({ transport: next, port: "", touched: false });
+  }
+  function moveCarrier(i, by) {
+    const j = i + by;
+    if (j < 0 || j >= f.carriers.length) return;
+    [f.carriers[i], f.carriers[j]] = [f.carriers[j], f.carriers[i]];
+  }
+  function dropCarrier(i) {
+    if (f.carriers.length > 2) f.carriers.splice(i, 1);
+  }
+  function randomCarrierPort(i) {
+    const used = avoid();
+    for (const c of f.carriers) if (/^\d+$/.test(plain(c.port))) used.add(+plain(c.port));
+    f.carriers[i].port = String(randomPort(used));
+    f.carriers[i].touched = true;
+  }
+
   /** The end that connects to the other, and the server it connects to. */
   const target = $derived(f.direction === "reverse" ? placeOf(f.iran) : placeOf(f.foreign));
 
   // Follow the transport's usual port and the listening server's address until the user types one.
+  // Forwarded ports another tunnel on the Iran server already listens on (the part before "=").
+  const portsTaken = $derived.by(() => {
+    const snap = f.iran === LOCAL ? live.snapshot : fleet.list.find((s) => s.id === f.iran)?.snapshot;
+    const used = usedPorts([snap]);
+    const out = [];
+    for (const item of plain(f.ports).split(/[,\s]+/).filter(Boolean)) {
+      const [a, b = a] = (item.split("=")[0].match(/\d+/g) ?? []).map(Number);
+      for (let n = a; a && n <= Math.min(b, a + 5000); n++) if (used.has(n) && !out.includes(n)) out.push(n);
+    }
+    return out;
+  });
+  // The usual port, or the next one no tunnel on the known servers uses yet.
+  const tunnelPorts = () => usedPorts([live.snapshot, ...fleet.list.map((s) => s.snapshot)]);
+  const freeFrom = (port, taken) => {
+    while (taken.has(port)) port = port >= 65535 ? 1024 : port + 1;
+    return port;
+  };
   $effect(() => {
-    if (!f.portTouched && transportInfo) f.port = String(transportInfo.port);
+    if (!f.portTouched && transportInfo) f.port = String(freeFrom(transportInfo.port, untrack(tunnelPorts)));
   });
   // IPv4 or IPv6: which address of the listening server the other end connects to.
   // IPv6 entry: the listening server's IPv6 address (it must have one).
@@ -151,8 +220,14 @@
     const e = {};
     if (!/^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/.test(f.name.trim())) e.name = t("nameRule");
     if (!f.foreign || f.iran === f.foreign) e.servers = t("twoServers");
-    const port = plain(f.port);
-    if (!/^\d+$/.test(port) || +port < 1 || +port > 65535) e.port = t("portRule");
+    if (f.mode === "failover") {
+      const ports = f.carriers.map((c) => plain(c.port));
+      if (ports.some((p) => !/^\d+$/.test(p) || +p < 1 || +p > 65535)) e.port = t("portRule");
+      else if (new Set(ports).size !== ports.length) e.port = t("foPortTwice");
+    } else {
+      const port = plain(f.port);
+      if (!/^\d+$/.test(port) || +port < 1 || +port > 65535) e.port = t("portRule");
+    }
     if (!f.address.trim()) e.address = t("addressMissing");
     if (f.carry === "ports" && !plain(f.ports)) e.ports = t("portsErr");
     return e;
@@ -165,13 +240,17 @@
     if (!valid) return;
     step = "working";
     problem = "";
-    const body = {
-      name: f.name.trim(), iran: f.iran, foreign: f.foreign, transport: f.transport, direction: f.direction,
-      tunnel_port: +plain(f.port), address: f.address.trim(), carry: f.carry,
-      ipv6_transport: isIpv6 ? f.ipv6_transport : undefined,
+    const shared = {
+      name: f.name.trim(), iran: f.iran, foreign: f.foreign, direction: f.direction, address: f.address.trim(), carry: f.carry,
       ports: plain(f.ports), protocol: f.protocol, reach: f.reach, socks_bind: f.socks.trim(),
-      ...carrierOptions(),
     };
+    const body = isFailover
+      ? { ...shared, carriers: f.carriers.map((c) => ({ transport: c.transport, tunnel_port: +plain(c.port) })), tunnel_port: +plain(f.carriers[0].port) }
+      : {
+          ...shared, transport: f.transport, tunnel_port: +plain(f.port),
+          ipv6_transport: isIpv6 ? f.ipv6_transport : undefined,
+          ...carrierOptions(),
+        };
     try {
       const { status, data } = await createTunnel(body);
       if (status !== 200) {
@@ -235,6 +314,10 @@
           </div>
         {/each}
       </div>
+      {#if made.carriers}
+        {@const listener = placeOf(made.direction === "reverse" ? made.iran : made.foreign)?.name ?? ""}
+        <div class="note info" role="note"><Icon name="lock" /><span>{t("foOpenPorts", listener, made.carriers.map((c) => `${c.tunnel_port} ${transports.find((x) => x.name === c.transport)?.udp ? "UDP" : "TCP"}`).join(", "))}</span></div>
+      {/if}
       {#if !bothLinked && waited >= 60}
         <div class="note warn" role="note"><Icon name="warn" /><span>{t("linkHelp", made.tunnel_port)}</span></div>
       {/if}
@@ -269,6 +352,43 @@
 
         <section class="ed-sec" aria-labelledby="nt-link-h">
           <header><span class="step-n">3</span><h3 id="nt-link-h">{t("linkH")}</h3></header>
+          <div class="seg full mb12" role="group" aria-label={t("foModeL")}>
+            {#each [["one", "foOne"], ["failover", "foMode"]] as [v, k]}<button type="button" aria-pressed={f.mode === v} onclick={() => (f.mode = v)}>{t(k)}</button>{/each}
+          </div>
+          {#if isFailover}
+            <p class="muted small m0 ehelp">{t("foHelp")}</p>
+            <ol class="fo-list mt8">
+              {#each f.carriers as c, i (i)}
+                <li class="fo-row">
+                  <span class="fo-n" aria-hidden="true">{i + 1}</span>
+                  <div class="grow">
+                    <label class="flabel" for="fo-t{i}">{i === 0 ? t("foMain") : t("foBackup", num(i))}</label>
+                    <select id="fo-t{i}" class="input" bind:value={c.transport}>
+                      {#each plainTransports as x (x.name)}<option value={x.name} disabled={usedElsewhere(i).has(x.name)}>{transportLabel(x.name)}</option>{/each}
+                    </select>
+                  </div>
+                  <div class="eproto">
+                    <label class="flabel" for="fo-p{i}">{t("tunnelPort")}</label>
+                    <div class="dice-in">
+                      <input id="fo-p{i}" class="input ltr" inputmode="numeric" bind:value={c.port} oninput={() => (c.touched = true)} />
+                      <button type="button" class="dice" onclick={() => randomCarrierPort(i)} title={t("randomPort")} aria-label={t("randomPort")}><Icon name="dice" /></button>
+                    </div>
+                  </div>
+                  <div class="fo-act">
+                    <button type="button" class="btn icon ghost" onclick={() => moveCarrier(i, -1)} disabled={i === 0} aria-label={t("foUp")} title={t("foUp")}>↑</button>
+                    <button type="button" class="btn icon ghost" onclick={() => moveCarrier(i, 1)} disabled={i === f.carriers.length - 1} aria-label={t("foDown")} title={t("foDown")}>↓</button>
+                    <button type="button" class="btn icon ghost" onclick={() => dropCarrier(i)} disabled={f.carriers.length <= 2} aria-label={t("foRemove")} title={t("foRemove")}><Icon name="x" /></button>
+                  </div>
+                </li>
+              {/each}
+            </ol>
+            {#if f.carriers.length < failoverMost}
+              <button type="button" class="btn mt8" onclick={addCarrier}><Icon name="plus" />{t("foAdd")}</button>
+            {/if}
+            {#if show("port")}<p class="small m0 bad-t">{show("port")}</p>{/if}
+            <p class="muted small m0 ehelp mt8">{t("foHow")}</p>
+            <p class="small m0 ehelp warn-t">{t("foFirewall")}</p>
+          {:else}
           <div class="erow">
             <div class="grow">
               <label class="flabel" for="nt-transport">{t("transport")}</label>
@@ -293,6 +413,7 @@
           <p class="muted small m0 ehelp">{isIpv6 ? `${t("trDesc").ipv6} ` : ""}{t("trDesc")[kind] ?? ""}{transportInfo?.udp ? ` ${t("udpPortNote")}` : ""}</p>
           {#if noIpv6}<p class="small m0 bad-t" role="alert">{t("ntNoIpv6", target?.name ?? "")}</p>{/if}
           {#if show("port")}<p class="small m0 bad-t">{show("port")}</p>{/if}
+          {/if}
           <div class="ed-grid">
             <div>
               <span class="flabel" id="nt-dir-l">{t("whoConnects")}</span>
@@ -306,7 +427,7 @@
             </div>
           </div>
           <p class="small m0 ehelp {show('address') ? 'bad-t' : 'muted'}">{show("address") || t(f.direction === "reverse" ? "reverseHelp" : "directHelp")}</p>
-          {#if hasOpts}
+          {#if hasOpts && !isFailover}
             <details class="nt-opts mt12" open={f.fromCheck}>
               <summary><span class="flabel m0">{t("ntOpts")}</span></summary>
               <p class="muted small m0 ehelp">{f.fromCheck ? t("ntFromCheck") : t("ntOptsHelp")}</p>
@@ -395,6 +516,7 @@
                 <button type="button" class="dice" onclick={randomForward} title={t("randomPortAdd")} aria-label={t("randomPortAdd")}><Icon name="dice" /></button>
               </div>
               <p class="small m0 ehelp {show('ports') ? 'bad-t' : 'muted'}">{show("ports") || t("newPortsHelp")}</p>
+              {#if portsTaken.length}<p class="small m0 ehelp warn-t" role="status">{t("portsTakenT", portsTaken.join(", "))}</p>{/if}
             </div>
             <div class="mt12">
               <span class="flabel" id="nt-reach-l">{t("reachLabel")}</span>

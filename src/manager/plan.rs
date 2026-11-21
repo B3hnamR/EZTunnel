@@ -288,6 +288,9 @@ pub struct Plan {
     pub wire_version: u8,
     /// Game mode: game UDP goes on the direct datagram path, in copies over several ports.
     pub game: Option<GamePlan>,
+    /// Failover: backup carriers after `transport`, in order of preference, as (transport,
+    /// tunnel port). Each one gets its defaults; the ports and SOCKS5 stay with the tunnel.
+    pub backups: Vec<(Transport, u16)>,
 }
 
 /// Game mode: the users' UDP (port maps and SOCKS UDP) skips the tunnel's ordered stream and goes
@@ -401,6 +404,7 @@ impl Plan {
             speed: super::speed::SpeedMode::Default,
             wire_version: crate::stealth::new_version(),
             game: None,
+            backups: Vec::new(),
         }
     }
 
@@ -481,8 +485,35 @@ impl Plan {
         }
     }
 
-    /// The configuration file content.
+    /// The configuration file content. With backup carriers (failover) every carrier is one more
+    /// listener (Iran) or path (foreign) in order, under the same key; the maps stay on the first.
     pub fn to_json(&self) -> Result<Value> {
+        let mut config = self.to_json_one()?;
+        if self.backups.is_empty() {
+            return Ok(config);
+        }
+        ensure!(self.raw.is_none() && self.tun.is_none() && self.cdn.is_none() && self.game.is_none(),
+            "failover is for plain carriers: no raw, TUN, CDN or Game mode");
+        let key = if self.mode() == Mode::Server { "listeners" } else { "paths" };
+        for (transport, port) in &self.backups {
+            ensure!(!is_raw(*transport) && *transport != Transport::Mirage, "a raw carrier cannot be a failover backup");
+            let mut carrier = Plan::new(self.key.clone(), self.side, self.direction, *transport);
+            carrier.tunnel_port = *port;
+            carrier.peer_host = self.peer_host.clone();
+            carrier.listen_ip = self.listen_ip.clone();
+            carrier.ipv6 = self.ipv6;
+            carrier.wire_version = self.wire_version;
+            let mut entry = carrier.to_json_one()?[key][0].clone();
+            if let Some(entry) = entry.as_object_mut() {
+                entry.remove("maps");
+            }
+            config[key].as_array_mut().context("no carrier list")?.push(entry);
+        }
+        config["failover"] = json!({"enabled": true});
+        Ok(config)
+    }
+
+    fn to_json_one(&self) -> Result<Value> {
         let mode = self.mode();
         let mut entry = Map::new();
         let dials = self.dials();

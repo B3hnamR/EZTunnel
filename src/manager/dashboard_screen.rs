@@ -158,6 +158,9 @@ tunnel live and lets you create, edit, start and stop tunnels on all your server
 
     fn ask_port() -> Result<u16> {
         let text = ui::ask("Port (1024 to 65535)", None, |text: &String| match text.trim().parse::<u16>() {
+            Ok(port) if port >= 1024 && crate::manager::service::port_busy(port, "tcp") => {
+                Err(format!("port {port} is already in use on this server; choose another"))
+            }
             Ok(port) if port >= 1024 => Ok(()),
             _ => Err("enter a port from 1024 to 65535".to_string()),
         })?;

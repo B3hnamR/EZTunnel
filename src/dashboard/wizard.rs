@@ -54,6 +54,90 @@ fn transport_of(word: &str) -> Result<Transport> {
 /// game UDP on the direct datagram path in copies) with `game_port`, `game_copies` and, for a
 /// direct tunnel, `iran_address` (how the foreign server reaches the Iran server).
 pub fn build(form: &Value) -> Result<Built> {
+    build_with_key(form, TunnelKey::generate()?.display())
+}
+
+/// Most carriers a failover tunnel may have.
+pub const FAILOVER_MOST: usize = 4;
+
+/// The form keys that belong to one carrier. A failover form sets none of them for the whole
+/// tunnel: every carrier gets its defaults.
+const CARRIER_KEYS: [&str; 13] = [
+    "transport", "ipv6_transport", "tunnel_port", "parallax_mode", "tls_profile", "tls_fragment", "tcp_congestion",
+    "fec_pacer", "speed", "pool", "game", "game_port", "game_copies",
+];
+
+/// A failover tunnel: the same form as `build` without the carrier, plus `carriers`, 2 to
+/// `FAILOVER_MOST` entries `{"transport", "tunnel_port"}` in order of preference (an absent port
+/// is the carrier's usual one). Every carrier is one listener on the Iran end and one path on the
+/// foreign end, under one key; the user ports and SOCKS5 belong to the tunnel and are served by
+/// whichever carrier is active (see `config::Failover`).
+pub fn build_failover(form: &Value) -> Result<Built> {
+    let carriers = form["carriers"].as_array().context("choose the carriers of the failover tunnel")?;
+    ensure!(
+        (2..=FAILOVER_MOST).contains(&carriers.len()),
+        "a failover tunnel has 2 to {FAILOVER_MOST} carriers"
+    );
+    ensure!(form["game"] != true, "Game mode is not available in a failover tunnel");
+    let key = TunnelKey::generate()?.display();
+    let mut base = form.clone();
+    if let Some(object) = base.as_object_mut() {
+        object.remove("carriers");
+        for carrier_key in CARRIER_KEYS {
+            object.remove(carrier_key);
+        }
+    }
+    let mut ports: Vec<u16> = Vec::new();
+    let mut merged: Option<Built> = None;
+    for (index, carrier) in carriers.iter().enumerate() {
+        let word = carrier["transport"].as_str().unwrap_or("").trim();
+        ensure!(TRANSPORTS.contains(&word), "carrier {}: choose one of {}", index + 1, TRANSPORTS.join(", "));
+        let transport = transport_of(word)?;
+        let port = match &carrier["tunnel_port"] {
+            Value::Null => plan::default_tunnel_port(transport),
+            value => value
+                .as_u64()
+                .and_then(|p| u16::try_from(p).ok())
+                .filter(|p| *p > 0)
+                .with_context(|| format!("carrier {}: the tunnel port must be 1 to 65535", index + 1))?,
+        };
+        ensure!(
+            !ports.contains(&port),
+            "carrier {} uses tunnel port {port} like an earlier one; give each carrier its own port",
+            index + 1
+        );
+        ports.push(port);
+        let mut one = base.clone();
+        one["transport"] = json!(word);
+        one["tunnel_port"] = json!(port);
+        let built = build_with_key(&one, key.clone()).with_context(|| format!("carrier {} ({word})", index + 1))?;
+        match &mut merged {
+            None => merged = Some(built),
+            Some(tunnel) => {
+                let mut listener = built.iran["listeners"][0].clone();
+                // The user ports are the tunnel's: they stay on the first listener only.
+                if let Some(entry) = listener.as_object_mut() {
+                    entry.remove("maps");
+                }
+                tunnel.iran["listeners"].as_array_mut().context("Iran end without listeners")?.push(listener);
+                tunnel.foreign["paths"]
+                    .as_array_mut()
+                    .context("foreign end without paths")?
+                    .push(built.foreign["paths"][0].clone());
+            }
+        }
+    }
+    let mut tunnel = merged.context("no carrier")?;
+    for end in [&mut tunnel.iran, &mut tunnel.foreign] {
+        end["failover"] = json!({"enabled": true});
+    }
+    plan::check(&tunnel.iran).context("the Iran end would not be valid")?;
+    plan::check(&tunnel.foreign).context("the foreign end would not be valid")?;
+    Ok(tunnel)
+}
+
+/// `build` with a given key (failover builds every carrier under one key).
+fn build_with_key(form: &Value, key: String) -> Result<Built> {
     let text = |key: &str| form[key].as_str().unwrap_or("").trim().to_string();
     let name = text("name");
     check_name(&name)?;
@@ -189,7 +273,6 @@ pub fn build(form: &Value) -> Result<Built> {
     } else {
         None
     };
-    let key = TunnelKey::generate()?.display();
     let plan_for = |side: Side| -> Result<Plan> {
         let mut plan = Plan::new(key.clone(), side, direction, transport);
         plan.tunnel_port = tunnel_port;
@@ -249,11 +332,21 @@ pub fn build(form: &Value) -> Result<Built> {
 /// anything else, so a hub can never install a raw-socket or TUN tunnel on it.
 pub fn creatable(config: &Value) -> Result<()> {
     ensure!(config.get("tun").is_none_or(Value::is_null), "TUN tunnels are set up in the terminal manager");
-    let entries = config["listeners"].as_array().or(config["paths"].as_array()).context("no listener or path")?;
-    ensure!(entries.len() == 1, "one listener or path is expected");
-    let transport = entries[0]["transport"].as_str().unwrap_or("tcp");
-    ensure!(TRANSPORTS.contains(&transport), "{transport} tunnels are set up in the terminal manager");
-    ensure!(entries[0].get("raw").is_none_or(Value::is_null), "raw tunnels are set up in the terminal manager");
+    let entries = config["listeners"]
+        .as_array()
+        .filter(|l| !l.is_empty())
+        .or(config["paths"].as_array())
+        .context("no listener or path")?;
+    if config["failover"]["enabled"] == true {
+        ensure!((2..=FAILOVER_MOST).contains(&entries.len()), "a failover tunnel has 2 to {FAILOVER_MOST} carriers");
+    } else {
+        ensure!(entries.len() == 1, "one listener or path is expected");
+    }
+    for entry in entries {
+        let transport = entry["transport"].as_str().unwrap_or("tcp");
+        ensure!(TRANSPORTS.contains(&transport), "{transport} tunnels are set up in the terminal manager");
+        ensure!(entry.get("raw").is_none_or(Value::is_null), "raw tunnels are set up in the terminal manager");
+    }
     plan::check(config)?;
     Ok(())
 }
@@ -422,6 +515,57 @@ mod tests {
         let mut tcp = form("game", "reverse");
         tcp["protocol"] = json!("tcp");
         assert!(build(&tcp).is_err());
+    }
+
+    fn failover_form(direction: &str, carriers: Value) -> Value {
+        let mut f = form("tcp", direction);
+        f.as_object_mut().unwrap().remove("transport");
+        f["carriers"] = carriers;
+        f
+    }
+
+    #[test]
+    fn a_failover_tunnel_has_its_carriers_in_order_under_one_key() {
+        let carriers = json!([{"transport": "tcp"}, {"transport": "wss", "tunnel_port": 8443}, {"transport": "xhttps", "tunnel_port": 8181}]);
+        for direction in ["reverse", "direct"] {
+            let built = build_failover(&failover_form(direction, carriers.clone())).unwrap_or_else(|e| panic!("{direction}: {e:#}"));
+            let listeners = built.iran["listeners"].as_array().unwrap();
+            let paths = built.foreign["paths"].as_array().unwrap();
+            for entries in [listeners, paths] {
+                let order: Vec<&str> = entries.iter().map(|e| e["transport"].as_str().unwrap()).collect();
+                assert_eq!(order, ["tcp", "wss", "xhttps"], "{direction}");
+            }
+            // The user ports stay on the first listener only.
+            assert_eq!(listeners[0]["maps"].as_array().unwrap().len(), 4);
+            assert!(listeners[1..].iter().all(|l| l.get("maps").is_none_or(|m| m.as_array().is_some_and(Vec::is_empty))));
+            for end in [&built.iran, &built.foreign] {
+                assert_eq!(end["failover"]["enabled"], true);
+                assert_eq!(end["tunnel_key"], built.iran["tunnel_key"]);
+                creatable(end).unwrap_or_else(|e| panic!("{direction}: {e:#}"));
+            }
+            // Each carrier on its own tunnel port, at the address the dialing end goes to.
+            let ports: Vec<String> = paths.iter().map(|p| p["addr"].as_str().unwrap().rsplit(':').next().unwrap().to_string()).collect();
+            assert_eq!(ports[1..], ["8443", "8181"], "{direction}");
+        }
+        // Refused: too few or too many carriers, a port used twice, a carrier the dashboard does
+        // not set up, and Game mode.
+        for bad in [
+            json!([{"transport": "tcp"}]),
+            json!([{"transport": "tcp", "tunnel_port": 7000}, {"transport": "wss", "tunnel_port": 7000}]),
+            json!([{"transport": "tcp"}, {"transport": "fec-raw", "tunnel_port": 9000}]),
+            json!([{"transport": "tcp"}, {"transport": "wss", "tunnel_port": 1}, {"transport": "ws", "tunnel_port": 2},
+                   {"transport": "kcp", "tunnel_port": 3}, {"transport": "http", "tunnel_port": 4}]),
+        ] {
+            assert!(build_failover(&failover_form("reverse", bad.clone())).is_err(), "{bad}");
+        }
+        let mut game = failover_form("reverse", carriers);
+        game["game"] = json!(true);
+        assert!(build_failover(&game).is_err());
+        // A single-carrier end with two entries is not one the dashboard made.
+        let mut two = build(&form("tcp", "reverse")).unwrap().foreign;
+        let second = two["paths"][0].clone();
+        two["paths"].as_array_mut().unwrap().push(second);
+        assert!(creatable(&two).is_err());
     }
 
     #[test]

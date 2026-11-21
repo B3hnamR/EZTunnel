@@ -14,6 +14,10 @@
 
   let { name = "", server = "local", onclose } = $props();
   let dialog = $state();
+  /** A failover tunnel: its settings here are those of the main transport. */
+  const isFailover = $derived(
+    Boolean((server === "local" ? live.snapshot?.tunnels : fleet.list.find((s) => s.id === server)?.snapshot?.tunnels)?.find((x) => x.name === name)?.failover),
+  );
   let openGeneration = 0;
   let controller;
 
@@ -379,6 +383,7 @@
       <div class="note bad" role="alert"><Icon name="warn" /><span>{t("editLoadFail")}{#if loadError}{" "}<span class="ltr">{loadError}</span>{/if}</span></div>
     {:else}
       <fieldset disabled={working}>
+        {#if isFailover}<div class="note info mb16" role="note"><Icon name="route" /><span>{t("foEditNote")}</span></div>{/if}
         {#if screen.presets?.presets?.length}
           <section class="ed-sec" aria-labelledby="ed-presets-h">
             <header><h3 id="ed-presets-h">{t("edPresets")}</h3>{#if chosen}<span class="dot" title={t("changesN", 1)}></span>{/if}</header>

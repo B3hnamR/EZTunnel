@@ -9,7 +9,7 @@
   import State from "./State.svelte";
   import { live } from "../lib/live.svelte.js";
   import { t, num, pct, amount, duration, rate } from "../lib/i18n.svelte.js";
-  import { tunnelState, transportLabel, isUp, linkState, own } from "../lib/view.js";
+  import { tunnelState, transportLabel, shownTransport, isUp, linkState, own } from "../lib/view.js";
   import LinkLine from "../lib/LinkLine.svelte";
   import { pending, pendingKey, confirmAction, confirmRestartAll } from "../lib/actions.svelte.js";
   import LogPanel from "../lib/LogPanel.svelte";
@@ -129,7 +129,7 @@
         <article class="panel tcard" aria-labelledby="t{i}">
           <div class="hd">
             <div class="grow">
-              <div class="title"><h2 id="t{i}" class="ltr"><a class="tlink" href="#/tunnel?t={encodeURIComponent(x.name)}{remote ? `&s=${encodeURIComponent(server)}` : ''}">{x.name}</a></h2>{#if x.transport}<span class="code-chip">{transportLabel(x.transport)}</span>{/if}{#if x.game}<span class="code-chip" title={t("gameF")}>{t("gameF")}</span>{/if}</div>
+              <div class="title"><h2 id="t{i}" class="ltr"><a class="tlink" href="#/tunnel?t={encodeURIComponent(x.name)}{remote ? `&s=${encodeURIComponent(server)}` : ''}">{x.name}</a></h2>{#if x.transport}<span class="code-chip">{transportLabel(shownTransport(x))}</span>{/if}{#if x.failover}<span class="code-chip" title={t("foH")}>{t("foH")}</span>{/if}{#if x.game}<span class="code-chip" title={t("gameF")}>{t("gameF")}</span>{/if}</div>
               <div class="meta">
                 {#if x.direction}<span>{t(x.direction)}</span>{/if}
                 {#each carried(x) as [label, value], ci}{#if ci || x.direction}<span aria-hidden="true">·</span>{/if}<span>{label}{#if value}{" "}<span class="ltr">{value}</span>{/if}</span>{/each}
@@ -228,7 +228,7 @@
           <small>{#each carried(x) as [lbl, value], ci}{#if ci}<span aria-hidden="true"> · </span>{/if}{lbl}{#if value}{" "}<span class="ltr">{value}</span>{/if}{/each}</small>
         </span>
         <span role="cell" class="tl-link">
-          <span class="tl-tags">{#if x.transport}<span class="code-chip">{transportLabel(x.transport)}</span>{/if}{#if x.game}<span class="code-chip">{t("gameF")}</span>{/if}{#if x.direction}<span class="tl-dir">{t(x.direction)}</span>{/if}</span>
+          <span class="tl-tags">{#if x.transport}<span class="code-chip">{transportLabel(shownTransport(x))}</span>{/if}{#if x.failover}<span class="code-chip" title={t("foH")}>{t("foH")}</span>{/if}{#if x.game}<span class="code-chip">{t("gameF")}</span>{/if}{#if x.direction}<span class="tl-dir">{t(x.direction)}</span>{/if}</span>
           <small class="ltr">{up && x.rtt_ms != null ? `${num(x.rtt_ms)} ms` : "-"}{#if up && x.loss_pct != null}{" · "}{pct(x.loss_pct)}{/if}</small>
         </span>
         <span role="cell" class="tl-now">

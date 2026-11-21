@@ -18,7 +18,8 @@ mod http;
 mod link;
 mod ops;
 mod conntest;
-mod maintain;
+/// Also used by the manager's Update (`eztunnel upgrade`) to download and check a release.
+pub(crate) mod maintain;
 mod prefs;
 mod relay;
 mod service;
